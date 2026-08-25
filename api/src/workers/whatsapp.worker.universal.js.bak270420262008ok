@@ -1,0 +1,63 @@
+// src/workers/whatsapp.worker.universal.js
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const watiService = require('../services/wati.service');
+
+const worker = new Worker(
+  'whatsapp-messages-*',
+  async (job) => {
+    // On extrait phoneNumber OU phone_number pour être sûr
+    const {
+      messageId, client_id, recipient_phone, message_type,
+      template_name, template_params, message_content, 
+      invoice_data, phoneNumber, phone_number 
+    } = job.data;
+
+    const sender = phoneNumber || phone_number;
+
+    logger.info(`[WORKER] Traitement ${messageId} | Émetteur: ${sender}`);
+
+    try {
+      let result;
+      if (message_type === 'template') {
+        const media = (invoice_data && invoice_data.pdfUrl) ? {
+          url: invoice_data.pdfUrl,
+          filename: `Facture_${invoice_data.number || '001'}.pdf`
+        } : null;
+
+        result = await watiService.sendTemplateMessage(
+          recipient_phone,
+          template_name,
+          template_params || {},
+          media,
+          sender
+        );
+      } else {
+        result = await watiService.sendTextMessage(recipient_phone, message_content, sender);
+      }
+
+      if (result && result.success) {
+        await query(
+          `UPDATE messages SET wa_status = 'sent', wa_message_id = $1, sent_at = NOW() WHERE id = $2`,
+          [result.messageId, messageId]
+        );
+      } else {
+        // ICI : On jette la VRAIE erreur venant du service
+        throw new Error(result.error || 'Réponse WATI inconnue');
+      }
+
+    } catch (error) {
+      logger.error(`[WORKER] Erreur finale ${messageId}: ${error.message}`);
+      await query(
+        `UPDATE messages SET wa_status = 'failed', wa_error_message = $1, failed_at = NOW() WHERE id = $2`,
+        [error.message, messageId]
+      );
+      throw error;
+    }
+  },
+  { connection: redisConnection, concurrency: 5, autorun: true }
+);
+
+module.exports = { worker };

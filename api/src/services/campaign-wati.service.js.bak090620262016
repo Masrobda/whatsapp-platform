@@ -1,0 +1,106 @@
+// src/services/campaign-wati.service.js
+// Service spécifique aux campagnes qui préserve l'ordre des variables
+const axios = require('axios');
+const watiService = require('./wati.service');
+
+class CampaignWatiService {
+  constructor() {
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+if (!this.apiKey) {
+  throw new Error('WATI_API_KEY manquant dans les variables d\'environnement');
+}
+}
+
+  cleanPhoneNumber(phone) {
+    let clean = phone?.toString().replace(/\s/g, '') || '';
+    if (!clean.startsWith('+')) clean = `+${clean}`;
+    return clean;
+  }
+
+  getChannelNumber(providedChannelNumber) {
+    if (providedChannelNumber) {
+      return this.cleanPhoneNumber(providedChannelNumber);
+    }
+    return '+237689588347';
+  }
+
+  /**
+   * Envoi de message template pour CAMPAGNE avec préservation de l'ordre
+   * @param {string} recipientPhone - Numéro du destinataire
+   * @param {string} templateName - Nom du template
+   * @param {Array} orderedValues - Tableau des valeurs dans l'ordre (position 1 = média si présent)
+   * @param {string} language - Langue
+   * @param {string} channelNumber - Numéro de canal
+   */
+  async sendCampaignTemplateMessage(recipientPhone, templateName, orderedValues = [], language = 'fr', channelNumber = null) {
+    try {
+      const cleanPhone = this.cleanPhoneNumber(recipientPhone);
+      const cleanChannelNumber = this.getChannelNumber(channelNumber);
+
+      // 🔥 Construire les paramètres dans l'ORDRE reçu
+      const parameters = [];
+      let position = 1;
+
+      for (const value of orderedValues) {
+        if (value !== undefined && value !== null && value !== '') {
+          parameters.push({
+            name: position.toString(),
+            value: String(value)
+          });
+          position++;
+        }
+      }
+
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `campaign_${Date.now()}`,
+        language: language,
+        parameters: parameters,
+        channel_number: cleanChannelNumber
+      };
+
+      // 🔥 Ajouter le média si fourni
+    if (mediaUrl) {
+      payload.media = {
+        url: mediaUrl,
+        filename: mediaUrl.split('/').pop() || 'document.pdf'
+      };
+      console.log(`📎 [CAMPAGNE] Média attaché : ${mediaUrl}`);
+    }
+
+
+      console.log(`📤 [CAMPAGNE] Envoi template ${templateName}:`);
+      console.log(`   Paramètres (ordre préservé): ${parameters.map(p => `${p.name}=${String(p.value).substring(0, 40)}...`).join(', ')}`);
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: { whatsappNumber: cleanPhone },
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      return {
+        success: true,
+        localMessageId: response.data.local_message_id,
+        watiMessageId: response.data.message_id || response.data.id,
+        status: response.data.status || 'queued'
+      };
+
+    } catch (error) {
+      console.error('❌ [CAMPAGNE] Erreur:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data?.message || error.message,
+        details: error.response?.data
+      };
+    }
+  }
+}
+
+module.exports = new CampaignWatiService();

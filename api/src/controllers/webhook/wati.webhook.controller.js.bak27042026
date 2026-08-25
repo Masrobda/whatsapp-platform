@@ -1,0 +1,318 @@
+// src/controllers/webhook/wati.webhook.controller.js
+const { query } = require('../../config/database');
+const logger = require('../../utils/logger');
+const crypto = require('crypto');
+
+class WatiWebhookController {
+  constructor() {
+    this.secret = process.env.WATI_WEBHOOK_SECRET;
+  }
+
+  /**
+   * Vérifier la signature du webhook WATI
+   */
+  verifySignature(payload, signature) {
+    if (!this.secret || process.env.NODE_ENV !== 'production') {
+      return true; // En développement, accepter sans vérification
+    }
+
+    const computedSignature = crypto
+      .createHmac('sha256', this.secret)
+      .update(JSON.stringify(payload))
+      .digest('hex');
+
+    return crypto.timingSafeEqual(
+      Buffer.from(signature || ''),
+      Buffer.from(computedSignature)
+    );
+  }
+
+  /**
+   * Mapper le statut WATI vers le statut interne
+   */
+  mapWatiStatus(watiStatus) {
+    const statusMap = {
+      'sent': 'sent',
+      'delivered': 'delivered',
+      'read': 'read',
+      'failed': 'failed',
+      'queued': 'queued',
+      'deleted': 'failed'
+    };
+    return statusMap[watiStatus.toLowerCase()] || 'unknown';
+  }
+
+  /**
+   * Mettre à jour le statut du message en base
+   */
+  async updateMessageStatus(messageId, status, timestamp, errorInfo = null) {
+    try {
+      const internalStatus = this.mapWatiStatus(status);
+      const timestampField = this.getTimestampField(internalStatus);
+
+      let updateQuery = `
+        UPDATE messages 
+        SET wa_status = $1,
+            ${timestampField} = COALESCE($2, ${timestampField}),
+            updated_at = NOW()
+      `;
+      
+      const params = [internalStatus, timestamp];
+      let paramIndex = 3;
+
+      if (errorInfo) {
+        updateQuery += `, wa_error_code = $${paramIndex}, wa_error_message = $${paramIndex + 1}`;
+        params.push(errorInfo.code, errorInfo.message);
+        paramIndex += 2;
+      }
+
+      updateQuery += ` WHERE wa_message_id = $${paramIndex}`;
+      params.push(messageId);
+
+      const result = await query(updateQuery, params);
+
+      if (result.rowCount > 0) {
+        logger.info('Message status updated via WATI webhook:', {
+          messageId,
+          oldStatus: status,
+          newStatus: internalStatus
+        });
+
+        // Déclencher les webhooks clients si configurés
+        await this.triggerClientWebhooks(messageId, internalStatus);
+      } else {
+        logger.warn('Message not found for status update:', messageId);
+      }
+    } catch (error) {
+      logger.error('Error updating message status:', error);
+    }
+  }
+
+  /**
+   * Obtenir le champ timestamp approprié
+   */
+  getTimestampField(status) {
+    const fieldMap = {
+      'queued': 'queued_at',
+      'sent': 'sent_at',
+      'delivered': 'delivered_at',
+      'read': 'read_at',
+      'failed': 'failed_at'
+    };
+    return fieldMap[status] || 'updated_at';
+  }
+
+  /**
+   * Déclencher les webhooks des clients
+   */
+  async triggerClientWebhooks(messageId, status) {
+    try {
+      // Récupérer les webhooks actifs du client
+      const webhooksResult = await query(
+        `SELECT ch.* FROM client_webhooks ch
+         JOIN messages m ON m.client_id = ch.client_id
+         WHERE m.id = $1 
+           AND ch.is_active = true
+           AND $2 = ANY(ch.events)`,
+        [messageId, `message.${status}`]
+      );
+
+      for (const webhook of webhooksResult.rows) {
+        // Envoyer la notification au webhook du client
+        this.sendWebhookNotification(webhook, messageId, status).catch(err => {
+          logger.error('Error sending webhook notification:', err);
+        });
+      }
+    } catch (error) {
+      logger.error('Error triggering client webhooks:', error);
+    }
+  }
+
+  /**
+   * Envoyer notification au webhook du client
+   */
+  async sendWebhookNotification(webhook, messageId, status) {
+    const axios = require('axios');
+    
+    try {
+      const messageResult = await query(
+        `SELECT * FROM messages WHERE id = $1`,
+        [messageId]
+      );
+
+      if (messageResult.rows.length === 0) return;
+
+      const payload = {
+        event: `message.${status}`,
+        timestamp: new Date().toISOString(),
+        data: {
+          message_id: messageId,
+          status: status,
+          recipient: messageResult.rows[0].recipient_phone,
+          sent_at: messageResult.rows[0].sent_at,
+          delivered_at: messageResult.rows[0].delivered_at,
+          read_at: messageResult.rows[0].read_at
+        }
+      };
+
+      // Signer le payload
+      const signature = crypto
+        .createHmac('sha256', webhook.secret)
+        .update(JSON.stringify(payload))
+        .digest('hex');
+
+      await axios.post(webhook.url, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Webhook-Signature': signature
+        },
+        timeout: 10000
+      });
+
+      logger.info('Webhook notification sent to client:', {
+        clientId: webhook.client_id,
+        url: webhook.url,
+        event: payload.event
+      });
+    } catch (error) {
+      logger.error('Error sending webhook notification:', error);
+    }
+  }
+
+  /**
+   * Handler principal du webhook WATI
+   */
+  async handleWebhook(request, reply) {
+    try {
+      const payload = request.body;
+      const signature = request.headers['x-wati-signature'];
+
+      // Vérifier la signature
+      if (!this.verifySignature(payload, signature)) {
+        logger.warn('Invalid WATI webhook signature');
+        return reply.code(401).send({ error: 'Invalid signature' });
+      }
+
+      logger.info('WATI webhook received:', { type: payload.type });
+
+      // Traiter selon le type d'événement
+      switch (payload.type) {
+        case 'message_status':
+          await this.handleMessageStatus(payload);
+          break;
+        case 'incoming_message':
+          await this.handleIncomingMessage(payload);
+          break;
+        case 'opt_in':
+        case 'opt_out':
+          await this.handleOptEvent(payload);
+          break;
+        default:
+          logger.info(`Unhandled webhook type: ${payload.type}`);
+      }
+
+      // Répondre rapidement à WATI
+      return reply.code(200).send({ status: 'received' });
+      
+    } catch (error) {
+      logger.error('Error processing WATI webhook:', error);
+      // Toujours répondre 200 pour éviter les retries
+      return reply.code(200).send({ status: 'error', message: error.message });
+    }
+  }
+
+  /**
+   * Traiter les mises à jour de statut
+   */
+  async handleMessageStatus(payload) {
+    const { messageId, status, timestamp, error } = payload.data;
+    
+    await this.updateMessageStatus(
+      messageId,
+      status,
+      new Date(parseInt(timestamp) * 1000),
+      error
+    );
+  }
+
+  /**
+   * Traiter les messages entrants
+   */
+  async handleIncomingMessage(payload) {
+    const { from, message, timestamp } = payload.data;
+    
+    logger.info('Incoming message from WATI:', { from, message: message?.text });
+    
+    // Vérifier les mots-clés d'opt-out
+    const optOutKeywords = ['stop', 'arrêter', 'unsubscribe', 'desabonner'];
+    const messageText = message?.text?.toLowerCase() || '';
+    
+    if (optOutKeywords.some(keyword => messageText.includes(keyword))) {
+      await this.handleOptOut(from);
+    }
+    
+    // Sauvegarder le message entrant
+    await this.saveIncomingMessage(from, message, timestamp);
+  }
+
+  /**
+   * Gérer l'opt-out (STOP)
+   */
+  async handleOptOut(phoneNumber) {
+    try {
+      // Marquer le contact comme opt-out
+      await query(
+        `INSERT INTO opt_out_contacts (phone_number, opt_out_at, source)
+         VALUES ($1, NOW(), 'wati')
+         ON CONFLICT (phone_number) DO UPDATE 
+         SET opt_out_at = NOW(), source = 'wati'`,
+        [phoneNumber]
+      );
+      
+      logger.info('Opt-out registered for:', { phoneNumber });
+    } catch (error) {
+      logger.error('Error handling opt-out:', error);
+    }
+  }
+
+  /**
+   * Traiter les événements opt-in/opt-out
+   */
+  async handleOptEvent(payload) {
+    const { phoneNumber, type, timestamp } = payload.data;
+    
+    if (type === 'opt_out') {
+      await this.handleOptOut(phoneNumber);
+    } else if (type === 'opt_in') {
+      // Réactiver le contact
+      await query(
+        `DELETE FROM opt_out_contacts WHERE phone_number = $1`,
+        [phoneNumber]
+      );
+      logger.info('Opt-in registered for:', { phoneNumber });
+    }
+  }
+
+  /**
+   * Sauvegarder un message entrant
+   */
+  async saveIncomingMessage(from, message, timestamp) {
+    try {
+      await query(
+        `INSERT INTO incoming_messages (
+          phone_number, message_content, message_type, received_at
+        ) VALUES ($1, $2, $3, $4)`,
+        [
+          from,
+          message?.text || message?.caption || '',
+          message?.type || 'text',
+          timestamp ? new Date(parseInt(timestamp) * 1000) : new Date()
+        ]
+      );
+    } catch (error) {
+      logger.error('Error saving incoming message:', error);
+    }
+  }
+}
+
+module.exports = new WatiWebhookController();

@@ -1,0 +1,198 @@
+const jwt = require('jsonwebtoken');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+/**
+ * Middleware pour vérifier le JWT (clients et utilisateurs)
+ */
+async function authenticateJWT(request, reply) {
+
+  try {
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({
+        success: false,
+        code: 'NO_TOKEN',
+        message: 'Token d\'authentification manquant'
+      });
+    }
+
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    let userData;
+    if (decoded.type === 'client') {
+      const result = await query(
+        `SELECT id, email, company_name, quota_remaining, is_active
+         FROM clients WHERE id = $1`,
+        [decoded.id]
+      );
+
+      if (result.rows.length === 0 || !result.rows[0].is_active) {
+        return reply.code(401).send({
+          success: false,
+          code: 'INVALID_TOKEN',
+          message: 'Token invalide ou compte désactivé'
+        });
+      }
+
+      userData = {
+        ...result.rows[0],
+        type: 'client'
+      };
+    } else if (decoded.type === 'user') {
+      const result = await query(
+        `SELECT id, email, full_name, role, permissions, is_active, is_blocked
+         FROM users WHERE id = $1`,
+        [decoded.id]
+      );
+
+      if (result.rows.length === 0 || !result.rows[0].is_active || result.rows[0].is_blocked) {
+        return reply.code(401).send({
+          success: false,
+          code: 'INVALID_TOKEN',
+          message: 'Token invalide ou compte bloqué'
+        });
+      }
+
+      userData = {
+        ...result.rows[0],
+        type: 'user'
+      };
+    } else {
+      return reply.code(401).send({
+        success: false,
+        code: 'INVALID_TOKEN_TYPE',
+        message: 'Type de token non reconnu'
+      });
+    }
+
+    request.user = userData;
+    logger.debug('authenticateJWT → utilisateur attaché', { userId: userData.id, type: userData.type });
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return reply.code(401).send({
+        success: false,
+        code: 'TOKEN_EXPIRED',
+        message: 'Token expiré. Veuillez vous reconnecter.'
+      });
+    }
+    if (error.name === 'JsonWebTokenError') {
+      return reply.code(401).send({
+        success: false,
+        code: 'INVALID_TOKEN',
+        message: 'Token invalide'
+      });
+    }
+
+    logger.error('Erreur authenticateJWT:', error);
+    return reply.code(500).send({
+      success: false,
+      code: 'INTERNAL_ERROR',
+      message: 'Erreur d\'authentification'
+    });
+  }
+}
+
+/**
+ * Middleware pour vérifier l'API Token (pour les appels API clients)
+ */
+async function authenticateApiToken(request, reply) {
+  try {
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return reply.code(401).send({
+        success: false,
+        code: 'NO_TOKEN',
+        message: 'API Token manquant'
+      });
+    }
+
+    const apiToken = authHeader.substring(7);
+    logger.debug('authenticateApiToken → tentative avec token', { tokenPrefix: apiToken.substring(0, 10) + '...' });
+
+    const result = await query(
+      `SELECT id, email, company_name, quota_remaining, is_active, api_instance
+       FROM clients WHERE api_token = $1`,
+      [apiToken]
+    );
+
+    if (result.rows.length === 0) {
+      logger.warn('authenticateApiToken → token non trouvé', { tokenPrefix: apiToken.substring(0, 10) + '...' });
+      return reply.code(401).send({
+        success: false,
+        code: 'INVALID_API_TOKEN',
+        message: 'API Token invalide'
+      });
+    }
+
+    const client = result.rows[0];
+
+    if (!client.is_active) {
+      return reply.code(403).send({
+        success: false,
+        code: 'ACCOUNT_DISABLED',
+        message: 'Compte désactivé'
+      });
+    }
+
+    // Vérification rapide que l'ID est bien un UUID (optionnel mais utile pour debug)
+    if (typeof client.id !== 'string' || client.id.length !== 36) {
+      logger.error('authenticateApiToken → ID client invalide (pas un UUID)', { clientId: client.id });
+      return reply.code(500).send({
+        success: false,
+        code: 'SERVER_ERROR',
+        message: 'Configuration client invalide'
+      });
+    }
+
+    // Attacher le client à la requête
+    request.client = client;
+
+    logger.debug('authenticateApiToken → client attaché avec succès', {
+      clientId: client.id,
+      email: client.email,
+      company: client.company_name
+    });
+  } catch (error) {
+    logger.error('Erreur authenticateApiToken:', error);
+    return reply.code(500).send({
+      success: false,
+      code: 'INTERNAL_ERROR',
+      message: 'Erreur d\'authentification API'
+    });
+  }
+}
+
+/**
+ * Middleware pour vérifier que l'utilisateur est un client (JWT)
+ */
+async function requireClient(request, reply) {
+  if (!request.user || request.user.type !== 'client') {
+    return reply.code(403).send({
+      success: false,
+      code: 'FORBIDDEN',
+      message: 'Accès réservé aux clients'
+    });
+  }
+}
+
+/**
+ * Middleware pour vérifier que l'utilisateur est un membre de l'équipe (JWT)
+ */
+async function requireUser(request, reply) {
+  if (!request.user || request.user.type !== 'user') {
+    return reply.code(403).send({
+      success: false,
+      code: 'FORBIDDEN',
+      message: 'Accès réservé aux membres de l\'équipe'
+    });
+  }
+}
+
+module.exports = {
+  authenticateJWT,
+  authenticateApiToken,
+  requireClient,
+  requireUser,
+};

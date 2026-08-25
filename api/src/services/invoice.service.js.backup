@@ -1,0 +1,648 @@
+const { query, getClient } = require('../config/database');
+const { generateInvoiceNumber, generateDisbursementNumber } = require('../utils/crypto');
+const { sendTeamNotification } = require('./email.service');
+const logger = require('../utils/logger');
+const fs = require('fs').promises;
+const path = require('path');
+const puppeteer = require('puppeteer');
+
+/**
+ * Générer la facture proforma
+ */
+async function generateProforma(orderId, userId) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la commande
+    const orderResult = await client.query(
+      `SELECT o.*, c.company_name, c.email, c.address, c.city, c.country, c.tax_id
+       FROM orders o
+       JOIN clients c ON o.client_id = c.id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+    if (orderResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      };
+    }
+    const order = orderResult.rows[0];
+
+    if (order.status !== 'validated_financial') {
+      throw {
+        statusCode: 400,
+        code: 'INVALID_STATUS',
+        message: 'La commande doit être validée par le responsable financier'
+      };
+    }
+
+    // Vérifier si une proforma n'existe pas déjà
+    const existingInvoice = await client.query(
+      'SELECT id FROM invoices WHERE order_id = $1 AND invoice_type = $2',
+      [orderId, 'proforma']
+    );
+    if (existingInvoice.rows.length > 0) {
+      throw {
+        statusCode: 400,
+        code: 'PROFORMA_EXISTS',
+        message: 'Une facture proforma existe déjà pour cette commande'
+      };
+    }
+
+    // Générer le numéro de facture
+    const invoiceNumber = generateInvoiceNumber('proforma');
+
+    // Créer la facture proforma
+    const invoiceResult = await client.query(
+      `INSERT INTO invoices (
+        invoice_number, order_id, client_id, invoice_type,
+        subtotal, vat_amount, total_amount, status,
+        issue_date, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *`,
+      [
+        invoiceNumber,
+        orderId,
+        order.client_id,
+        'proforma',
+        order.subtotal,
+        order.vat_amount,
+        order.total_amount,
+        'proforma_generated',
+        new Date(),
+        userId
+      ]
+    );
+    const invoice = invoiceResult.rows[0];
+
+    // Générer à la fois le HTML et le PDF
+    const pdfPath = await generateInvoicePDF(invoice, order);
+
+    // Mettre à jour le chemin du PDF
+    await client.query(
+      'UPDATE invoices SET pdf_path = $1 WHERE id = $2',
+      [pdfPath, invoice.id]
+    );
+
+    // Mettre à jour le statut de la commande
+    await client.query(
+      'UPDATE orders SET status = $1 WHERE id = $2',
+      ['invoice_generated', orderId]
+    );
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'PROFORMA_GENERATED',
+        'invoice',
+        invoice.id,
+        JSON.stringify({ invoice_number: invoiceNumber })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Notification à l'équipe
+    sendTeamNotification(
+      'Facture proforma générée',
+      `
+      <h2>Facture proforma générée</h2>
+      <p><strong>Numéro facture:</strong> ${invoiceNumber}</p>
+      <p><strong>Commande:</strong> ${order.order_code}</p>
+      <p><strong>Montant:</strong> ${Number(order.total_amount || 0).toFixed(2)} FCFA</p>
+      <p><strong>Prochaine étape:</strong> Validation responsable achats</p>
+      `
+    ).catch(err => logger.error('Erreur notification:', err));
+
+    logger.info('Facture proforma générée:', invoiceNumber);
+
+    return {
+      success: true,
+      message: 'Facture proforma générée avec succès',
+      invoice: {
+        id: invoice.id,
+        invoice_number: invoice.invoice_number,
+        pdf_path: pdfPath
+      }
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur génération proforma:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Générer à la fois le HTML et le PDF de la facture
+ */
+async function generateInvoicePDF(invoice, orderData) {
+  try {
+    logger.info('Début generateInvoicePDF - puppeteer présent:', !!puppeteer);
+
+    const invoicesDir = process.env.INVOICES_PATH || '/var/www/numericexport/media/invoices';
+    await fs.mkdir(invoicesDir, { recursive: true });
+
+    const fileNameBase = invoice.invoice_number;
+    const htmlFileName = `${fileNameBase}.html`;
+    const pdfFileName = `${fileNameBase}.pdf`;
+    const htmlPath = path.join(invoicesDir, htmlFileName);
+    const pdfPath = path.join(invoicesDir, pdfFileName);
+
+    // Conversion explicite des montants en nombres + fallback à 0
+    const unitPrice   = Number(orderData.unit_price)   || 0;
+    const subtotal    = Number(orderData.subtotal)    || 0;
+    const vatAmount   = Number(orderData.vat_amount)  || 0;
+    const totalAmount = Number(orderData.total_amount) || 0;
+    const vatRate     = Number(orderData.vat_rate)    || 0;
+
+    // Template HTML (identique à l'original, mais avec variables converties)
+    const html = `
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Facture Proforma ${invoice.invoice_number}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; color: #333; line-height: 1.6; }
+    .header { text-align: center; margin-bottom: 40px; border-bottom: 3px solid #2d5016; padding-bottom: 20px; }
+    .logo { font-size: 32px; font-weight: bold; color: #2d5016; }
+    .company-info { margin-top: 10px; font-size: 14px; color: #555; }
+    .invoice-info { display: flex; justify-content: space-between; margin-bottom: 40px; }
+    .client-info, .invoice-details { width: 48%; }
+    .section-title { font-weight: bold; color: #2d5016; margin-bottom: 12px; border-bottom: 2px solid #8bc34a; padding-bottom: 6px; font-size: 18px; }
+    table { width: 100%; border-collapse: collapse; margin: 30px 0; }
+    th { background: #2d5016; color: white; padding: 14px 10px; text-align: left; font-weight: bold; }
+    td { padding: 12px 10px; border-bottom: 1px solid #ddd; }
+    .total-section { margin-top: 30px; text-align: right; font-size: 16px; }
+    .total-row { display: flex; justify-content: flex-end; margin: 10px 0; }
+    .total-label { width: 180px; font-weight: bold; text-align: right; padding-right: 20px; }
+    .total-value { width: 180px; text-align: right; }
+    .grand-total { font-size: 20px; color: #2d5016; font-weight: bold; border-top: 2px solid #2d5016; padding-top: 12px; margin-top: 12px; }
+    .footer { margin-top: 60px; text-align: center; font-size: 12px; color: #777; border-top: 1px solid #ddd; padding-top: 20px; }
+    .watermark { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); font-size: 90px; color: rgba(45, 80, 22, 0.08); font-weight: bold; z-index: -1; pointer-events: none; }
+  </style>
+</head>
+<body>
+  ${invoice.invoice_type === 'proforma' ? '<div class="watermark">PROFORMA</div>' : ''}
+
+  <div class="header">
+    <div class="logo">NEXT LTD</div>
+    <div class="company-info">
+      Numeric EXport Technologies<br>
+      Douala, Cameroun<br>
+      Email: team@numericexport.com | Web: numericexport.com
+    </div>
+  </div>
+
+  <div class="invoice-info">
+    <div class="client-info">
+      <div class="section-title">FACTURÉ À</div>
+      <strong>${orderData.company_name || 'Client'}</strong><br>
+      ${orderData.email || ''}<br>
+      ${orderData.address || ''}<br>
+      ${orderData.city || ''}, ${orderData.country || 'Cameroun'}<br>
+      ${orderData.tax_id ? `ID Fiscal : ${orderData.tax_id}` : ''}
+    </div>
+
+    <div class="invoice-details">
+      <div class="section-title">DÉTAILS FACTURE</div>
+      <strong>${invoice.invoice_type === 'proforma' ? 'FACTURE PROFORMA' : 'FACTURE FINALE'}</strong><br>
+      <strong>N° :</strong> ${invoice.invoice_number}<br>
+      <strong>Date :</strong> ${new Date(invoice.issue_date).toLocaleDateString('fr-FR')}<br>
+      ${invoice.due_date ? `<strong>Échéance :</strong> ${new Date(invoice.due_date).toLocaleDateString('fr-FR')}<br>` : ''}
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th style="text-align: center;">Quantité</th>
+        <th style="text-align: right;">Prix Unitaire</th>
+        <th style="text-align: right;">Montant</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Messages WhatsApp Business API</td>
+        <td style="text-align: center;">${orderData.quantity || 0}</td>
+        <td style="text-align: right;">${unitPrice.toFixed(2)} FCFA</td>
+        <td style="text-align: right;">${subtotal.toFixed(2)} FCFA</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="total-section">
+    <div class="total-row">
+      <div class="total-label">Sous-total :</div>
+      <div class="total-value">${subtotal.toFixed(2)} FCFA</div>
+    </div>
+    <div class="total-row">
+      <div class="total-label">TVA (${vatRate.toFixed(2)} %) :</div>
+      <div class="total-value">${vatAmount.toFixed(2)} FCFA</div>
+    </div>
+    <div class="total-row grand-total">
+      <div class="total-label">TOTAL TTC :</div>
+      <div class="total-value">${totalAmount.toFixed(2)} FCFA</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p><strong>Conditions de paiement :</strong> Paiement par virement bancaire</p>
+    <p>NEXT LTD - RCCM : [À compléter] - NUI : [À compléter]</p>
+    <p>Merci pour votre confiance !</p>
+  </div>
+</body>
+</html>
+    `;
+
+    // Écrire le fichier HTML
+    await fs.writeFile(htmlPath, html, 'utf8');
+    logger.info('Facture HTML générée :', htmlPath);
+
+    logger.info('Début génération PDF avec puppeteer');
+
+    let browser;
+    try {
+      browser = await puppeteer.launch({
+        headless: 'new',  // 'new' est plus stable en 2025
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        timeout: 60000
+      });
+      logger.info('Browser puppeteer lancé');
+
+      const page = await browser.newPage();
+      logger.info('Nouvelle page créée');
+
+      await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+      logger.info('Contenu HTML chargé dans la page');
+
+      await page.pdf({
+        path: pdfPath,
+        format: 'A4',
+        printBackground: true,
+        margin: { top: '20mm', right: '20mm', bottom: '20mm', left: '20mm' },
+        timeout: 30000
+      });
+      logger.info('PDF généré avec succès :', pdfPath);
+    } catch (puppeteerErr) {
+      logger.error('Erreur puppeteer détaillée :', puppeteerErr);
+      throw puppeteerErr;
+    } finally {
+      if (browser) await browser.close();
+    }
+
+    return pdfPath;
+  } catch (error) {
+    logger.error('Erreur lors de la génération de la facture :', error);
+    throw error;
+  }
+}
+
+/**
+ * Créer une fiche de décaissement
+ */
+async function createDisbursementSlip(orderId, userId, disbursementData) {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la facture proforma
+    const invoiceResult = await client.query(
+      `SELECT i.*, o.quantity, o.total_amount
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       WHERE i.order_id = $1 AND i.invoice_type = $2`,
+      [orderId, 'proforma']
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'PROFORMA_NOT_FOUND',
+        message: 'Facture proforma non trouvée'
+      };
+    }
+
+    const invoice = invoiceResult.rows[0];
+
+    // Générer le numéro de fiche
+    const slipNumber = generateDisbursementNumber();
+
+    // Créer la fiche de décaissement
+    const slipResult = await client.query(
+      `INSERT INTO disbursement_slips (
+        slip_number, invoice_id, order_id, amount, purpose,
+        messages_to_purchase, purchase_cost, status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *`,
+      [
+        slipNumber,
+        invoice.id,
+        orderId,
+        disbursementData.amount,
+        disbursementData.purpose || 'Achat messages WhatsApp 360dialog',
+        disbursementData.messages_to_purchase || invoice.quantity,
+        disbursementData.purchase_cost,
+        'pending',
+        userId
+      ]
+    );
+
+    const slip = slipResult.rows[0];
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'DISBURSEMENT_SLIP_CREATED',
+        'disbursement_slip',
+        slip.id,
+        JSON.stringify({ slip_number: slipNumber, amount: disbursementData.amount })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info('Fiche de décaissement créée:', slipNumber);
+
+    return {
+      success: true,
+      message: 'Fiche de décaissement créée avec succès',
+      slip
+    };
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur création fiche décaissement:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Confirmer l'achat et générer la facture finale
+ */
+async function confirmPurchase(orderId, userId) {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la commande et le client
+    const orderResult = await client.query(
+      `SELECT o.*, c.quota_remaining, c.company_name, c.email
+       FROM orders o
+       JOIN clients c ON o.client_id = c.id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+
+    if (orderResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      };
+    }
+
+    const order = orderResult.rows[0];
+
+    // Générer la facture finale
+    const finalInvoiceNumber = generateInvoiceNumber('final');
+
+    const finalInvoice = await client.query(
+      `INSERT INTO invoices (
+        invoice_number, order_id, client_id, invoice_type,
+        subtotal, vat_amount, total_amount, status,
+        issue_date, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *`,
+      [
+        finalInvoiceNumber,
+        orderId,
+        order.client_id,
+        'final',
+        order.subtotal,
+        order.vat_amount,
+        order.total_amount,
+        'final_generated',
+        new Date(),
+        userId
+      ]
+    );
+
+    // Créditer le compte client
+    await client.query(
+      `UPDATE clients
+       SET quota_total = quota_total + $1,
+           quota_remaining = quota_remaining + $1
+       WHERE id = $2`,
+      [order.quantity, order.client_id]
+    );
+
+    // Mettre à jour la commande
+    await client.query(
+      `UPDATE orders
+       SET status = $1,
+           purchase_confirmed_by = $2,
+           purchase_confirmed_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      ['purchase_completed', userId, orderId]
+    );
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'PURCHASE_CONFIRMED',
+        'order',
+        orderId,
+        JSON.stringify({
+          messages_added: order.quantity,
+          final_invoice: finalInvoiceNumber
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Notification au client et à l'équipe
+    sendTeamNotification(
+      'Commande complétée',
+      `
+      <h2>✅ Commande complétée</h2>
+      <p><strong>Client:</strong> ${order.company_name || order.email}</p>
+      <p><strong>Commande:</strong> ${order.order_code}</p>
+      <p><strong>Messages ajoutés:</strong> ${order.quantity}</p>
+      <p><strong>Facture finale:</strong> ${finalInvoiceNumber}</p>
+      `
+    ).catch(err => logger.error('Erreur notification:', err));
+
+    logger.info('Achat confirmé et compte crédité:', order.order_code);
+
+    return {
+      success: true,
+      message: `Achat confirmé. ${order.quantity} messages ajoutés au compte client.`,
+      invoice_number: finalInvoiceNumber
+    };
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur confirmation achat:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Récupérer les factures d'un client
+ */
+async function getClientInvoices(clientId, filters = {}) {
+  try {
+    const { page = 1, limit = 5, status, type } = filters;
+    const offset = (page - 1) * limit;
+    
+    // CORRECTION : Ajout de l'alias 'i.' devant client_id et autres colonnes
+    let whereClause = 'WHERE i.client_id = $1';
+    const params = [clientId];
+    let paramIndex = 2;
+    
+    if (status) {
+      whereClause += ` AND i.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    if (type) {
+      whereClause += ` AND i.invoice_type = $${paramIndex}`;
+      params.push(type);
+      paramIndex++;
+    }
+    
+    // Compter le total avec alias
+    const countResult = await query(
+      `SELECT COUNT(*) FROM invoices i ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+    
+    // Récupérer les factures - CORRECTION : utilisation cohérente des alias
+    const invoicesResult = await query(
+      `SELECT
+        i.*,
+        o.order_code, o.quantity
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       ${whereClause}
+       ORDER BY i.created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    );
+    
+    return {
+      success: true,
+      invoices: invoicesResult.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur récupération factures client:', error);
+    throw error;
+  }
+}
+
+/**
+ * Récupérer les factures (pour les administrateurs)
+ */
+
+async function getInvoices(filters = {}) {
+  try {
+    const { page = 1, limit = 10, status, type, client_id } = filters;
+    const offset = (page - 1) * limit;
+
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+
+    if (client_id) {
+      whereClause += ` AND i.client_id = $${paramIndex}`;  // ← correction importante : alias "i."
+      params.push(client_id);
+      paramIndex++;
+    }
+    if (status) {
+      whereClause += ` AND i.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    if (type) {
+      whereClause += ` AND i.invoice_type = $${paramIndex}`;
+      params.push(type);
+      paramIndex++;
+    }
+
+    // Compter le total
+    const countResult = await query(
+      `SELECT COUNT(*) FROM invoices i ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Récupérer les factures avec jointures + infos client/commande
+    const invoicesResult = await query(
+      `SELECT
+        i.*,
+        o.order_code,
+        c.company_name,
+        c.email as client_email
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       JOIN clients c ON i.client_id = c.id
+       ${whereClause}
+       ORDER BY i.created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    );
+
+    return {
+      success: true,
+      invoices: invoicesResult.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur récupération factures:', error);
+    throw error;
+  }
+}
+
+module.exports = {
+  generateProforma,
+  generateInvoicePDF,
+  createDisbursementSlip,
+  confirmPurchase,
+  getClientInvoices,
+  getInvoices
+};

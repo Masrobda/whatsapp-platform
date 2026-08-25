@@ -1,0 +1,128 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+class WatiService {
+  constructor() {
+    this.baseURL = process.env.WATI_API_URL || 'https://live-mt-server.wati.io/10141984';
+    this.apiKey = process.env.WATI_API_KEY;
+    this.testMode = process.env.WATI_TEST_MODE === 'true';
+
+    logger.info('WATI Service Multi-Tenant configuré', { testMode: this.testMode });
+  }
+
+  /**
+   * Envoie un template dynamique
+   */
+  async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, media = null) {
+    if (this.testMode) {
+      logger.info('[TEST MODE] Envoi simulé:', { templateName, recipientPhone });
+      return { success: true, status: 'sent', messageId: `test_${Date.now()}` };
+    }
+
+    try {
+      const url = `${this.baseURL}/api/v1/sendTemplateMessage`;
+      const cleanPhone = recipientPhone.replace('+', '').trim();
+
+      const parameters = Object.entries(templateParams).map(([key, value]) => ({
+        name: key,
+        value: String(value)
+      }));
+
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `api_dispatch_${Date.now()}`,
+        parameters: parameters
+      };
+
+      if (media && media.url) {
+        payload.media = {
+          type: media.type || "document",
+          url: media.url,
+          filename: media.filename || "document.pdf"
+        };
+      }
+
+      const response = await axios.post(url, payload, {
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        params: { whatsappNumber: cleanPhone },
+        timeout: 30000
+      });
+
+      if (response.data.result === false) {
+        throw new Error(response.data.info || 'Erreur de validation template WATI');
+      }
+
+      return { success: true, messageId: response.data.messageId, status: 'sent' };
+    } catch (error) {
+      const errorDetail = error.response?.data || error.message;
+      logger.error('Erreur API WATI sendTemplateMessage:', errorDetail);
+      return { success: false, error: errorDetail.info || errorDetail.message || errorDetail };
+    }
+  }
+
+  /**
+   * NOUVEAU : Envoie une facture PDF (Media Message)
+   */
+
+   async sendInvoiceWithPDF(recipientPhone, invoiceData) {
+    if (this.testMode) {
+      logger.info('[TEST MODE] Envoi facture simulé:', { recipientPhone, url: invoiceData.pdfUrl });
+      return { success: true, status: 'sent', messageId: `test_inv_${Date.now()}` };
+    }
+
+    try {
+      const cleanPhone = recipientPhone.replace('+', '').trim();
+      const url = `${this.baseURL}/api/v1/sendSessionFile/${cleanPhone}`;
+      
+      logger.info(`Tentative d'envoi PDF à ${cleanPhone}`, { url: invoiceData.pdfUrl });
+
+      const response = await axios.post(url, null, {
+        headers: { 
+          'Authorization': `Bearer ${this.apiKey}`,
+          // On évite le slash-étoile pour ne pas perturber l'éditeur
+          'Accept': 'application/json' 
+        },
+        params: { 
+          fileUrl: invoiceData.pdfUrl,
+          fileName: `Facture_${invoiceData.number || '001'}.pdf`
+        }
+      });
+
+      if (response.data.result === 'error' || response.data.result === false) {
+        return { 
+          success: false, 
+          error: response.data.info || 'Session fermée (Besoin d\'un message du client)' 
+        };
+      }
+
+      return { success: true, messageId: response.data.messageId, status: 'sent' };
+    } catch (error) {
+      const detail = error.response?.data || error.message;
+      logger.error('Erreur WATI sendInvoiceWithPDF:', detail);
+      return { success: false, error: "Erreur WATI: Session fermée ou PDF inaccessible" };
+    }
+  }
+
+  /**
+   * Message texte simple
+   */
+  async sendTextMessage(recipientPhone, text) {
+    try {
+      const cleanPhone = recipientPhone.replace('+', '').trim();
+      const response = await axios.post(`${this.baseURL}/api/v1/sendMessage`, { message: text }, {
+        headers: { 'Authorization': `Bearer ${this.apiKey}` },
+        params: { whatsappNumber: cleanPhone }
+      });
+      return { success: response.data.result, messageId: response.data.messageId, status: 'sent' };
+    } catch (error) {
+      logger.error('Erreur WATI Texte:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+}
+
+module.exports = new WatiService();

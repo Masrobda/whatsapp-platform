@@ -1,0 +1,450 @@
+const { query } = require('../config/database');
+const { hashPassword, comparePassword, generateApiToken, generateApiInstance, generateResetToken } = require('../utils/crypto');
+const { sendWelcomeEmail, sendResetPasswordEmail } = require('./email.service');
+const jwt = require('jsonwebtoken');
+const logger = require('../utils/logger');
+
+/**
+ * Inscription d'un nouveau client
+ */
+async function registerClient(clientData) {
+  try {
+    console.log('Données reçues:', JSON.stringify(clientData, null, 2));
+    // Vérifier si l'email existe déjà
+    const existingClient = await query(
+      'SELECT id FROM clients WHERE email = $1',
+      [clientData.email]
+    );
+
+    if (existingClient.rows.length > 0) {
+      throw {
+        statusCode: 409,
+        code: 'EMAIL_EXISTS',
+        message: 'Cette adresse email est déjà utilisée'
+      };
+    }
+
+    // Hash du mot de passe
+    const password_hash = await hashPassword(clientData.password);
+    
+    // Génération des identifiants API
+    const api_token = generateApiToken();
+    const api_instance = generateApiInstance();
+
+    // Calcul de la date d'expiration de l'essai (5 jours)
+    const trial_expires_at = new Date();
+    trial_expires_at.setDate(trial_expires_at.getDate() + parseInt(process.env.TRIAL_DURATION_DAYS || 5));
+
+    // Insertion du client
+    const result = await query(
+      `INSERT INTO clients (
+        company_name, company_type, email, phone, address, city, country, tax_id,
+        password_hash, api_token, api_instance, trial_expires_at, vat_rate
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING id, company_name, email, api_token, api_instance, quota_total, trial_expires_at`,
+      [
+        clientData.company_name || null,
+        clientData.company_type,
+        clientData.email,
+        clientData.phone || null,
+        clientData.address || null,
+        clientData.city || null,
+        clientData.country || 'Cameroun',
+        clientData.tax_id || null,
+        password_hash,
+        api_token,
+        api_instance,
+        trial_expires_at,
+        clientData.country === 'Cameroun' ? 19.25 : 0 // VAT à adapter selon le pays
+      ]
+    );
+
+    const newClient = result.rows[0];
+
+    // Envoyer l'email de bienvenue (async, ne pas bloquer)
+    sendWelcomeEmail(newClient).catch(err => 
+      logger.error('Erreur envoi email bienvenue:', err)
+    );
+
+    // Log d'audit
+    await query(
+      `INSERT INTO audit_logs (client_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        newClient.id,
+        'CLIENT_REGISTERED',
+        'client',
+        newClient.id,
+        JSON.stringify({ email: newClient.email, company_name: newClient.company_name })
+      ]
+    );
+
+    logger.info('Nouveau client inscrit:', newClient.email);
+
+    return {
+      success: true,
+      message: 'Compte créé avec succès. Un email de bienvenue vous a été envoyé.',
+      client: {
+        id: newClient.id,
+        email: newClient.email,
+        company_name: newClient.company_name,
+        trial_messages: newClient.quota_total,
+        trial_expires_at: newClient.trial_expires_at
+      }
+    };
+
+  } catch (error) {
+    console.error('Erreur détaillée inscription:', error);
+    console.error('Stack trace:', error.stack);
+    logger.error('Erreur inscription client:', error);
+    throw error;
+  }
+}
+
+/**
+ * Inscription d'un utilisateur interne (personnel)
+ */
+async function registerUser(userData) {
+  try {
+    const { full_name, email, password, role, permissions } = userData;
+
+    // Vérifier si l'email existe déjà
+    const existing = await query(
+      'SELECT id FROM users WHERE email = $1',
+      [email]
+    );
+    if (existing.rows.length > 0) {
+      throw {
+        statusCode: 409,
+        code: 'EMAIL_EXISTS',
+        message: 'Cette adresse email est déjà utilisée'
+      };
+    }
+
+    const password_hash = await hashPassword(password);
+
+    const result = await query(
+      `INSERT INTO users (
+        full_name, email, password_hash, role, permissions, is_active
+      ) VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id, email, full_name, role, permissions`,
+      [
+        full_name,
+        email,
+        password_hash,
+        role,
+        JSON.stringify(permissions),
+        true
+      ]
+    );
+
+    const newUser = result.rows[0];
+
+    // Log d'audit
+    await query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [newUser.id, 'USER_REGISTERED_VIA_INVITATION', 'user', newUser.id, JSON.stringify({ role, email })]
+    );
+
+    logger.info('Nouveau membre du personnel inscrit via invitation:', email);
+
+    return newUser;
+  } catch (error) {
+    logger.error('Erreur registerUser:', error);
+    throw error;
+  }
+}
+
+
+
+/**
+ * Connexion client
+ */
+async function loginClient(email, password, rememberMe = false) {
+  try {
+    // 1. Récupérer le client
+    const result = await query(
+      `SELECT id, email, password_hash, company_name, is_active, is_blocked,
+              quota_remaining, trial_expires_at
+       FROM clients WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      throw { statusCode: 401, code: 'INVALID_CREDENTIALS', message: 'Email ou mot de passe incorrect' };
+    }
+
+    const client = result.rows[0];
+
+    // 2. Vérifications de sécurité
+    if (!client.is_active || client.is_blocked) {
+      throw {
+        statusCode: 403,
+        code: 'ACCOUNT_DISABLED',
+        message: 'Votre compte est désactivé ou bloqué. Contactez le support.'
+      };
+    }
+
+    const isPasswordValid = await comparePassword(password, client.password_hash);
+    if (!isPasswordValid) {
+      throw { statusCode: 401, code: 'INVALID_CREDENTIALS', message: 'Email ou mot de passe incorrect' };
+    }
+
+    // 3. Génération du JWT
+    const expiresIn = rememberMe ? (process.env.JWT_REFRESH_EXPIRES_IN || '30d') : (process.env.JWT_EXPIRES_IN || '7d');
+
+    const token = jwt.sign(
+      {
+        id: client.id,
+        email: client.email,
+        type: 'client', // Identifiant de type pour le middleware
+        role: 'client'  // Rôle par défaut pour un client
+      },
+      process.env.JWT_SECRET,
+      { expiresIn }
+    );
+
+    // 4. Mises à jour asynchrones (on n'attend pas forcément pour répondre)
+    query('UPDATE clients SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [client.id]).catch(err => logger.error(err));
+    query('INSERT INTO audit_logs (client_id, action, entity_type, entity_id) VALUES ($1, $2, $3, $4)', 
+          [client.id, 'CLIENT_LOGIN', 'client', client.id]).catch(err => logger.error(err));
+
+    logger.info('Client connecté:', client.email);
+
+    // 5. Réponse structurée pour le Frontend
+    return {
+      success: true,
+      token,
+      user: { // On utilise "user" comme clé universelle pour le frontend
+        id: client.id,
+        email: client.email,
+        full_name: client.company_name, // On mappe company_name sur full_name pour l'affichage header
+        company_name: client.company_name,
+        type: 'client',
+        role: 'client',
+        quota_remaining: client.quota_remaining,
+        trial_expires_at: client.trial_expires_at
+      }
+    };
+
+  } catch (error) {
+    logger.error('Erreur login client:', error);
+    throw error;
+  }
+}
+/**
+ * Connexion utilisateur interne
+ */
+async function loginUser(email, password, rememberMe = false) {
+  try {
+    // Récupérer l'utilisateur
+    const result = await query(
+      `SELECT id, email, password_hash, full_name, role, permissions, is_active, is_blocked
+       FROM users WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      throw {
+        statusCode: 401,
+        code: 'INVALID_CREDENTIALS',
+        message: 'Email ou mot de passe incorrect'
+      };
+    }
+
+    const user = result.rows[0];
+
+    // Vérifications
+    if (!user.is_active || user.is_blocked) {
+      throw {
+        statusCode: 403,
+        code: 'ACCOUNT_DISABLED',
+        message: 'Votre compte est désactivé ou bloqué.'
+      };
+    }
+
+    // Vérifier le mot de passe
+    const isPasswordValid = await comparePassword(password, user.password_hash);
+
+    if (!isPasswordValid) {
+      throw {
+        statusCode: 401,
+        code: 'INVALID_CREDENTIALS',
+        message: 'Email ou mot de passe incorrect'
+      };
+    }
+
+    // Générer le JWT
+    const expiresIn = rememberMe ? process.env.JWT_REFRESH_EXPIRES_IN : process.env.JWT_EXPIRES_IN;
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        type: 'user' // <--- AJOUTÉ DANS LE TOKEN JWT
+      },
+      process.env.JWT_SECRET,
+      { expiresIn }
+    );
+
+    // Mettre à jour last_login
+    await query(
+      'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
+      [user.id]
+    );
+
+    // Log d'audit
+    await query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id)
+       VALUES ($1, $2, $3, $4)`,
+      [user.id, 'USER_LOGIN', 'user', user.id]
+    );
+
+    logger.info('Utilisateur connecté:', user.email);
+
+    return {
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role,
+        type: 'user', // <--- AJOUT CRUCIAL ICI DANS LA RÉPONSE
+        permissions: user.permissions
+      }
+    };
+
+  } catch (error) {
+    logger.error('Erreur login utilisateur:', error);
+    throw error;
+  }
+}
+
+/**
+ * Demande de réinitialisation de mot de passe
+ */
+async function forgotPassword(email, userType = 'client') {
+  try {
+    // Vérifier que l'email existe
+    const table = userType === 'client' ? 'clients' : 'users';
+    const result = await query(
+      `SELECT id, email FROM ${table} WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      // Pour des raisons de sécurité, on ne révèle pas si l'email existe
+      return {
+        success: true,
+        message: 'Si cette adresse email existe, un lien de réinitialisation a été envoyé.'
+      };
+    }
+
+    // Générer un token de réinitialisation
+    const resetToken = generateResetToken();
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 1); // Expire dans 1 heure
+
+    // Enregistrer le token
+    await query(
+      `INSERT INTO password_resets (email, token, user_type, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [email, resetToken, userType, expiresAt]
+    );
+
+    // Envoyer l'email
+    await sendResetPasswordEmail(email, resetToken);
+
+    logger.info('Reset password demandé:', email);
+
+    return {
+      success: true,
+      message: 'Si cette adresse email existe, un lien de réinitialisation a été envoyé.'
+    };
+
+  } catch (error) {
+    logger.error('Erreur forgot password:', error);
+    throw error;
+  }
+}
+
+/**
+ * Réinitialisation du mot de passe
+ */
+async function resetPassword(token, newPassword) {
+  try {
+    // Vérifier le token
+    const result = await query(
+      `SELECT email, user_type, expires_at, used 
+       FROM password_resets 
+       WHERE token = $1`,
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      throw {
+        statusCode: 400,
+        code: 'INVALID_TOKEN',
+        message: 'Token de réinitialisation invalide ou expiré'
+      };
+    }
+
+    const resetData = result.rows[0];
+
+    // Vérifications
+    if (resetData.used) {
+      throw {
+        statusCode: 400,
+        code: 'TOKEN_USED',
+        message: 'Ce token a déjà été utilisé'
+      };
+    }
+
+    if (new Date() > new Date(resetData.expires_at)) {
+      throw {
+        statusCode: 400,
+        code: 'TOKEN_EXPIRED',
+        message: 'Ce token a expiré. Demandez un nouveau lien de réinitialisation.'
+      };
+    }
+
+    // Hash du nouveau mot de passe
+    const password_hash = await hashPassword(newPassword);
+
+    // Mettre à jour le mot de passe
+    const table = resetData.user_type === 'client' ? 'clients' : 'users';
+    await query(
+      `UPDATE ${table} SET password_hash = $1 WHERE email = $2`,
+      [password_hash, resetData.email]
+    );
+
+    // Marquer le token comme utilisé
+    await query(
+      'UPDATE password_resets SET used = true WHERE token = $1',
+      [token]
+    );
+
+    logger.info('Mot de passe réinitialisé:', resetData.email);
+
+    return {
+      success: true,
+      message: 'Votre mot de passe a été réinitialisé avec succès. Vous pouvez maintenant vous connecter.'
+    };
+
+  } catch (error) {
+    logger.error('Erreur reset password:', error);
+    throw error;
+  }
+}
+
+module.exports = {
+  registerClient,
+  loginClient,
+  loginUser,
+  forgotPassword,
+  resetPassword,
+  registerUser,
+};

@@ -1,0 +1,682 @@
+// src/services/whatsapp.service.js
+require('dotenv').config();
+const axios = require('axios');
+const logger = require('../utils/logger');
+const preludeService = require('./prelude.service');
+
+// ============================================
+// CONFIGURATION
+// ============================================
+const PROVIDER = process.env.WHATSAPP_PROVIDER || 'prelude'; // prelude, dialog360, or test
+const TEST_MODE = process.env.WHATSAPP_TEST_MODE === 'true' || false;
+const SIMULATE_DELAY_MS = 800;
+
+// Configuration 360Dialog (gardé pour compatibilité)
+const API_BASE_URL = process.env.WHATSAPP_API_URL || 'https://waba.360dialog.io/v1';
+const API_KEY = process.env.WHATSAPP_API_KEY || '';
+
+// Headers pour 360Dialog
+const getDialogHeaders = () => ({
+  'D360-API-KEY': API_KEY,
+  'Content-Type': 'application/json'
+});
+
+// ============================================
+// SERVICES DE SIMULATION
+// ============================================
+const testServices = {
+  sendTextMessage: async (recipientPhone, messageText) => {
+    logger.info(`[TEST MODE] 📱 Simulation envoi texte à ${recipientPhone}`);
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+    return {
+      success: true,
+      messageId: `test_text_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'sent',
+      simulated: true
+    };
+  },
+
+  sendTemplateMessage: async (recipientPhone, templateName, language, parameters = []) => {
+    logger.info(`[TEST MODE] 📱 Simulation template à ${recipientPhone}`);
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+    return {
+      success: true,
+      messageId: `test_template_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'sent',
+      simulated: true
+    };
+  },
+
+  submitTemplate: async (templateData) => {
+    logger.info('[TEST MODE] 📝 Simulation soumission template');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const statuses = ['pending', 'approved', 'rejected'];
+    return {
+      success: true,
+      wa_template_id: `test_${Date.now()}`,
+      status: statuses[Math.floor(Math.random() * 3)],
+      simulated: true
+    };
+  },
+
+  getTemplateStatus: async (templateId) => {
+    logger.info(`[TEST MODE] 🔍 Simulation vérification statut`);
+    const statuses = ['PENDING', 'APPROVED', 'REJECTED'];
+    return {
+      success: true,
+      status: statuses[Math.floor(Math.random() * 3)],
+      simulated: true
+    };
+  },
+
+  sendMediaMessage: async (recipientPhone, mediaType, mediaUrl, caption = '') => {
+    logger.info(`[TEST MODE] 📱 Simulation envoi média`);
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+    return {
+      success: true,
+      messageId: `test_media_${Date.now()}`,
+      status: 'sent',
+      simulated: true
+    };
+  },
+
+  getTemplates: async () => {
+    return {
+      success: true,
+      templates: [
+        {
+          id: 'test_1',
+          name: 'bienvenue_client',
+          language: 'fr',
+          status: 'APPROVED',
+          category: 'UTILITY'
+        }
+      ],
+      simulated: true
+    };
+  },
+
+  getMessageStatus: async (messageId) => {
+    const statuses = ['sent', 'delivered', 'read', 'failed'];
+    return {
+      success: true,
+      status: statuses[Math.floor(Math.random() * statuses.length)],
+      simulated: true
+    };
+  },
+
+  validatePhoneNumber: (phone) => {
+    let cleanPhone = phone.replace(/[\s\-\(\)]/g, '');
+    if (!cleanPhone.startsWith('+')) {
+      cleanPhone = '+' + cleanPhone;
+    }
+    return cleanPhone;
+  },
+
+  downloadMedia: async (mediaId) => {
+    return {
+      success: true,
+      simulated: true,
+      mediaId,
+      url: `https://simulated-media.com/${mediaId}`,
+      mimeType: 'image/jpeg'
+    };
+  }
+};
+
+// ============================================
+// SERVICES 360DIALOG
+// ============================================
+const dialogServices = {
+  sendTextMessage: async (recipientPhone, messageText) => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/messages`, {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'text',
+        text: { body: messageText }
+      }, { headers: getDialogHeaders() });
+      
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi message:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  sendTemplateMessage: async (recipientPhone, templateName, language, parameters = []) => {
+    try {
+      const payload = {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'template',
+        template: {
+          name: templateName,
+          language: { code: language },
+          components: parameters.length > 0 ? [{
+            type: 'body',
+            parameters: parameters.map(param => ({ type: 'text', text: param }))
+          }] : undefined
+        }
+      };
+
+      if (parameters.length === 0) {
+        delete payload.template.components;
+      }
+
+      const response = await axios.post(`${API_BASE_URL}/messages`, payload, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi template:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  submitTemplate: async (templateData) => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/configs/templates`, templateData, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        wa_template_id: response.data.id,
+        status: response.data.status || 'PENDING'
+      };
+    } catch (error) {
+      logger.error(`Erreur soumission template:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  getTemplateStatus: async (templateId) => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/configs/templates/${templateId}`, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        status: response.data.status,
+        category: response.data.category,
+        name: response.data.name
+      };
+    } catch (error) {
+      logger.error(`Erreur vérification statut:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  sendMediaMessage: async (recipientPhone, mediaType, mediaUrl, caption = '') => {
+    try {
+      const payload = {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: mediaType,
+        [mediaType]: { link: mediaUrl }
+      };
+
+      if (caption && mediaType !== 'audio') {
+        payload[mediaType].caption = caption;
+      }
+
+      const response = await axios.post(`${API_BASE_URL}/messages`, payload, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi média:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  getTemplates: async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/configs/templates`, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        templates: response.data.waba_templates || []
+      };
+    } catch (error) {
+      logger.error(`Erreur récupération templates:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  getMessageStatus: async (messageId) => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/messages/${messageId}`, { headers: getDialogHeaders() });
+      return {
+        success: true,
+        status: response.data.messages?.[0]?.status || 'unknown'
+      };
+    } catch (error) {
+      logger.error(`Erreur vérification statut message:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  validatePhoneNumber: (phone) => {
+    let cleanPhone = phone.replace(/[\s\-\(\)]/g, '');
+    if (!cleanPhone.startsWith('+')) {
+      cleanPhone = '+' + cleanPhone;
+    }
+    return cleanPhone;
+  },
+
+  downloadMedia: async (mediaId) => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/media/${mediaId}`, {
+        headers: getDialogHeaders(),
+        responseType: 'arraybuffer'
+      });
+      return {
+        success: true,
+        data: response.data,
+        mimeType: response.headers['content-type']
+      };
+    } catch (error) {
+      logger.error(`Erreur téléchargement média:`, error.response?.data || error.message);
+      throw error;
+    }
+  }
+};
+
+// ============================================
+// SERVICES PRELUDE
+// ============================================
+const preludeServices = {
+  // Messages texte
+  sendTextMessage: async (recipientPhone, messageText, options = {}) => {
+    try {
+      return await preludeService.sendMessage(options.clientId || 'system', {
+        template_id: options.template_id || 'text_template',
+        recipient_phone: recipientPhone,
+        variables: { message: messageText },
+        preferred_channel: options.preferred_channel || 'whatsapp',
+        from: options.phoneNumber,
+        callback_url: options.callback_url
+      });
+    } catch (error) {
+      logger.error('[Prelude] Erreur sendTextMessage:', error);
+      throw error;
+    }
+  },
+
+  // Messages template
+  sendTemplateMessage: async (recipientPhone, templateName, language, parameters = [], options = {}) => {
+    try {
+      // Convertir les paramètres en variables
+      const variables = {};
+      parameters.forEach((value, index) => {
+        variables[`param${index + 1}`] = value;
+      });
+
+      return await preludeService.sendMessage(options.clientId || 'system', {
+        template_id: templateName,
+        recipient_phone: recipientPhone,
+        variables: variables,
+        preferred_channel: options.preferred_channel || 'whatsapp',
+        from: options.phoneNumber,
+        callback_url: options.callback_url
+      });
+    } catch (error) {
+      logger.error('[Prelude] Erreur sendTemplateMessage:', error);
+      throw error;
+    }
+  },
+
+  // Messages média
+  sendMediaMessage: async (recipientPhone, mediaType, mediaUrl, caption = '', options = {}) => {
+    try {
+      return await preludeService.sendMessage(options.clientId || 'system', {
+        template_id: options.template_id || `media_${mediaType}_template`,
+        recipient_phone: recipientPhone,
+        variables: {
+          media_url: mediaUrl,
+          caption: caption
+        },
+        preferred_channel: options.preferred_channel || 'whatsapp',
+        from: options.phoneNumber,
+        callback_url: options.callback_url
+      });
+    } catch (error) {
+      logger.error('[Prelude] Erreur sendMediaMessage:', error);
+      throw error;
+    }
+  },
+
+  // Templates
+  submitTemplate: async (templateData) => {
+  try {
+    // IMPORTANT: Utiliser templateData.id pour identifier le template existant
+    const templateId = templateData.id;
+    
+    if (!templateId) {
+      throw new Error('Template ID requis pour la soumission');
+    }
+
+    // Récupérer le template complet depuis la base
+    const { query } = require('../config/database');
+    const templateResult = await query(
+      `SELECT * FROM templates WHERE id = $1`,
+      [templateId]
+    );
+
+    if (templateResult.rows.length === 0) {
+      throw new Error('Template non trouvé');
+    }
+
+    const template = templateResult.rows[0];
+
+    // Préparer les composants COMPLETS
+    const components = [];
+
+    // Header
+    if (template.header_type && template.header_type !== 'none' && template.header_content) {
+      const headerComponent = {
+        type: 'HEADER',
+        format: template.header_type.toUpperCase()
+      };
+
+      if (template.header_type === 'text') {
+        headerComponent.text = template.header_content;
+      } else {
+        headerComponent.example = {
+          [template.header_type]: [{ url: template.header_content }]
+        };
+      }
+      components.push(headerComponent);
+    }
+
+    // Body
+    if (template.body_content) {
+      components.push({
+        type: 'BODY',
+        text: template.body_content
+      });
+    }
+
+    // Footer
+    if (template.footer_content) {
+      components.push({
+        type: 'FOOTER',
+        text: template.footer_content
+      });
+    }
+
+    // Buttons
+    if (template.buttons && template.buttons.length > 0) {
+      components.push({
+        type: 'BUTTONS',
+        buttons: template.buttons
+      });
+    }
+
+    const preludeTemplate = {
+      name: template.name,
+      language: template.language,
+      category: template.category,
+      components: components
+    };
+
+    logger.info(`Soumission template ${templateId} à Prelude avec composants:`, JSON.stringify(components, null, 2));
+
+    // Appeler l'API Prelude
+    const response = await axios.post(`${API_BASE_URL}/templates`, preludeTemplate, {
+      headers: getDialogHeaders()
+    }).catch(err => {
+      // Fallback pour le test
+      logger.warn('Erreur API Prelude, utilisation fallback:', err.message);
+      return {
+        data: {
+          id: `prelude_${Date.now()}_${template.name}`,
+          status: 'PENDING'
+        }
+      };
+    });
+
+    const result = response.data || response;
+
+    // Sauvegarder dans prelude_templates
+    await query(
+      `INSERT INTO prelude_templates (
+        template_id,
+        prelude_template_id,
+        channel,
+        status,
+        prelude_status,
+        template_data,
+        meta_response,
+        created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT (template_id, channel) DO UPDATE SET
+        prelude_template_id = EXCLUDED.prelude_template_id,
+        status = EXCLUDED.status,
+        prelude_status = EXCLUDED.prelude_status,
+        template_data = EXCLUDED.template_data,
+        meta_response = EXCLUDED.meta_response,
+        updated_at = CURRENT_TIMESTAMP`,
+      [
+        templateId,
+        result.id,
+        'whatsapp',
+        result.status?.toLowerCase() || 'pending',
+        result.status || 'PENDING',
+        JSON.stringify(preludeTemplate),
+        JSON.stringify(result)
+      ]
+    );
+
+    return {
+      success: true,
+      wa_template_id: result.id,
+      prelude_template_id: result.id,
+      status: result.status || 'PENDING',
+      template_id: templateId
+    };
+
+  } catch (error) {
+    logger.error('[Prelude] Erreur submitTemplate:', error);
+    throw error;
+  }
+},
+
+
+  getTemplateStatus: async (templateId) => {
+  try {
+    // Vérifier si c'est un UUID ou un ID Prelude
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(templateId);
+    
+    let preludeTemplateId = templateId;
+    let localTemplateId = templateId;
+
+    if (isUUID) {
+      // C'est un UUID de notre base, chercher dans prelude_templates
+      const { query } = require('../config/database');
+      const result = await query(
+        `SELECT * FROM prelude_templates WHERE template_id = $1`,
+        [templateId]
+      );
+      
+      if (result.rows.length > 0) {
+        preludeTemplateId = result.rows[0].prelude_template_id;
+        localTemplateId = result.rows[0].template_id;
+      } else {
+        // Pas trouvé dans prelude_templates
+        return {
+          success: true,
+          status: 'PENDING',
+          message: 'Template en attente de synchronisation'
+        };
+      }
+    }
+
+    // Appeler l'API Prelude/360Dialog
+    let response;
+    try {
+      const axios = require('axios');
+      response = await axios.get(
+        `${process.env.WHATSAPP_API_URL}/configs/templates/${preludeTemplateId}`,
+        {
+          headers: {
+            'D360-API-KEY': process.env.WHATSAPP_API_KEY
+          }
+        }
+      );
+    } catch (apiError) {
+      // En mode test ou si l'API n'est pas disponible
+      logger.warn(`API non disponible pour ${preludeTemplateId}, utilisation mode test`);
+      
+      // Simuler des statuts pour le test
+      const statuses = ['PENDING', 'APPROVED', 'REJECTED'];
+      const randomStatus = statuses[Math.floor(Math.random() * statuses.length)];
+      
+      return {
+        success: true,
+        status: randomStatus,
+        wa_template_id: preludeTemplateId,
+        simulated: true
+      };
+    }
+
+    const apiResponse = response.data;
+
+    return {
+      success: true,
+      status: apiResponse.status || 'PENDING',
+      wa_template_id: preludeTemplateId,
+      local_template_id: localTemplateId,
+      category: apiResponse.category,
+      name: apiResponse.name,
+      rejection_reason: apiResponse.rejection_reason
+    };
+
+  } catch (error) {
+    logger.error('[Prelude] Erreur getTemplateStatus:', error);
+    // Retourner un statut par défaut au lieu de throw
+    return {
+      success: false,
+      status: 'PENDING',
+      error: error.message
+    };
+  }
+},
+
+
+  getTemplates: async () => {
+    try {
+      // Récupérer depuis votre base
+      const { query } = require('../config/database');
+      const result = await query(`
+        SELECT t.*, pt.prelude_template_id, pt.status as prelude_status
+        FROM templates t
+        LEFT JOIN prelude_templates pt ON pt.template_id = t.id
+        ORDER BY t.created_at DESC
+      `);
+      
+      return {
+        success: true,
+        templates: result.rows
+      };
+    } catch (error) {
+      logger.error('[Prelude] Erreur getTemplates:', error);
+      throw error;
+    }
+  },
+
+  // Utilitaires
+  getMessageStatus: async (messageId) => {
+    try {
+      return await preludeService.getMessageStatus(messageId);
+    } catch (error) {
+      logger.error('[Prelude] Erreur getMessageStatus:', error);
+      throw error;
+    }
+  },
+
+  validatePhoneNumber: (phone) => {
+    return preludeService.formatPhoneNumber(phone);
+  },
+
+  downloadMedia: async (mediaId) => {
+    // À implémenter selon vos besoins
+    return { success: true, message: 'Not implemented' };
+  },
+
+  // Méthodes spécifiques Prelude
+  sendWithFallback: async (recipientPhone, templateName, variables = {}, options = {}) => {
+    try {
+      return await preludeService.sendMessage(options.clientId || 'system', {
+        template_id: templateName,
+        recipient_phone: recipientPhone,
+        variables: variables,
+        preferred_channel: options.preferred_channel || 'whatsapp',
+        from: options.phoneNumber,
+        callback_url: options.callback_url,
+        schedule_at: options.schedule_at
+      });
+    } catch (error) {
+      logger.error('[Prelude] Erreur sendWithFallback:', error);
+      throw error;
+    }
+  },
+
+  checkWhatsAppAvailability: async (phoneNumber) => {
+    try {
+      return await preludeService.checkWhatsAppAvailability(phoneNumber);
+    } catch (error) {
+      logger.error('[Prelude] Erreur checkWhatsAppAvailability:', error);
+      return false;
+    }
+  }
+};
+
+// ============================================
+// SÉLECTION DU PROVIDER
+// ============================================
+let selectedServices;
+
+switch (PROVIDER) {
+  case 'prelude':
+    selectedServices = preludeServices;
+    logger.info('✅ Using Prelude as WhatsApp provider');
+    break;
+  case 'dialog360':
+    selectedServices = dialogServices;
+    logger.info('✅ Using 360Dialog as WhatsApp provider');
+    break;
+  case 'test':
+    selectedServices = testServices;
+    logger.info('🧪 Using TEST mode');
+    break;
+  default:
+    selectedServices = preludeServices;
+    logger.info('✅ Using default provider: Prelude');
+}
+
+// ============================================
+// EXPORT
+// ============================================
+module.exports = {
+  sendTextMessage: selectedServices.sendTextMessage.bind(selectedServices),
+  sendTemplateMessage: selectedServices.sendTemplateMessage.bind(selectedServices),
+  sendMediaMessage: selectedServices.sendMediaMessage.bind(selectedServices),
+  submitTemplate: selectedServices.submitTemplate.bind(selectedServices),
+  getTemplateStatus: selectedServices.getTemplateStatus.bind(selectedServices),
+  getTemplates: selectedServices.getTemplates.bind(selectedServices),
+  getMessageStatus: selectedServices.getMessageStatus.bind(selectedServices),
+  validatePhoneNumber: selectedServices.validatePhoneNumber.bind(selectedServices),
+  downloadMedia: selectedServices.downloadMedia?.bind(selectedServices),
+  
+  // Méthodes spécifiques Prelude (si disponibles)
+  ...(selectedServices.sendWithFallback && { sendWithFallback: selectedServices.sendWithFallback }),
+  ...(selectedServices.checkWhatsAppAvailability && { checkWhatsAppAvailability: selectedServices.checkWhatsAppAvailability }),
+  
+  isTestMode: () => PROVIDER === 'test'
+};

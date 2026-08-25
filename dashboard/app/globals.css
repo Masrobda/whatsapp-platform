@@ -1,0 +1,339 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #f8faf9;
+    color: #1a1a1a;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Inputs, select, textarea - texte visible (noir sur blanc) */
+  input, select, textarea {
+    color: #1a1a1a !important;
+    background-color: white !important;
+  }
+
+  input::placeholder, textarea::placeholder {
+    color: #9ca3af !important;
+  }
+
+  /* Focus ring avec la couleur primaire */
+  input:focus, select:focus, textarea:focus {
+    outline: 2px solid #2d7a3e;
+    outline-offset: 2px;
+  }
+
+  /* Tableaux */
+  table {
+    width: 100%;
+    background-color: white;
+    color: #1a1a1a;
+  }
+
+  th {
+    background-color: #f0f7f3;
+    color: #1e5a2f;
+    font-weight: 600;
+  }
+
+  td {
+    border-bottom: 1px solid #e5ebe8;
+  }
+
+  tr:hover {
+    background-color: #f8fbfa;
+  }
+
+  :root {
+    /* Couleurs principales de la charte */
+    --primary-green: #2d7a3e;        /* Vert principal professionnel */
+    --primary-green-light: #3a9950;  /* Vert clair */
+    --primary-green-dark: #1e5a2f;   /* Vert foncé */
+
+    --lime-green: #8bc34a;           /* Vert citron principal */
+    --lime-green-light: #aed581;     /* Vert citron clair */
+    --lime-green-dark: #689f38;      /* Vert citron foncé */
+
+    --blue-accent: #1976d2;          /* Bleu d'accentuation */
+    --blue-accent-light: #42a5f5;    /* Bleu clair */
+    --blue-accent-dark: #0d47a1;     /* Bleu foncé */
+
+    /* Teintes neutres complémentaires */
+    --neutral-50: #f8faf9;
+    --neutral-100: #f0f7f3;
+    --neutral-200: #e5ebe8;
+    --neutral-300: #cbd5d0;
+    --neutral-400: #9eada5;
+    --neutral-500: #6b7c74;
+    --neutral-600: #4a5852;
+    --neutral-700: #2f3935;
+    --neutral-800: #1a1f1d;
+    --neutral-900: #0f1211;
+
+    /* Variables shadcn/ui adaptées à la charte */
+    --background: 0 0% 100%;
+    --foreground: 150 15% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 150 15% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 150 15% 10%;
+
+    --primary: 145 48% 33%;           /* Vert principal */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 88 50% 53%;          /* Vert citron */
+    --secondary-foreground: 150 15% 10%;
+
+    --accent: 207 77% 46%;            /* Bleu */
+    --accent-foreground: 0 0% 100%;
+
+    --muted: 140 15% 94%;
+    --muted-foreground: 150 10% 45%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 140 15% 90%;
+    --input: 140 15% 90%;
+    --ring: 145 48% 33%;
+
+    --chart-1: 145 48% 33%;           /* Vert principal */
+    --chart-2: 88 50% 53%;            /* Vert citron */
+    --chart-3: 207 77% 46%;           /* Bleu */
+    --chart-4: 145 38% 58%;           /* Vert pastel */
+    --chart-5: 88 40% 70%;            /* Citron pastel */
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 150 15% 5%;
+    --foreground: 0 0% 98%;
+
+    --card: 150 15% 8%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 150 15% 8%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 145 55% 45%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 88 55% 60%;
+    --secondary-foreground: 150 15% 10%;
+
+    --accent: 207 77% 55%;
+    --accent-foreground: 0 0% 100%;
+
+    --muted: 150 10% 15%;
+    --muted-foreground: 0 0% 64%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 150 10% 15%;
+    --input: 150 10% 15%;
+    --ring: 145 55% 45%;
+
+    --chart-1: 145 55% 50%;
+    --chart-2: 88 55% 65%;
+    --chart-3: 207 77% 60%;
+    --chart-4: 145 45% 60%;
+    --chart-5: 88 45% 75%;
+  }
+}
+
+@layer components {
+  /* Classes utilitaires pour la charte de couleurs */
+  .btn-primary {
+    @apply bg-[var(--primary-green)] hover:bg-[var(--primary-green-dark)] text-white font-medium px-4 py-2 rounded-lg transition-colors duration-200;
+  }
+
+  .btn-secondary {
+    @apply bg-[var(--lime-green)] hover:bg-[var(--lime-green-dark)] text-[var(--neutral-800)] font-medium px-4 py-2 rounded-lg transition-colors duration-200;
+  }
+
+  .btn-accent {
+    @apply bg-[var(--blue-accent)] hover:bg-[var(--blue-accent-dark)] text-white font-medium px-4 py-2 rounded-lg transition-colors duration-200;
+  }
+
+  .btn-outline {
+    @apply border-2 border-[var(--primary-green)] text-[var(--primary-green)] hover:bg-[var(--primary-green)] hover:text-white font-medium px-4 py-2 rounded-lg transition-colors duration-200;
+  }
+
+  /* Sélecteurs Tailwind personnalisés */
+  .text-input {
+    @apply text-dark placeholder-gray-500 bg-white border border-[var(--neutral-300)] rounded-lg focus:ring-2 focus:ring-[var(--primary-green)] focus:border-transparent transition-all duration-200;
+  }
+
+  /* Badges de statut */
+  .badge-success {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--lime-green-light)] text-[var(--primary-green-dark)];
+  }
+
+  .badge-info {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-[var(--blue-accent-light)] text-[var(--blue-accent-dark)];
+  }
+
+  .badge-warning {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800;
+  }
+
+  /* Cartes */
+  .card {
+    @apply bg-white rounded-lg shadow-sm border border-[var(--neutral-200)] p-6 hover:shadow-md transition-shadow duration-200;
+  }
+
+  .card-header {
+    @apply border-b border-[var(--neutral-200)] pb-4 mb-4;
+  }
+
+  /* Classe utilitaire pour les tableaux standardisés */
+  .table-standard {
+    @apply min-w-full divide-y divide-[var(--neutral-200)] bg-white text-dark;
+  }
+
+  /* Navigation */
+  .nav-link {
+    @apply text-[var(--neutral-600)] hover:text-[var(--primary-green)] font-medium transition-colors duration-200;
+  }
+
+  .nav-link-active {
+    @apply text-[var(--primary-green)] font-semibold border-b-2 border-[var(--primary-green)];
+  }
+
+  /* Alertes */
+  .alert-success {
+    @apply bg-[var(--neutral-100)] border-l-4 border-[var(--primary-green)] text-[var(--neutral-800)] p-4 rounded;
+  }
+
+  .alert-info {
+    @apply bg-blue-50 border-l-4 border-[var(--blue-accent)] text-[var(--neutral-800)] p-4 rounded;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* Utilitaires de couleurs personnalisées */
+  .text-primary {
+    color: var(--primary-green);
+  }
+
+  .text-secondary {
+    color: var(--lime-green);
+  }
+
+  .text-accent {
+    color: var(--blue-accent);
+  }
+
+  .bg-primary {
+    background-color: var(--primary-green);
+  }
+
+  .bg-secondary {
+    background-color: var(--lime-green);
+  }
+
+  .bg-accent {
+    background-color: var(--blue-accent);
+  }
+
+  .border-primary {
+    border-color: var(--primary-green);
+  }
+
+  .border-secondary {
+    border-color: var(--lime-green);
+  }
+
+  .border-accent {
+    border-color: var(--blue-accent);
+  }
+}
+
+/* Animations personnalisées */
+@keyframes slideIn {
+  from {
+    transform: translateX(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s ease-out;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.3s ease-out;
+}
+
+/* Custom scrollbar avec couleurs de la charte */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background-color: var(--neutral-100);
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--primary-green-light);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--primary-green);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}

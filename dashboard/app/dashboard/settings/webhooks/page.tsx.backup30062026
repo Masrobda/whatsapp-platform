@@ -1,0 +1,1076 @@
+// app/dashboard/settings/webhooks/page.tsx
+'use client';
+
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import Card, { CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
+import Button from '@/components/ui/Button';
+import Tabs from '@/components/ui/Tabs';
+import Pagination from '@/components/ui/Pagination';
+import {
+  FiPlus, FiTrash2, FiEdit2, FiCheck, FiX, FiRefreshCw,
+  FiClock, FiAlertCircle, FiCheckCircle, FiCopy,
+  FiEye, FiEyeOff, FiBell, FiShield, FiZap, FiLoader,
+  FiActivity, FiAlertTriangle, FiLink,
+  FiToggleLeft, FiToggleRight, FiTrendingUp, FiSend,
+  FiInbox, FiTerminal, FiExternalLink, FiInfo
+} from 'react-icons/fi';
+import { copyToClipboard } from '@/lib/utils';
+import Cookies from 'js-cookie';
+
+// ── Types ────────────────────────────────────────────────────
+interface Webhook {
+  id: string;
+  url: string;
+  secret: string;
+  events: string[];
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+  last_triggered_at?: string;
+  last_status?: number;
+  last_error?: string;
+}
+
+interface WebhookLog {
+  id: string;
+  webhook_id: string;
+  url?: string;
+  event: string;
+  payload: any;
+  response_status: number;
+  response_body?: string;
+  duration_ms: number;
+  created_at: string;
+}
+
+// ── Design tokens ────────────────────────────────────────────
+// Brand: #2d7a3e (green). Everything else is neutral so the brand
+// reads as a deliberate accent, not wallpaper.
+const BRAND = '#2d7a3e';
+const BRAND_DARK = '#1f5c2c';
+const BRAND_SOFT = '#f0f7f3';
+
+const AVAILABLE_EVENTS = [
+  { value: 'message.sent',      label: 'Message envoyé',  icon: FiSend,        desc: 'Accepté par les serveurs WhatsApp' },
+  { value: 'message.delivered', label: 'Message délivré', icon: FiCheckCircle, desc: 'Reçu sur le téléphone du destinataire' },
+  { value: 'message.read',      label: 'Message lu',      icon: FiEye,         desc: 'Ouvert par le destinataire' },
+  { value: 'message.failed',    label: "Échec d'envoi",   icon: FiAlertCircle, desc: "Le message n'a pas pu être délivré" },
+  { value: 'message.incoming',  label: 'Réponse reçue',   icon: FiInbox,       desc: 'Un contact vous répond sur WhatsApp' },
+];
+
+const EVENT_STYLES: Record<string, { badge: string; dot: string }> = {
+  'message.sent':      { badge: 'bg-blue-50 text-blue-700 ring-blue-600/20',     dot: 'bg-blue-500' },
+  'message.delivered': { badge: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20', dot: 'bg-emerald-500' },
+  'message.read':      { badge: 'bg-violet-50 text-violet-700 ring-violet-600/20',    dot: 'bg-violet-500' },
+  'message.failed':    { badge: 'bg-red-50 text-red-700 ring-red-600/20',        dot: 'bg-red-500' },
+  'message.incoming':  { badge: 'bg-amber-50 text-amber-700 ring-amber-600/20',  dot: 'bg-amber-500' },
+  'message.test':      { badge: 'bg-gray-100 text-gray-600 ring-gray-500/20',    dot: 'bg-gray-400' },
+};
+
+const EVENT_LABEL: Record<string, string> = Object.fromEntries(
+  AVAILABLE_EVENTS.map(e => [e.value, e.label])
+);
+
+function genSecret(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+  }
+  return Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+}
+
+function relativeTime(iso?: string): string {
+  if (!iso) return '—';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diffMs / 60000);
+  if (m < 1) return "à l'instant";
+  if (m < 60) return `il y a ${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `il y a ${d} j`;
+  return new Date(iso).toLocaleDateString('fr-FR');
+}
+
+// ── Small UI atoms ──────────────────────────────────────────
+function Skeleton({ className = '' }: { className?: string }) {
+  return <div className={`animate-pulse rounded-lg bg-gray-100 ${className}`} />;
+}
+
+function EmptyState({
+  icon: Icon, title, hint, action,
+}: { icon: any; title: string; hint: string; action?: React.ReactNode }) {
+  return (
+    <div className="text-center py-16 px-6 border-2 border-dashed border-gray-200 rounded-2xl bg-gray-50/50">
+      <div className="w-12 h-12 rounded-xl bg-white border border-gray-200 flex items-center justify-center mx-auto mb-4 shadow-sm">
+        <Icon size={20} className="text-gray-400" />
+      </div>
+      <p className="font-semibold text-gray-700">{title}</p>
+      <p className="text-sm text-gray-400 mt-1 max-w-sm mx-auto">{hint}</p>
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  );
+}
+
+function StatusPill({ active }: { active: boolean }) {
+  return (
+    <button
+      type="button"
+      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold transition-colors ring-1 ring-inset ${
+        active
+          ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 hover:bg-emerald-100'
+          : 'bg-gray-100 text-gray-500 ring-gray-400/20 hover:bg-gray-200'
+      }`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-emerald-500' : 'bg-gray-400'}`} />
+      {active ? 'Actif' : 'En pause'}
+    </button>
+  );
+}
+
+// ── Main Component ────────────────────────────────────────────
+export default function WebhooksSettingsPage() {
+  const [webhooks, setWebhooks]       = useState<Webhook[]>([]);
+  const [logs, setLogs]               = useState<WebhookLog[]>([]);
+  const [isLoading, setIsLoading]     = useState(true);
+  const [isSaving, setIsSaving]       = useState(false);
+  const [editingId, setEditingId]     = useState<string | null>(null);
+  const [activeTab, setActiveTab]     = useState('webhooks');
+  const [toast, setToast]             = useState<{ type: 'ok' | 'err' | 'warn'; msg: string } | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, any>>({});
+  const [testLoading, setTestLoading] = useState<Record<string, boolean>>({});
+  const [showForm, setShowForm]       = useState(false);
+
+  // Formulaire
+  const [formUrl, setFormUrl]         = useState('');
+  const [formSecret, setFormSecret]   = useState('');
+  const [formEvents, setFormEvents]   = useState<string[]>(['message.delivered', 'message.read', 'message.failed']);
+  const [showFormSecret, setShowFormSecret] = useState(false);
+  const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
+  const [copied, setCopied]           = useState<string | null>(null);
+  const [urlError, setUrlError]       = useState<string | null>(null);
+
+  // Secret modal après création
+  const [createdWebhook, setCreatedWebhook] = useState<Webhook | null>(null);
+  const [showCreatedSecret, setShowCreatedSecret] = useState(false);
+
+  // Logs pagination
+  const [logPage, setLogPage]         = useState(1);
+  const [logTotal, setLogTotal]       = useState(0);
+  const LOG_LIMIT = 20;
+
+  const token = () => Cookies.get('token') || localStorage.getItem('token') || '';
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+
+  const showToast = (type: 'ok' | 'err' | 'warn', msg: string) => {
+    setToast({ type, msg });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  // ── Loaders ──────────────────────────────────────────────────
+  useEffect(() => { loadWebhooks(); }, []);
+
+  const loadWebhooks = async () => {
+    setIsLoading(true);
+    try {
+      const res  = await fetch(`${apiUrl}/webhooks/client`, { headers: { Authorization: `Bearer ${token()}` } });
+      const data = await res.json();
+      if (data.success) setWebhooks(data.webhooks || []);
+      else showToast('err', data.message || 'Impossible de charger les webhooks');
+    } catch { showToast('err', 'Erreur réseau — impossible de charger les webhooks'); }
+    finally { setIsLoading(false); }
+  };
+
+  // ── Derived dashboard stats ───────────────────────────────────
+  const dashboardStats = useMemo(() => {
+    const total = webhooks.length;
+    const active = webhooks.filter(w => w.is_active).length;
+    const withErrors = webhooks.filter(w => w.last_status && (w.last_status < 200 || w.last_status >= 300)).length;
+    const healthy = total - withErrors;
+    const successRate = total > 0 ? Math.round((healthy / total) * 100) : 100;
+    return { total, active, withErrors, successRate };
+  }, [webhooks]);
+
+  // ── CRUD ──────────────────────────────────────────────────────
+  const resetForm = () => {
+    setEditingId(null);
+    setFormUrl('');
+    setFormSecret('');
+    setFormEvents(['message.delivered', 'message.read', 'message.failed']);
+    setShowFormSecret(false);
+    setUrlError(null);
+    setShowForm(false);
+  };
+
+  const startEdit = (w: Webhook) => {
+    setEditingId(w.id);
+    setFormUrl(w.url);
+    setFormSecret(w.secret || '');
+    setFormEvents(w.events || []);
+    setShowFormSecret(false);
+    setShowForm(true);
+    setUrlError(null);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const validateUrl = (value: string): string | null => {
+    if (!value.trim()) return 'Veuillez entrer une URL';
+    try {
+      const u = new URL(value);
+      if (u.protocol !== 'https:') return 'Seules les URL HTTPS sont acceptées';
+      return null;
+    } catch {
+      return 'URL invalide — format attendu : https://...';
+    }
+  };
+
+  const saveWebhook = async () => {
+    const err = validateUrl(formUrl);
+    if (err) { setUrlError(err); showToast('warn', err); return; }
+    if (formEvents.length === 0) { showToast('warn', 'Sélectionnez au moins un événement'); return; }
+
+    setIsSaving(true);
+    try {
+      const isEdit = !!editingId;
+      const method = isEdit ? 'PUT' : 'POST';
+      const url    = isEdit
+        ? `${apiUrl}/webhooks/client/${editingId}`
+        : `${apiUrl}/webhooks/client`;
+
+      const body: any = { url: formUrl, events: formEvents };
+      if (formSecret) body.secret = formSecret;
+      if (isEdit) body.is_active = webhooks.find(w => w.id === editingId)?.is_active ?? true;
+
+      const res  = await fetch(url, {
+        method,
+        headers: { Authorization: `Bearer ${token()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        showToast('ok', isEdit ? 'Webhook mis à jour' : 'Webhook créé');
+        if (!isEdit && data.webhook) {
+          setCreatedWebhook(data.webhook);
+          setShowCreatedSecret(true);
+        }
+        resetForm();
+        await loadWebhooks();
+      } else {
+        showToast('err', data.message || 'Erreur lors de la sauvegarde');
+      }
+    } catch (e: any) {
+      showToast('err', e.message || 'Erreur réseau');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const deleteWebhook = async (id: string) => {
+    if (!confirm('Supprimer ce webhook définitivement ? Cette action est irréversible.')) return;
+    try {
+      const res  = await fetch(`${apiUrl}/webhooks/client/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token()}` }
+      });
+      const data = await res.json();
+      if (data.success) { showToast('ok', 'Webhook supprimé'); await loadWebhooks(); }
+      else showToast('err', data.message || 'Erreur lors de la suppression');
+    } catch { showToast('err', 'Erreur réseau'); }
+  };
+
+  const toggleWebhook = async (w: Webhook) => {
+    // Optimistic update for a snappier feel
+    setWebhooks(prev => prev.map(x => x.id === w.id ? { ...x, is_active: !x.is_active } : x));
+    try {
+      const res  = await fetch(`${apiUrl}/webhooks/client/${w.id}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: w.url, events: w.events, is_active: !w.is_active })
+      });
+      const data = await res.json();
+      if (!data.success) {
+        setWebhooks(prev => prev.map(x => x.id === w.id ? { ...x, is_active: w.is_active } : x));
+        showToast('err', data.message || 'Erreur lors de la mise à jour');
+      }
+    } catch {
+      setWebhooks(prev => prev.map(x => x.id === w.id ? { ...x, is_active: w.is_active } : x));
+      showToast('err', 'Erreur réseau');
+    }
+  };
+
+  const testWebhook = async (w: Webhook) => {
+    setTestLoading(p => ({ ...p, [w.id]: true }));
+    setTestResults(p => ({ ...p, [w.id]: null }));
+    try {
+      const res  = await fetch(`${apiUrl}/webhooks/client/${w.id}/test`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token()}` }
+      });
+      const data = await res.json();
+      setTestResults(p => ({ ...p, [w.id]: data }));
+      setTimeout(() => setTestResults(p => ({ ...p, [w.id]: null })), 6000);
+    } catch {
+      setTestResults(p => ({ ...p, [w.id]: { success: false, message: 'Erreur de connexion' } }));
+    } finally {
+      setTestLoading(p => ({ ...p, [w.id]: false }));
+    }
+  };
+
+  const copyText = async (text: string, key: string) => {
+    await copyToClipboard(text);
+    setCopied(key);
+    setTimeout(() => setCopied(null), 2000);
+  };
+
+  // ── SECRET REVEAL MODAL ───────────────────────────────────────
+  const SecretModal = () => {
+    if (!showCreatedSecret || !createdWebhook) return null;
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm px-4"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="secret-modal-title"
+      >
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+          <div className="p-5 text-white" style={{ background: `linear-gradient(135deg, ${BRAND}, ${BRAND_DARK})` }}>
+            <div className="flex items-center gap-3 mb-1">
+              <FiShield size={20} />
+              <h2 id="secret-modal-title" className="text-lg font-bold">Notez votre secret maintenant</h2>
+            </div>
+            <p className="text-white/80 text-sm">Il ne sera plus jamais affiché en clair après fermeture.</p>
+          </div>
+          <div className="p-6 space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">URL</label>
+              <p className="font-mono text-sm bg-gray-50 px-3 py-2 rounded-lg border border-gray-200 break-all">{createdWebhook.url}</p>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Secret (HMAC-SHA256)</label>
+              <div className="flex gap-2 items-center">
+                <p className="flex-1 font-mono text-sm bg-amber-50 border border-amber-200 px-3 py-2 rounded-lg break-all text-amber-900 select-all">
+                  {createdWebhook.secret}
+                </p>
+                <button
+                  onClick={() => copyText(createdWebhook.secret, 'modal-secret')}
+                  className="shrink-0 p-2 bg-amber-100 hover:bg-amber-200 rounded-lg transition-colors"
+                  aria-label="Copier le secret"
+                >
+                  {copied === 'modal-secret' ? <FiCheck className="text-emerald-600" /> : <FiCopy className="text-amber-700" />}
+                </button>
+              </div>
+            </div>
+            <div className="flex gap-2 bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-800">
+              <FiInfo size={14} className="shrink-0 mt-0.5" />
+              <p>
+                Stockez ce secret dans une variable d'environnement (<code className="bg-blue-100 px-1 rounded">WEBHOOK_SECRET</code>)
+                et vérifiez le header <code className="bg-blue-100 px-1 rounded">X-Webhook-Signature</code> à chaque requête reçue.
+              </p>
+            </div>
+            <Button onClick={() => { setShowCreatedSecret(false); setCreatedWebhook(null); }} className="w-full">
+              J'ai bien noté mon secret <FiCheck className="ml-2" />
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ── STATS DASHBOARD ───────────────────────────────────────────
+  const StatsDashboard = () => {
+    const cards = [
+      { label: 'Webhooks configurés', value: dashboardStats.total, icon: FiBell, tint: 'text-gray-700 bg-gray-100' },
+      { label: 'Actifs',              value: dashboardStats.active, icon: FiToggleRight, tint: 'text-emerald-700 bg-emerald-50' },
+      { label: 'En erreur',           value: dashboardStats.withErrors, icon: FiAlertTriangle, tint: dashboardStats.withErrors > 0 ? 'text-red-700 bg-red-50' : 'text-gray-400 bg-gray-50' },
+      { label: 'Taux de succès',      value: `${dashboardStats.successRate}%`, icon: FiTrendingUp, tint: 'text-blue-700 bg-blue-50' },
+    ];
+    return (
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        {cards.map(c => (
+          <div key={c.label} className="bg-white border border-gray-200 rounded-2xl p-4 flex items-center gap-3">
+            <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${c.tint}`}>
+              <c.icon size={17} />
+            </div>
+            <div className="min-w-0">
+              {isLoading ? <Skeleton className="h-6 w-12 mb-1" /> : (
+                <p className="text-xl font-bold text-gray-900 leading-none">{c.value}</p>
+              )}
+              <p className="text-xs text-gray-500 mt-1 truncate">{c.label}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // ── FORM ──────────────────────────────────────────────────────
+  const FormSection = () => {
+    if (!showForm) {
+      return (
+        <button
+          onClick={() => setShowForm(true)}
+          className="w-full border-2 border-dashed border-gray-200 rounded-2xl p-5 flex items-center justify-center gap-2 text-sm font-semibold text-gray-500 hover:border-[var(--brand)] hover:text-[var(--brand)] hover:bg-[var(--brand-soft)] transition-colors"
+          style={{ ['--brand' as any]: BRAND, ['--brand-soft' as any]: BRAND_SOFT }}
+        >
+          <FiPlus size={16} /> Ajouter un webhook
+        </button>
+      );
+    }
+
+    return (
+      <Card className="border-2" style={{ borderColor: `${BRAND}33`, background: BRAND_SOFT }}>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="flex items-center gap-2">
+              {editingId ? <><FiEdit2 size={18} /> Modifier le webhook</> : <><FiPlus size={18} /> Nouveau webhook</>}
+            </CardTitle>
+            <button onClick={resetForm} className="p-1.5 rounded-lg hover:bg-black/5 text-gray-400 hover:text-gray-600" aria-label="Fermer">
+              <FiX size={16} />
+            </button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          {/* URL */}
+          <div>
+            <label htmlFor="webhook-url" className="block text-sm font-medium mb-1.5">
+              URL de réception <span className="text-red-500">*</span>
+            </label>
+            <div className={`flex gap-2 items-center px-3 py-2.5 border rounded-lg bg-white transition focus-within:ring-2 ${
+              urlError ? 'border-red-300 focus-within:ring-red-100' : 'border-gray-300 focus-within:border-[var(--brand)] focus-within:ring-[var(--brand)]/20'
+            }`} style={{ ['--brand' as any]: BRAND }}>
+              <FiLink className="text-gray-400 shrink-0" />
+              <input
+                id="webhook-url"
+                type="url"
+                value={formUrl}
+                onChange={e => { setFormUrl(e.target.value); if (urlError) setUrlError(null); }}
+                onBlur={() => setUrlError(validateUrl(formUrl))}
+                placeholder="https://votre-serveur.com/webhook/numericexport"
+                className="flex-1 text-sm outline-none bg-transparent"
+                aria-invalid={!!urlError}
+                aria-describedby="webhook-url-hint"
+              />
+            </div>
+            {urlError ? (
+              <p className="text-xs text-red-600 mt-1 flex items-center gap-1"><FiAlertCircle size={12} /> {urlError}</p>
+            ) : (
+              <p id="webhook-url-hint" className="text-xs text-gray-500 mt-1">URL publique HTTPS accessible depuis internet</p>
+            )}
+          </div>
+
+          {/* Secret */}
+          <div>
+            <label htmlFor="webhook-secret" className="block text-sm font-medium mb-1.5 flex items-center gap-2">
+              <FiShield size={14} style={{ color: BRAND }} />
+              Secret de signature
+              <span className="text-xs font-normal text-gray-400 ml-1">(optionnel — généré automatiquement si vide)</span>
+            </label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <input
+                  id="webhook-secret"
+                  type={showFormSecret ? 'text' : 'password'}
+                  value={formSecret}
+                  onChange={e => setFormSecret(e.target.value)}
+                  placeholder="Laissez vide pour une génération automatique sécurisée"
+                  className="w-full px-3 py-2.5 pr-10 border border-gray-300 rounded-lg text-sm font-mono bg-white focus:border-[var(--brand)] focus:ring-2 focus:ring-[var(--brand)]/20 outline-none transition"
+                  style={{ ['--brand' as any]: BRAND }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowFormSecret(s => !s)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  aria-label={showFormSecret ? 'Masquer le secret' : 'Afficher le secret'}
+                >
+                  {showFormSecret ? <FiEyeOff size={15} /> : <FiEye size={15} />}
+                </button>
+              </div>
+              <Button type="button" variant="outline" onClick={() => { setFormSecret(genSecret()); setShowFormSecret(true); }}>
+                <FiRefreshCw size={14} className="mr-1" /> Générer
+              </Button>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              Utilisé pour signer chaque payload avec HMAC-SHA256 → header <code className="bg-gray-100 px-1 rounded">X-Webhook-Signature</code>
+            </p>
+          </div>
+
+          {/* Events */}
+          <fieldset>
+            <legend className="block text-sm font-medium mb-2">
+              Événements à recevoir <span className="text-red-500">*</span>
+            </legend>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {AVAILABLE_EVENTS.map(ev => {
+                const checked = formEvents.includes(ev.value);
+                const Icon = ev.icon;
+                return (
+                  <label
+                    key={ev.value}
+                    className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                      checked ? 'bg-white' : 'border-gray-200 hover:border-gray-300 bg-white'
+                    }`}
+                    style={checked ? { borderColor: BRAND } : undefined}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={e => setFormEvents(
+                        e.target.checked
+                          ? [...formEvents, ev.value]
+                          : formEvents.filter(v => v !== ev.value)
+                      )}
+                      className="mt-0.5"
+                      style={{ accentColor: BRAND }}
+                    />
+                    <Icon size={15} className="mt-0.5 text-gray-400 shrink-0" />
+                    <div>
+                      <span className="text-sm font-medium text-gray-800">{ev.label}</span>
+                      <p className="text-xs text-gray-500 mt-0.5">{ev.desc}</p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+
+          {/* Actions */}
+          <div className="flex gap-3 pt-1">
+            <Button onClick={saveWebhook} disabled={isSaving} className="flex items-center gap-2">
+              {isSaving
+                ? <><FiLoader className="animate-spin" size={14} /> Enregistrement...</>
+                : <><FiCheck size={14} /> {editingId ? 'Mettre à jour' : 'Créer le webhook'}</>
+              }
+            </Button>
+            <Button variant="outline" onClick={resetForm}>Annuler</Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  };
+
+  // ── WEBHOOKS LIST ─────────────────────────────────────────────
+  const WebhooksList = () => {
+    if (isLoading) return (
+      <div className="space-y-3">
+        {[1, 2].map(i => (
+          <div key={i} className="border border-gray-200 rounded-xl p-5 bg-white">
+            <Skeleton className="h-5 w-1/2 mb-3" />
+            <Skeleton className="h-4 w-1/3 mb-4" />
+            <Skeleton className="h-9 w-full" />
+          </div>
+        ))}
+      </div>
+    );
+
+    if (webhooks.length === 0) return (
+      <EmptyState
+        icon={FiBell}
+        title="Aucun webhook configuré"
+        hint="Ajoutez un webhook pour recevoir les événements de messagerie en temps réel sur votre serveur."
+        action={<Button onClick={() => setShowForm(true)}><FiPlus size={14} className="mr-1.5" /> Ajouter un webhook</Button>}
+      />
+    );
+
+    return (
+      <div className="space-y-3">
+        {webhooks.map(w => {
+          const test = testResults[w.id];
+          const hasError = w.last_status && (w.last_status < 200 || w.last_status >= 300);
+          return (
+            <div
+              key={w.id}
+              className={`border rounded-2xl p-5 bg-white hover:shadow-sm transition-shadow ${hasError ? 'border-red-200' : 'border-gray-200'}`}
+            >
+              {/* Header */}
+              <div className="flex justify-between items-start gap-4 mb-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                    <code className="text-sm font-mono bg-gray-50 px-2.5 py-1 rounded-lg truncate max-w-xs border border-gray-100" title={w.url}>
+                      {w.url}
+                    </code>
+                    <StatusPill active={w.is_active} />
+                    {hasError && (
+                      <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-red-50 text-red-700 ring-1 ring-inset ring-red-600/20">
+                        <FiAlertTriangle size={11} /> Dernier appel échoué
+                      </span>
+                    )}
+                  </div>
+                  {/* Events */}
+                  <div className="flex flex-wrap gap-1.5">
+                    {(w.events || []).map(ev => {
+                      const style = EVENT_STYLES[ev] || EVENT_STYLES['message.test'];
+                      return (
+                        <span key={ev} className={`px-2 py-0.5 rounded-full text-xs font-medium ring-1 ring-inset ${style.badge}`}>
+                          {EVENT_LABEL[ev] || ev}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-1.5 shrink-0">
+                  <button
+                    onClick={() => toggleWebhook(w)}
+                    title={w.is_active ? 'Mettre en pause' : 'Réactiver'}
+                    className="p-2 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors"
+                  >
+                    {w.is_active ? <FiToggleRight size={15} className="text-emerald-600" /> : <FiToggleLeft size={15} className="text-gray-400" />}
+                  </button>
+                  <button
+                    onClick={() => testWebhook(w)}
+                    disabled={testLoading[w.id]}
+                    title="Tester ce webhook"
+                    className="p-2 rounded-lg border border-gray-200 hover:bg-amber-50 hover:border-amber-300 transition-colors disabled:opacity-50"
+                  >
+                    {testLoading[w.id]
+                      ? <FiLoader size={15} className="animate-spin text-amber-500" />
+                      : <FiZap size={15} className="text-amber-500" />}
+                  </button>
+                  <button
+                    onClick={() => startEdit(w)}
+                    title="Modifier"
+                    className="p-2 rounded-lg border border-gray-200 hover:bg-blue-50 hover:border-blue-300 transition-colors"
+                  >
+                    <FiEdit2 size={15} className="text-blue-500" />
+                  </button>
+                  <button
+                    onClick={() => deleteWebhook(w.id)}
+                    title="Supprimer"
+                    className="p-2 rounded-lg border border-gray-200 hover:bg-red-50 hover:border-red-300 transition-colors"
+                  >
+                    <FiTrash2 size={15} className="text-red-500" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Meta */}
+              <div className="flex items-center gap-4 text-xs text-gray-400 mb-3 flex-wrap">
+                <span>Créé {relativeTime(w.created_at)}</span>
+                {w.last_triggered_at && (
+                  <span className="flex items-center gap-1">
+                    <FiActivity size={11} /> Dernier appel {relativeTime(w.last_triggered_at)}
+                  </span>
+                )}
+                {w.last_status && (
+                  <span className={`flex items-center gap-1 font-medium ${hasError ? 'text-red-500' : 'text-emerald-600'}`}>
+                    {hasError ? <FiAlertCircle size={11} /> : <FiCheckCircle size={11} />}
+                    HTTP {w.last_status}
+                  </span>
+                )}
+              </div>
+
+              {/* Secret row */}
+              {w.secret && (
+                <div className="flex items-center gap-2 p-2.5 bg-gray-50 border border-gray-200 rounded-lg">
+                  <FiShield size={13} className="text-gray-400 shrink-0" />
+                  <span className="text-xs text-gray-500 shrink-0">Secret :</span>
+                  <code className="flex-1 text-xs font-mono text-gray-700 truncate">
+                    {showSecrets[w.id] ? w.secret : '•'.repeat(Math.min(w.secret.length, 48))}
+                  </code>
+                  <div className="flex gap-1 shrink-0">
+                    <button
+                      onClick={() => setShowSecrets(p => ({ ...p, [w.id]: !p[w.id] }))}
+                      className="p-1 text-gray-400 hover:text-gray-600"
+                      title={showSecrets[w.id] ? 'Masquer' : 'Afficher'}
+                    >
+                      {showSecrets[w.id] ? <FiEyeOff size={13} /> : <FiEye size={13} />}
+                    </button>
+                    <button
+                      onClick={() => copyText(w.secret, `secret-${w.id}`)}
+                      className="p-1 text-gray-400 hover:text-gray-600"
+                      title="Copier"
+                    >
+                      {copied === `secret-${w.id}` ? <FiCheck size={13} className="text-emerald-500" /> : <FiCopy size={13} />}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Test result */}
+              {test && (
+                <div className={`mt-3 flex items-center gap-2 px-3 py-2 rounded-lg text-sm ${
+                  test.success ? 'bg-emerald-50 border border-emerald-200 text-emerald-700' : 'bg-red-50 border border-red-200 text-red-700'
+                }`}>
+                  {test.success
+                    ? <FiCheckCircle size={15} className="shrink-0" />
+                    : <FiAlertCircle size={15} className="shrink-0" />}
+                  <span className="font-medium">{test.success ? 'Test réussi' : 'Test échoué'}</span>
+                  <span className="text-xs opacity-80 ml-1">
+                    {test.message}{test.duration ? ` · ${test.duration}ms` : ''}
+                  </span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ── LOGS ──────────────────────────────────────────────────────
+  const LogsList = () => {
+    const [filterEvent, setFilterEvent] = useState<string>('');
+    const [logsLoading, setLogsLoading] = useState(false);
+    const [stats, setStats] = useState<{ total: number; by_event: Record<string, number> } | null>(null);
+
+    // Références pour éviter les appels concurrents
+    const isLoadingRef = useRef(false);
+    const abortControllerRef = useRef<AbortController | null>(null);
+    const mountedRef = useRef(true);
+
+    // Fonction de chargement des logs (memoized)
+    const loadFilteredLogs = useCallback(async (force = false) => {
+      if (isLoadingRef.current && !force) return;
+      if (!mountedRef.current) return;
+
+      isLoadingRef.current = true;
+      setLogsLoading(true);
+
+      // Annuler la requête précédente
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      try {
+        let url = `${apiUrl}/webhooks/client/logs?page=${logPage}&limit=${LOG_LIMIT}`;
+        if (filterEvent) url += `&event_type=${filterEvent}`;
+
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${token()}` },
+          signal: controller.signal,
+        });
+        const data = await res.json();
+
+        if (!mountedRef.current) return;
+        if (data.success) {
+          setLogs(data.logs || []);
+          setLogTotal(data.total || 0);
+        } else {
+          showToast('err', data.message || 'Impossible de charger les logs');
+        }
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          // Ignorer les erreurs d'annulation
+          return;
+        }
+        if (mountedRef.current) {
+          showToast('err', 'Impossible de charger les logs');
+        }
+      } finally {
+        if (mountedRef.current) {
+          setLogsLoading(false);
+          isLoadingRef.current = false;
+        }
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+        }
+      }
+    }, [apiUrl, logPage, filterEvent, token, LOG_LIMIT]);
+
+    // Chargement des stats (memoized)
+    const loadStats = useCallback(async () => {
+      if (!mountedRef.current) return;
+      try {
+        const res = await fetch(`${apiUrl}/webhooks/client/logs/stats`, {
+          headers: { Authorization: `Bearer ${token()}` },
+        });
+        const data = await res.json();
+        if (mountedRef.current && data.success) {
+          setStats(data);
+        }
+      } catch {
+        // Ignorer les erreurs de stats (non bloquant)
+      }
+    }, [apiUrl, token]);
+
+    // Effet principal : charger au changement d'onglet, page ou filtre
+    useEffect(() => {
+      mountedRef.current = true;
+
+      if (activeTab !== 'logs') {
+        mountedRef.current = false;
+        return;
+      }
+
+      // Délai pour éviter les appels trop rapides lors du changement de filtre
+      const timer = setTimeout(() => {
+        loadFilteredLogs();
+        loadStats();
+      }, 200);
+
+      return () => {
+        clearTimeout(timer);
+        mountedRef.current = false;
+        // Annuler les requêtes en cours au démontage
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+          abortControllerRef.current = null;
+        }
+      };
+    }, [activeTab, logPage, filterEvent, loadFilteredLogs, loadStats]);
+
+    // Gestionnaire de changement de filtre
+    const handleFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+      setFilterEvent(e.target.value);
+      setLogPage(1); // Revenir à la première page
+    };
+
+    return (
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-3 p-4 bg-gray-50 rounded-2xl border border-gray-200">
+          <label htmlFor="event-filter" className="text-sm font-medium text-gray-700">Filtrer :</label>
+          <select
+            id="event-filter"
+            value={filterEvent}
+            onChange={handleFilterChange}
+            className="px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:border-[var(--brand)] outline-none"
+            style={{ ['--brand' as any]: BRAND }}
+          >
+            <option value="">Tous les événements</option>
+            {AVAILABLE_EVENTS.map(ev => (
+              <option key={ev.value} value={ev.value}>{ev.label}</option>
+            ))}
+            <option value="message.test">Test</option>
+          </select>
+
+          {stats && (
+            <div className="flex flex-wrap gap-2 ml-auto">
+              {Object.keys(EVENT_LABEL).map(ev => {
+                const style = EVENT_STYLES[ev];
+                return (
+                  <span key={ev} className={`px-2 py-1 rounded-lg text-xs font-semibold ring-1 ring-inset ${style.badge}`}>
+                    {stats.by_event[ev] || 0}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-3">
+          {logsLoading ? (
+            [1, 2, 3].map(i => <Skeleton key={i} className="h-20 w-full" />)
+          ) : logs.length === 0 ? (
+            <EmptyState
+              icon={FiClock}
+              title="Aucun log pour le moment"
+              hint="Les appels webhook apparaîtront ici dès qu'un événement sera déclenché."
+            />
+          ) : (
+            <>
+              {logs.map(log => {
+                const event = log.event || 'unknown';
+                const style = EVENT_STYLES[event] || EVENT_STYLES['message.test'];
+                const payload = log.payload || {};
+                const status = log.response_status || 200;
+                const data = payload.data || payload;
+                const recipient = data.recipient || data.recipient_phone || data.to || data.from || null;
+                const messageId = data.message_id || data.id || null;
+                const ok = status >= 200 && status < 300;
+
+                return (
+                  <div key={log.id} className="border border-gray-200 rounded-2xl p-4 bg-white hover:shadow-sm transition-shadow">
+                    <div className="flex justify-between items-start gap-3 mb-2 flex-wrap">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ring-1 ring-inset ${style.badge}`}>
+                          {EVENT_LABEL[event] || event}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded text-xs font-mono font-bold ${
+                          ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'
+                        }`}>
+                          HTTP {status || '—'}
+                        </span>
+                        {recipient && <span className="text-sm text-gray-700 font-mono">→ {recipient}</span>}
+                        {messageId && (
+                          <code className="text-xs text-gray-400 truncate max-w-[150px]" title={messageId}>
+                            #{String(messageId).slice(0, 8)}…
+                          </code>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-gray-400 shrink-0">
+                        <span>{log.duration_ms ?? '—'}ms</span>
+                        <span>{relativeTime(log.created_at)}</span>
+                      </div>
+                    </div>
+
+                    <details className="text-xs">
+                      <summary className="cursor-pointer text-gray-500 hover:text-gray-700 select-none">
+                        Voir le payload complet
+                      </summary>
+                      <pre className="mt-2 p-3 bg-[#0d1117] text-emerald-300 rounded-lg overflow-x-auto max-h-60 leading-relaxed">
+                        {JSON.stringify(payload, null, 2)}
+                      </pre>
+                    </details>
+                  </div>
+                );
+              })}
+
+              {logTotal > LOG_LIMIT && (
+                <Pagination
+                  currentPage={logPage}
+                  totalPages={Math.ceil(logTotal / LOG_LIMIT)}
+                  onPageChange={setLogPage}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+
+  // ── CODE EXAMPLE ──────────────────────────────────────────────
+  const CodeExample = () => (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <FiTerminal size={16} /> Recevoir un webhook — Node.js (Express)
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-sm text-gray-500">Exemple minimal avec vérification de signature.</p>
+          <button
+            onClick={() => copyText(NODE_EXAMPLE, 'code-example')}
+            className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-gray-700 px-2.5 py-1.5 border border-gray-200 rounded-lg"
+          >
+            {copied === 'code-example' ? <FiCheck size={12} className="text-emerald-500" /> : <FiCopy size={12} />}
+            {copied === 'code-example' ? 'Copié' : 'Copier'}
+          </button>
+        </div>
+        <pre className="bg-[#0d1117] text-white p-5 rounded-xl overflow-x-auto text-sm leading-relaxed">
+{NODE_EXAMPLE}
+        </pre>
+        <a
+          href="https://docs.numericexport.com/webhooks"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1.5 text-sm font-medium mt-4"
+          style={{ color: BRAND }}
+        >
+          Documentation complète des webhooks <FiExternalLink size={13} />
+        </a>
+      </CardContent>
+    </Card>
+  );
+
+  // ── TABS ──────────────────────────────────────────────────────
+  const tabs = [
+    { id: 'webhooks', label: `Mes webhooks (${webhooks.length})`, content: <WebhooksList /> },
+    { id: 'logs',     label: 'Historique',                         content: <LogsList /> },
+    { id: 'code',     label: 'Code exemple',                       content: <CodeExample /> },
+  ];
+
+  // ── RENDER ────────────────────────────────────────────────────
+  return (
+    <div className="space-y-6 pb-8">
+      <SecretModal />
+
+      {/* Toast */}
+      {toast && (
+        <div
+          role="status"
+          className={`fixed top-4 right-4 z-40 flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg text-sm font-medium transition-all ${
+            toast.type === 'ok'   ? 'bg-emerald-600 text-white' :
+            toast.type === 'warn' ? 'bg-amber-500 text-white' :
+                                     'bg-red-600 text-white'
+          }`}
+        >
+          {toast.type === 'ok'   && <FiCheckCircle size={16} />}
+          {toast.type === 'warn' && <FiAlertTriangle size={16} />}
+          {toast.type === 'err'  && <FiAlertCircle size={16} />}
+          {toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="flex items-end justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Webhooks</h1>
+          <p className="text-gray-500 mt-1">Recevez les événements de messagerie en temps réel sur votre propre serveur</p>
+        </div>
+        {!showForm && webhooks.length > 0 && (
+          <Button onClick={() => setShowForm(true)} className="flex items-center gap-1.5">
+            <FiPlus size={14} /> Ajouter un webhook
+          </Button>
+        )}
+      </div>
+
+      {/* Stats */}
+      <StatsDashboard />
+
+      {/* Form */}
+      <FormSection />
+
+      {/* List + Logs + Code */}
+      <Tabs tabs={tabs} defaultTab="webhooks" onTabChange={setActiveTab} />
+
+      {/* Security reminder */}
+      <div className="bg-blue-50 border border-blue-200 rounded-2xl p-5">
+        <h3 className="font-semibold text-blue-800 mb-3 flex items-center gap-2">
+          <FiShield size={16} /> Bonnes pratiques de sécurité
+        </h3>
+        <ul className="text-sm text-blue-700 space-y-1.5">
+          <li className="flex items-start gap-2"><FiCheck size={14} className="mt-0.5 shrink-0 text-blue-500" /> Stockez le secret dans une variable d'environnement, jamais dans votre code</li>
+          <li className="flex items-start gap-2"><FiCheck size={14} className="mt-0.5 shrink-0 text-blue-500" /> Vérifiez <code className="bg-blue-100 px-1 rounded">X-Webhook-Signature</code> sur chaque requête avec <code className="bg-blue-100 px-1 rounded">timingSafeEqual</code></li>
+          <li className="flex items-start gap-2"><FiCheck size={14} className="mt-0.5 shrink-0 text-blue-500" /> Répondez HTTP 200 <strong>immédiatement</strong> avant de traiter (timeout : 10 s)</li>
+          <li className="flex items-start gap-2"><FiCheck size={14} className="mt-0.5 shrink-0 text-blue-500" /> En cas d'échec, le système effectue jusqu'à 3 nouvelles tentatives automatiques</li>
+          <li className="flex items-start gap-2"><FiCheck size={14} className="mt-0.5 shrink-0 text-blue-500" /> Utilisez HTTPS uniquement — les URL HTTP sont rejetées</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+const NODE_EXAMPLE = `const express = require('express');
+const crypto  = require('crypto');
+const app     = express();
+
+app.use(express.json());
+
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET; // votre secret
+
+app.post('/webhook/numericexport', (req, res) => {
+  // 1. Répondre 200 immédiatement (timeout = 10s)
+  res.sendStatus(200);
+
+  // 2. Vérifier la signature HMAC-SHA256
+  const sig      = req.headers['x-webhook-signature'];
+  const expected = crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(JSON.stringify(req.body))
+    .digest('hex');
+
+  if (!crypto.timingSafeEqual(Buffer.from(sig || ''), Buffer.from(expected))) {
+    console.error('Signature invalide — requête ignorée');
+    return;
+  }
+
+  // 3. Traiter l'événement de façon asynchrone
+  const { event, timestamp, data } = req.body;
+
+  switch (event) {
+    case 'message.sent':
+      console.log(\`\${data.recipient} — message accepté\`);
+      break;
+    case 'message.delivered':
+      // db.query('UPDATE messages SET status=$1 WHERE id=$2', ['delivered', data.message_id])
+      console.log(\`\${data.recipient} — délivré à \${data.delivered_at}\`);
+      break;
+    case 'message.read':
+      console.log(\`\${data.recipient} — lu à \${data.read_at}\`);
+      break;
+    case 'message.failed':
+      console.error(\`\${data.recipient} — échec [\${data.message_id}]\`);
+      break;
+    case 'message.incoming':
+      console.log(\`Réponse de \${data.from}: "\${data.message}"\`);
+      break;
+  }
+});
+
+app.listen(3000);`;

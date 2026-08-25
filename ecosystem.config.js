@@ -1,0 +1,279 @@
+module.exports = {
+  apps: [
+    // 1. VITRINE (Next.js)
+    {
+      name: 'nextltd-vitrine',
+      cwd: '/var/www/numericexport/vitrine',
+      script: 'npm',
+      args: 'start',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        PORT: 3000,
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 2. API PRINCIPALE - 2 instances en cluster
+    {
+      name: 'nextltd-api',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/index.js',
+      instances: 2,
+      exec_mode: 'cluster',
+      watch: false,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        PORT: 3001,
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 3. LEGACY WORKERS
+    {
+      name: 'legacy-workers',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/start.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '500M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 4. WORKER WHATSAPP UNIVERSEL — INDÉPENDANT
+    {
+      name: 'whatsapp-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/whatsapp.worker.universal.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 4bis. SESSION WORKER — INDÉPENDANT (maintenance fenêtre 24h WhatsApp)
+    {
+      name: 'session-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/session.worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '300M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 4ter. CHATBOT WORKER — INDÉPENDANT (queue dédiée bot-messages, numéro consommateur)
+    {
+      name: 'chatbot-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/chatbot.worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+
+    // 4ter. WORKER DE DISPATCH DE CAMPAGNE — NOUVEAU, INDÉPENDANT DE L'API
+    {
+      name: 'campaign-dispatch-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/campaign-dispatch.worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    /*
+     * 5. AUTOMATION CRON (commenté car temporairement désactivé)
+     * {
+     *   name: 'automation-cron',
+     *   cwd: '/var/www/numericexport/api',
+     *   script: 'src/workers/automation.cron.js',
+     *   instances: 1,
+     *   exec_mode: 'fork',
+     *   autorestart: true,
+     *   max_memory_restart: '500M',
+     *   env: {
+     *     NODE_ENV: 'production',
+     *     HOME: '/var/www/numericexport'
+     *   }
+     * },
+     */
+
+    // 6. CAMPAIGN CRON
+    {
+      name: 'campaign-cron',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/campaign.cron.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '500M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 7. STATS WORKER
+    {
+      name: 'stats-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'worker-stats.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '500M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 8. CRONS DE NETTOYAGE
+    {
+      name: 'storage-cleaner',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/cron/storage-cleaner.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '0 0 * * *',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+    {
+      name: 'cron-clean-messages',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/cron/clean-old-messages.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '0 4 * * *',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 9. DASHBOARD (Next.js)
+    {
+      name: 'nextltd-dashboard',
+      cwd: '/var/www/numericexport/dashboard',
+      script: 'npm',
+      args: 'start -- -p 3003',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        PORT: 3003,
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 10. Alarm Worker
+    {
+      name: 'alarm-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/alarm-worker.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 11. Alarm cron
+    {
+      name: 'alarm-polling-cron',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/cron/alarm-polling.cron.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '500M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 11. WORKER SOCADEL CSV IMPORT
+    {
+      name: 'socadel-csv-worker',
+      cwd: '/var/www/numericexport/api',
+      script: 'scripts/process-socadel-csv.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '*/15 * * * *', // S'exécute toutes les 15 minutes
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    },
+
+    // 12. WebSocket
+    {
+  name: 'hetu-websocket',
+  cwd: '/var/www/numericexport/api',
+  script: 'src/workers/hetu-websocket.worker.js',
+  instances: 1,
+  exec_mode: 'fork',
+  autorestart: true,
+  max_memory_restart: '500M',
+  env: {
+    NODE_ENV: 'production',
+    HOME: '/var/www/numericexport'
+  }
+},
+
+    // 13. ORPHAN WEBHOOK CRON
+    {
+      name: 'orphan-webhook-cron',
+      cwd: '/var/www/numericexport/api',
+      script: 'src/workers/orphan-webhook.cron.js',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_memory_restart: '200M',
+      env: {
+        NODE_ENV: 'production',
+        HOME: '/var/www/numericexport'
+      }
+    }
+  ]
+};

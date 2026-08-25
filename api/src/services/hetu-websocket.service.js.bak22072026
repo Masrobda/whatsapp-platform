@@ -1,0 +1,521 @@
+// api/src/services/hetu-websocket.service.js
+const WebSocket = require('ws');
+const logger = require('../utils/logger');
+const authService = require('./alarm-auth.service');
+const alarmVideoService = require('./alarm-video.service');
+const { uploadAndConvertVideoFromStream, uploadAndConvertImageFromStream } = require('./storage-upload.service');
+const vehicleMappingService = require('./vehicle-mapping.service');
+const { normalizePhoneNumber } = require('../utils/phone-validator');
+const { markVideoAsSent, isVideoAlreadySent } = require('./alarm-notification.service');
+const { addAlarmToQueue } = require('./alarm-queue.service');
+const alarmCorrelation = require('./alarm-correlation.service');
+const { v4: uuidv4 } = require('uuid');
+
+const alarmLabels = {
+  emergencyAlarm: "Alerte d'urgence détectée",
+  speedingAlarm: "Excès de vitesse détectée",
+  fatigueDrivingAlarm: "Conduite fatiguée détectée",
+  fatigueDriving: "Conduite fatiguée détectée",
+  forwardCollision: "Collision frontale détectée",
+  laneDeparture: "Franchissement de ligne détectée",
+  pedestrianCollision: "Risque piéton détectée",
+  makeCalls: "Appel au volant détectée",
+};
+
+function getAlarmLabel(type) {
+  return alarmLabels[type] || `⚠️ Alarme ${type}`;
+}
+
+// Délai avant de basculer sur le fallback REST (historyreplay/media/file) si
+// aucun message vehicleAlarmFile n'est arrivé par WebSocket pour cet alarmNo.
+// Observé en production : les fichiers arrivent parfois 35-50 secondes après
+// l'alarme, donc 30s était trop court et déclenchait le fallback trop tôt.
+const FALLBACK_REST_DELAY_MS = 60 * 1000; // 60 secondes
+
+class HetuWebSocketService {
+  constructor() {
+    this.ws = null;
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectDelay = 5000;
+    this.heartbeatInterval = null;
+    this.username = null;
+    this.language = 'fr-FR';
+
+    // alarmNo -> Timeout, pour annuler le fallback REST si le WS livre le fichier à temps
+    this.fallbackTimers = new Map();
+
+    // Callback unique déclenché dès qu'une alarme + ses fichiers sont corrélés
+    alarmCorrelation.onReady((alarmNo, payload) => this._onAlarmReady(alarmNo, payload));
+  }
+
+  async connect(username, language = 'fr-FR') {
+    console.log('[HetuWS] 🔌 Tentative de connexion...');
+    this.username = username || process.env.HETU_WEBSOCKET_USERNAME;
+    this.language = language;
+    if (!this.username) {
+      console.log('[HetuWS] ❌ Username non défini');
+      logger.error('[HetuWS] Username non défini (HETU_WEBSOCKET_USERNAME)');
+      return;
+    }
+
+    try {
+      const token = await authService.getToken();
+      console.log('[HetuWS] 🔑 Token obtenu');
+      const encodedToken = encodeURIComponent(token);
+      const url = `${process.env.HETU_WEBSOCKET_URL || 'ws://api.hetuv2x.com:20007'}/vehicleWs/${this.username}/${encodedToken}/${this.language}`;
+      console.log(`[HetuWS] 🌐 Connexion à ${url}`);
+      logger.info(`[HetuWS] Connexion à ${url}`);
+
+      this.ws = new WebSocket(url);
+
+      this.ws.on('open', () => {
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
+        console.log('[HetuWS] ✅ WebSocket connecté !');
+        logger.info('[HetuWS] Connecté');
+        this.subscribe();
+        this.startHeartbeat();
+      });
+
+      this.ws.on('message', async (data) => {
+        try {
+          const message = JSON.parse(data);
+          await this.handleMessage(message);
+        } catch (err) {
+          logger.error('[HetuWS] Erreur parsing message:', err.message);
+        }
+      });
+
+      this.ws.on('error', (err) => {
+        console.error('[HetuWS] ❌ Erreur connexion:', err.message);
+        logger.error('[HetuWS] Erreur WebSocket:', err.message);
+      });
+
+      this.ws.on('close', () => {
+        this.isConnected = false;
+        this.stopHeartbeat();
+        logger.warn('[HetuWS] Déconnecté, tentative de reconnexion...');
+        this.reconnect();
+      });
+    } catch (err) {
+      logger.error('[HetuWS] Erreur connexion:', err.message);
+      this.reconnect();
+    }
+  }
+
+  subscribe() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const subscribeMsg = {
+      messageType: 'subscribe',
+      data: {
+        // vehicleAlarmFile ajouté : c'est le message qui porte filePath/uploadStatus
+        // pour les pièces jointes vidéo/image liées à une alarme (clé: alarmNo).
+        dataTypes: ['vehicleCommonAlarm', 'vehicleActiveSafeAlarm', 'vehicleAlarmFile'],
+        vehicleOnlineInterval: 1
+      }
+    };
+    this.ws.send(JSON.stringify(subscribeMsg));
+    logger.info('[HetuWS] Abonnement envoyé (vehicleCommonAlarm, vehicleActiveSafeAlarm, vehicleAlarmFile)');
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ messageType: 'heartBeat', data: Date.now() }));
+      }
+    }, 30000);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      logger.error('[HetuWS] Nombre maximal de tentatives de reconnexion atteint');
+      return;
+    }
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
+    logger.info(`[HetuWS] Reconnexion dans ${delay}ms (tentative ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    setTimeout(() => this.connect(this.username, this.language), delay);
+  }
+
+  async handleMessage(message) {
+    const { messageType, data } = message;
+    if (!data) return;
+    switch (messageType) {
+      case 'vehicleCommonAlarm':
+      case 'vehicleActiveSafeAlarm':
+        this.handleIncomingAlarm(data);
+        break;
+      case 'vehicleAlarmFile':
+        this.handleIncomingFile(data);
+        break;
+      default:
+        // ignorer (heartBeat ack, vehicleOnlineList, etc.)
+    }
+  }
+
+  /**
+   * Alias de compatibilité : alarm.controller.js (route /test-websocket) appelle
+   * historiquement hetuWebSocketService.handleAlarm(payload) pour simuler une
+   * alarme reçue du WebSocket. On le conserve pour ne pas casser cette route.
+   * ATTENTION : avec le nouveau flux, cet appel enregistre seulement l'alarme
+   * dans le cache de corrélation et programme le fallback REST (3 min). Si vous
+   * voulez tester le chemin "fichier déjà disponible côté Hetu", utilisez plutôt
+   * la nouvelle méthode handleAlarm avec un payload contenant alarmNo, puis
+   * envoyez aussi un fichier de test via simulateAlarmFile (voir plus bas).
+   */
+  async handleAlarm(alarmData) {
+    return this.handleIncomingAlarm(alarmData);
+  }
+
+  /**
+   * Méthode de test : simule la réception d'un message vehicleAlarmFile.
+   * Utile pour vérifier la corrélation alarmNo sans attendre un vrai événement
+   * Hetu. Voir alarm.controller.js / route /test-websocket-file (à ajouter).
+   */
+  async simulateAlarmFile(fileData) {
+    return this.handleIncomingFile(fileData);
+  }
+
+  /**
+   * Réception d'une alarme : on l'enregistre dans le cache de corrélation et on
+   * programme un fallback REST au cas où aucun fichier n'arrive par WebSocket.
+   */
+  handleIncomingAlarm(alarmData) {
+    const { alarmNo, licenseNum, alarmType, startTime } = alarmData;
+    console.log(`[HetuWS] 🔔 Alarme reçue: alarmNo=${alarmNo}, licenseNum=${licenseNum}, alarmType=${alarmType}, startTime=${startTime}`);
+
+    if (!licenseNum) {
+      console.log('[HetuWS] ❌ Alarme sans plaque, ignorée');
+      logger.warn('[HetuWS] Alarme sans plaque');
+      return;
+    }
+    if (!alarmNo) {
+      // Pas de clé de corrélation possible : on traite directement avec le fallback REST,
+      // comme avant, pour ne pas perdre l'alarme.
+      console.log('[HetuWS] ⚠️ Alarme sans alarmNo, bascule directe sur la recherche REST');
+      this._fallbackRestSearch(alarmData);
+      return;
+    }
+
+    alarmCorrelation.registerAlarm(alarmData);
+    this._scheduleFallback(alarmNo, alarmData);
+  }
+
+  /**
+   * Réception d'un vehicleAlarmFile : on l'enregistre dans le cache de corrélation.
+   */
+  handleIncomingFile(fileData) {
+    const { alarmNo, fileName, filePath, fileType, fileSize } = fileData;
+    console.log(`[HetuWS] 📎 Fichier reçu: alarmNo=${alarmNo}, fileName=${fileName}, fileType=${fileType}, fileSize=${fileSize}`);
+    console.log(`[HetuWS] 📎 filePath=${filePath}`);
+
+    if (!alarmNo) {
+      console.log('[HetuWS] ⚠️ Fichier reçu sans alarmNo, impossible de le corréler, ignoré');
+      return;
+    }
+    if (!filePath) {
+      console.log(`[HetuWS] ⚠️ Fichier alarmNo=${alarmNo} sans filePath, ignoré`);
+      return;
+    }
+    alarmCorrelation.registerFile(fileData);
+  }
+
+  _scheduleFallback(alarmNo, alarmData) {
+    if (this.fallbackTimers.has(alarmNo)) return;
+    const timer = setTimeout(() => {
+      this.fallbackTimers.delete(alarmNo);
+      if (alarmCorrelation.isTriggered(alarmNo)) {
+        console.log(`[HetuWS] ✅ alarmNo=${alarmNo} déjà traité via vehicleAlarmFile, fallback REST annulé`);
+        return;
+      }
+      console.log(`[HetuWS] ⏰ Aucun vehicleAlarmFile reçu pour alarmNo=${alarmNo} après ${FALLBACK_REST_DELAY_MS / 1000}s, bascule sur la recherche REST`);
+      this._fallbackRestSearch(alarmData);
+    }, FALLBACK_REST_DELAY_MS);
+    this.fallbackTimers.set(alarmNo, timer);
+  }
+
+  /**
+   * Callback appelé par alarm-correlation.service dès que l'alarme + au moins
+   * un fichier exploitable sont réunis.
+   */
+  async _onAlarmReady(alarmNo, { alarm, files }) {
+    // On annule le fallback REST puisqu'on a déjà ce qu'il faut
+    const timer = this.fallbackTimers.get(alarmNo);
+    if (timer) {
+      clearTimeout(timer);
+      this.fallbackTimers.delete(alarmNo);
+    }
+
+    // Trier : vidéo en premier (pour que le client reçoive la vidéo avant l'image),
+    // puis image. On identifie le type à partir de fileName/filePath.
+    const sorted = [...files].sort((a, b) => {
+      const aIsVideo = /\.mp4$/i.test(a.fileName || a.filePath || '');
+      const bIsVideo = /\.mp4$/i.test(b.fileName || b.filePath || '');
+      if (aIsVideo && !bIsVideo) return -1;
+      if (!aIsVideo && bIsVideo) return 1;
+      return 0;
+    });
+
+    // Envoyer un job par fichier, avec un délai de 3 secondes entre chaque
+    // pour garantir l'ordre de réception sur WhatsApp.
+    for (let i = 0; i < sorted.length; i++) {
+      const file = sorted[i];
+      const delayMs = i * 3000;
+      if (delayMs > 0) {
+        await new Promise(res => setTimeout(res, delayMs));
+      }
+      await this._processAlarmWithFile(alarm, {
+        filePath: file.filePath,
+        fileId: file.fileId || file.downloadId || null,
+        fileType: file.fileType,
+        fileSize: file.fileSize || null,
+        fileName: file.fileName || null,
+        viaWebSocket: true
+      });
+    }
+  }
+
+  /**
+   * Filet de sécurité : ancien comportement par recherche REST sur fenêtre horaire,
+   * utilisé seulement si vehicleAlarmFile n'a rien donné dans le délai imparti,
+   * ou si l'alarme n'a pas d'alarmNo exploitable.
+   */
+  async _fallbackRestSearch(alarmData) {
+    const { licenseNum, alarmType, startTime } = alarmData;
+
+    if (!startTime) {
+      console.log('[HetuWS] ⚠️ Pas de startTime, impossible de faire une recherche REST de secours');
+      await this._scheduleDeferredRetry(alarmData, null);
+      return;
+    }
+
+    const start = new Date(startTime);
+    const end = new Date(start.getTime() + 120000); // fenêtre élargie à 2 minutes
+    const startStr = start.toISOString().replace('T', ' ').slice(0, 19);
+    const endStr = end.toISOString().replace('T', ' ').slice(0, 19);
+    console.log(`[HetuWS] 🔎 [Fallback REST] Recherche média pour ${licenseNum} entre ${startStr} et ${endStr}`);
+
+    try {
+      const result = await alarmVideoService.fetchAllVideos(licenseNum, startStr, endStr, alarmType);
+      const videos = result.data?.list || [];
+      // On a constaté que uploadStatus n'est pas fiable côté vehicleAlarmFile (WebSocket).
+      // Par précaution on ne s'y fie pas non plus ici : on prend la première vidéo avec
+      // un filePath exploitable, peu importe uploadStatus.
+      const video = videos.find(v => v.uploadStatus === 1) || videos.find(v => !!v.filePath);
+      if (video) {
+        await this._processAlarmWithFile(alarmData, { filePath: video.filePath, fileId: video.fileId });
+        return;
+      }
+      console.log(`[HetuWS] ⚠️ [Fallback REST] Aucune vidéo avec filePath trouvée pour ${licenseNum}`);
+    } catch (err) {
+      console.log(`[HetuWS] ❌ [Fallback REST] Erreur recherche média:`, err.message);
+    }
+
+    await this._scheduleDeferredRetry(alarmData, null);
+  }
+
+  async _scheduleDeferredRetry(alarmData, fileInfo) {
+    const { licenseNum, alarmType, startTime } = alarmData;
+    const phone = await vehicleMappingService.getPhoneByLicense(licenseNum);
+    const recipient = normalizePhoneNumber(phone);
+    if (!recipient) {
+      console.log(`[HetuWS] ❌ Aucun téléphone pour ${licenseNum}, abandon`);
+      return;
+    }
+
+    const retryJobData = {
+      ...alarmData,
+      retryCount: 1,
+      maxRetries: 5,
+      originalStartTime: startTime,
+      recipientPhone: recipient,
+      clientId: process.env.SYSTEM_CLIENT_ID,
+      channelNumber: process.env.DEFAULT_WHATSAPP_NUMBER,
+      messageId: uuidv4()
+    };
+    const queueResult = await addAlarmToQueue(retryJobData, 120000);
+    if (queueResult.success) {
+      console.log(`[HetuWS] 📅 Job différé ajouté pour ${recipient} (retry 1/5, alarmNo=${alarmData.alarmNo || 'n/a'})`);
+    } else {
+      console.error(`[HetuWS] ❌ Échec ajout job différé`);
+    }
+  }
+
+  /**
+   * Point d'entrée commun (WebSocket vehicleAlarmFile OU fallback REST) une fois
+   * qu'on a une alarme ET un fichier (filePath) exploitable.
+   */
+  async _processAlarmWithFile(alarmData, fileInfo) {
+    const {
+      licenseNum,
+      alarmType,
+      startTime,
+      location,
+      latitude,
+      longitude,
+      speed,
+      alarmSpeed,
+      alarmFlag,
+      driverName,
+      motorcadeName,
+      alarmNo
+    } = alarmData;
+
+    try {
+      const { filePath, fileId, fileSize, viaWebSocket } = fileInfo;
+
+      const phone = await vehicleMappingService.getPhoneByLicense(licenseNum);
+      const recipient = normalizePhoneNumber(phone);
+      if (!recipient) {
+        console.log(`[HetuWS] ❌ Aucun téléphone pour ${licenseNum}`);
+        return;
+      }
+
+      const alreadySent = await isVideoAlreadySent(fileId, filePath);
+      if (alreadySent) {
+        console.log(`[HetuWS] ⚠️ Média déjà envoyé pour fileId=${fileId} / alarmNo=${alarmNo}, on arrête`);
+        return;
+      }
+
+      console.log(`[HetuWS] ⬇️ Téléchargement du média alarmNo=${alarmNo}, filePath=${filePath}`);
+
+      let stream, originalName;
+      try {
+        if (viaWebSocket) {
+          // Fichier reçu via vehicleAlarmFile : filePath est une URL FTP HTTP
+          // complète et directement accessible (confirmé en production), donc
+          // on télécharge directement plutôt que de passer par l'endpoint Hetu
+          // historyreplay/download (qui attend un chemin interne, pas une URL
+          // complète, et renvoie une erreur 500 silencieuse dans ce cas).
+          const result = await alarmVideoService.downloadFromUrl(filePath, licenseNum, alarmType, fileSize);
+          stream = result.stream;
+          originalName = result.originalName;
+        } else {
+          // Fichier issu du fallback REST (historyreplay/media/file) : filePath
+          // peut être un chemin interne Hetu, on passe par l'endpoint dédié.
+          const result = await alarmVideoService.downloadVideoByPath(filePath, licenseNum, alarmType);
+          stream = result.stream;
+          originalName = result.originalName;
+        }
+      } catch (downloadErr) {
+        console.log(`[HetuWS] ❌ Téléchargement invalide pour alarmNo=${alarmNo}: ${downloadErr.message}`);
+        await this._scheduleDeferredRetry(alarmData, fileInfo);
+        return;
+      }
+
+      // Détection du type de média à partir de l'extension du fichier source
+      // (filePath original chez Hetu), avant l'upload — pour choisir la bonne
+      // fonction de conversion (vidéo via ffmpeg, image via sharp). Se baser
+      // sur l'URL publique générée APRÈS l'upload serait trop tard puisque
+      // l'upload aurait déjà utilisé la mauvaise fonction de conversion.
+      const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(filePath);
+      const mediaType = isImage ? 'image' : 'video';
+
+      const uploadResult = isImage
+        ? await uploadAndConvertImageFromStream(stream, originalName, process.env.SYSTEM_CLIENT_ID, licenseNum)
+        : await uploadAndConvertVideoFromStream(stream, originalName, process.env.SYSTEM_CLIENT_ID, licenseNum);
+
+      if (!uploadResult.success) {
+        console.log(`[HetuWS] ❌ Échec upload pour alarmNo=${alarmNo}: ${uploadResult.error}`);
+        await this._scheduleDeferredRetry(alarmData, fileInfo);
+        return;
+      }
+
+      const mediaUrl = uploadResult.publicUrl;
+      console.log(`[HetuWS] ✅ Média uploadé: ${mediaUrl} (${mediaType})`);
+
+      const alarmLabel = getAlarmLabel(alarmType);
+      const vehicleInfo = `${licenseNum}${motorcadeName ? ` (${motorcadeName})` : ''}`;
+      const driver = driverName || 'Non spécifié';
+      const driverPhone = recipient;
+
+      // Position : Hetu envoie location au format "longitude,latitude" (inversé
+      // par rapport à la convention standard). On utilise latitude/longitude
+      // directement quand disponibles (plus fiable), sinon on inverse location.
+      let gps = 'N/A';
+      let position = '';
+      if (latitude && longitude) {
+        gps = `${latitude},${longitude}`;
+        position = `${latitude},${longitude}`;
+      } else if (location && location.includes(',')) {
+        const parts = location.split(',');
+        if (parts.length === 2) {
+          // location = "lon,lat" → on inverse pour afficher "lat,lon"
+          gps = `${parts[1].trim()},${parts[0].trim()}`;
+          position = gps;
+        }
+      }
+
+      // Vitesse : speed et alarmSpeed sont souvent à 0 dans vehicleCommonAlarm
+      // même quand le véhicule roule (constaté en production). Hetu encode
+      // parfois la vraie vitesse d'alarme dans alarmFlag (JSON en string).
+      let speedValue = speed || alarmSpeed || 0;
+      if (!speedValue && alarmFlag) {
+        try {
+          const flag = typeof alarmFlag === 'string'
+            ? JSON.parse(alarmFlag)
+            : alarmFlag;
+          speedValue = flag?.alarmSpeed || flag?.speed || flag?.vehicleSpeed || speedValue;
+        } catch (_) {}
+      }
+      // Dernier recours : alarmSpeed depuis le champ racine si on l'a raté
+      if (!speedValue && alarmSpeed) speedValue = alarmSpeed;
+
+      const time = startTime ? startTime.replace('T', ' ').slice(0, 19) : new Date().toISOString().slice(0, 19);
+
+      const templateParams = {
+        "1": mediaUrl,
+        "2": alarmLabel,
+        "3": vehicleInfo,
+        "4": driver,
+        "5": driverPhone,
+        "6": position,
+        "7": gps,
+        "8": speedValue + ' km/h',
+        "9": time
+      };
+
+      const templateName = mediaType === 'image' ? 'next_alarm_image_02' : 'next_alarm_video_02';
+      const messageId = uuidv4();
+      const alarmJobData = {
+        licenseNum,
+        alarmType,
+        alarmNo,
+        fileId,
+        filePath,
+        startTime: time,
+        recipientPhone: recipient,
+        clientId: process.env.SYSTEM_CLIENT_ID,
+        alarmLabel,
+        templateName,
+        templateParams,
+        messageId,
+        channelNumber: process.env.DEFAULT_WHATSAPP_NUMBER
+      };
+
+      console.log(`[HetuWS] 📤 Ajout à la queue alarm-processing pour ${recipient} (messageId=${messageId}, alarmNo=${alarmNo})`);
+      const queueResult = await addAlarmToQueue(alarmJobData);
+      if (queueResult.success) {
+        await markVideoAsSent(fileId, filePath, licenseNum, alarmType, recipient, messageId);
+        console.log(`[HetuWS] ✅ Alarme mise en file (alarm-processing) pour ${recipient} (messageId=${messageId})`);
+      } else {
+        console.log(`[HetuWS] ❌ Échec ajout à la queue alarme: ${queueResult.error || 'inconnu'}`);
+      }
+    } catch (err) {
+      console.log(`[HetuWS] ❌ Erreur générale dans _processAlarmWithFile (alarmNo=${alarmNo}): ${err.message}`);
+      logger.error('[HetuWS] Erreur traitement alarme:', err.message);
+    }
+  }
+}
+
+module.exports = new HetuWebSocketService();

@@ -1,0 +1,114 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+class WatiService {
+  constructor() {
+    this.baseURL = process.env.WATI_API_URL || 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+    this.testMode = process.env.WATI_TEST_MODE === 'true';
+    
+    logger.info('WATI Service configuré:', {
+      baseURL: this.baseURL,
+      hasApiKey: !!this.apiKey,
+      testMode: this.testMode
+    });
+  }
+
+  async sendTextMessage(phoneNumber, text) {
+    if (this.testMode) {
+      logger.info('[TEST MODE] Envoi texte simulé');
+      return { success: true, testMode: true, messageId: `test_${Date.now()}` };
+    }
+
+    try {
+      const url = `${this.baseURL}/api/v1/sendMessage`;
+      const payload = {
+        phoneNumber: phoneNumber.replace('+', ''),
+        message: text
+      };
+      
+      logger.info('Envoi message texte WATI:', { phone: payload.phoneNumber });
+      
+      const response = await axios.post(url, payload, {
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        params: {
+          whatsappNumber: phoneNumber.replace('+', '')
+        },
+        timeout: 30000
+      });
+      
+      logger.info('Réponse WATI:', response.data);
+      
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.messageId,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error('Erreur WATI texte:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data?.info || error.response?.data?.message || error.message
+      };
+    }
+  }
+
+  async sendTemplateMessage(phoneNumber, templateName, templateParams = [], language = 'fr') {
+    if (this.testMode) {
+      logger.info('[TEST MODE] Envoi template simulé');
+      return { success: true, testMode: true, messageId: `test_${Date.now()}` };
+    }
+
+    try {
+      const url = `${this.baseURL}/api/v1/sendTemplateMessage`;
+      
+      // Formater les paramètres pour WATI
+      const parameters = templateParams.map((value, index) => ({
+        name: `param${index + 1}`,
+        value: value
+      }));
+      
+      const payload = {
+        template_name: templateName,
+        broadcast_name: templateName,
+        parameters: parameters,
+        channel_number: phoneNumber.replace('+', '')
+      };
+      
+      logger.info('Envoi template WATI:', { template: templateName, phone: phoneNumber });
+      
+      const response = await axios.post(url, payload, {
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        params: {
+          whatsappNumber: phoneNumber.replace('+', '')
+        },
+        timeout: 30000
+      });
+      
+      if (!response.data.result) {
+        throw new Error(response.data.info || 'Template non approuvé');
+      }
+      
+      return {
+        success: true,
+        messageId: response.data.messageId,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error('Erreur WATI template:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data?.info || error.response?.data?.message || error.message
+      };
+    }
+  }
+}
+
+module.exports = new WatiService();

@@ -1,0 +1,161 @@
+// api/src/workers/alarm-worker.js
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const alarmVideoService = require('../services/alarm-video.service');
+const hetuUserService = require('../services/hetu-user.service');
+const { uploadAndConvertVideoFromStream } = require('../services/storage-upload.service');
+const { sendAlarmTemplate } = require('../services/whatsapp-send.service');
+const { isVideoAlreadySent, markVideoAsSent } = require('../services/alarm-notification.service');
+const { normalizePhoneNumber } = require('../utils/phone-validator');
+
+const alarmLabels = {
+  makeCalls: "faire des appels",
+  fatigueDriving: "Conduite fatiguée",
+  speedingAlarm: "Excès de vitesse",
+  forwardCollision: "Collision frontale",
+  laneDeparture: "Franchissement de ligne",
+  pedestrianCollision: "Risque piéton",
+  emergencyAlarm: "Alerte d'urgence"
+};
+
+function getAlarmLabel(type) {
+  return alarmLabels[type] || type;
+}
+
+async function processAlarmJob(job) {
+  const { 
+    licenseNum, 
+    alarmType, 
+    fileId, 
+    filePath, 
+    startTime, 
+    endTime, 
+    driverId, 
+    recipientPhone, 
+    clientId,
+    channelNum,
+    videoTime,
+    originalName
+  } = job.data;
+
+  try {
+    // 1. Vérifier si déjà envoyé (doublon)
+    const alreadySent = await isVideoAlreadySent(fileId, filePath);
+    if (alreadySent) {
+      logger.info(`[AlarmWorker] Vidéo déjà envoyée: fileId=${fileId}`);
+      return { success: true, skipped: true, fileId };
+    }
+
+    // 2. Déterminer le destinataire
+    let finalRecipient = null;
+    if (recipientPhone) {
+      finalRecipient = normalizePhoneNumber(recipientPhone);
+    } else if (driverId) {
+      try {
+        const userInfo = await hetuUserService.getUserById(driverId);
+        if (userInfo.phone) {
+          finalRecipient = normalizePhoneNumber(userInfo.phone);
+        }
+      } catch (err) {
+        logger.error(`[AlarmWorker] Erreur récupération téléphone driverId ${driverId}:`, err.message);
+      }
+    }
+
+    if (!finalRecipient) {
+      throw new Error(`Aucun destinataire valide pour fileId ${fileId}`);
+    }
+
+    // 3. Télécharger la vidéo
+    const { stream, originalName: name, startTime: videoStart } = await alarmVideoService.downloadVideoByPath(
+      filePath, 
+      licenseNum, 
+      alarmType
+    );
+
+    // 4. Upload et conversion
+    const uploadResult = await uploadAndConvertVideoFromStream(stream, name, clientId, licenseNum);
+    if (!uploadResult.success) {
+      throw new Error(`Upload échoué: ${uploadResult.error}`);
+    }
+
+    // 5. Envoyer WhatsApp
+    const alarmLabel = getAlarmLabel(alarmType);
+    const dateTimeStr = videoStart ? videoStart.replace(' ', ' à ') : new Date().toLocaleString();
+    const channelNumber = process.env.DEFAULT_WHATSAPP_NUMBER;
+
+    const sendResult = await sendAlarmTemplate(
+      finalRecipient,
+      uploadResult.publicUrl,
+      alarmLabel,
+      licenseNum,
+      dateTimeStr,
+      channelNumber
+    );
+    if (!sendResult.success) {
+      throw new Error(`WhatsApp échoué: ${sendResult.error}`);
+    }
+
+    // 6. Enregistrer comme envoyé
+    await markVideoAsSent(fileId, filePath, licenseNum, alarmType, finalRecipient, sendResult.localMessageId);
+
+    logger.info(`[AlarmWorker] Envoi réussi: fileId=${fileId}, recipient=${finalRecipient}`);
+
+    return {
+      success: true,
+      fileId,
+      recipient: finalRecipient,
+      messageId: sendResult.localMessageId
+    };
+
+  } catch (error) {
+    logger.error(`[AlarmWorker] Échec pour fileId ${fileId}: ${error.message}`);
+    throw error; // pour que BullMQ retente
+  }
+}
+
+// Créer le worker
+const queueName = 'alarm-processing';
+
+const worker = new Worker(
+  queueName,
+  processAlarmJob,
+  {
+    connection: redisConnection,
+    concurrency: 5, // 5 vidéos en parallèle
+    lockDuration: 60000,
+    stalledInterval: 30000,
+    maxStalledCount: 2,
+    limiter: { max: 10, duration: 1000 }, // 10 requêtes/sec max vers Hetu
+    removeOnComplete: { age: 86400, count: 1000 },
+    removeOnFail: { age: 604800, count: 5000 }
+  }
+);
+
+worker.on('completed', (job, result) => {
+  logger.info(`✅ Job ${job.id} terminé: fileId=${result.fileId}`);
+});
+
+worker.on('failed', (job, err) => {
+  logger.error(`❌ Job ${job.id} échoué: ${err.message}`);
+});
+
+worker.on('error', (err) => {
+  logger.error(`🔥 Worker error: ${err.message}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+module.exports = { worker };

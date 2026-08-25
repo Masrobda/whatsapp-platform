@@ -1,0 +1,190 @@
+// src/services/queue.service.js
+const { Queue } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const queues = new Map();
+
+function normalizePhone(phone) {
+  return phone.replace(/[^0-9]/g, '');
+}
+
+function getQueue(phoneNumber) {
+  if (!phoneNumber) throw new Error('phoneNumber requis');
+  const norm = normalizePhone(phoneNumber);
+  const name = `whatsapp-messages-${norm}`;
+
+  if (!queues.has(norm)) {
+    const q = new Queue(name, {
+      connection: redisConnection,
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: { age: 3600, count: 1000 },
+        removeOnFail: { age: 86400, count: 2000 },
+      }
+    });
+    queues.set(norm, q);
+    logger.info(`Queue créée : ${name}`);
+  }
+
+  return queues.get(norm);
+}
+
+async function addMessageToQueue({ phoneNumber, messageId, ...data }) {
+  if (!phoneNumber || !messageId) throw new Error('phoneNumber + messageId requis');
+  
+  // Log de débogage
+  console.log("🔍 [QUEUE] Réception données:", {
+    messageId,
+    phoneNumber,
+    hasInvoiceData: !!data.invoice_data,
+    invoiceData: data.invoice_data ? JSON.stringify(data.invoice_data) : 'null'
+  });
+  
+  const queue = getQueue(phoneNumber);
+  
+  // S'assurer que invoice_data est présent et bien formaté
+  const jobData = {
+    ...data,
+    phoneNumber,
+    messageId,
+    invoice_data: data.invoice_data || null
+  };
+  
+  const job = await queue.add('send-message', jobData, {
+    jobId: messageId
+  });
+  
+  logger.debug('Job ajouté', { jobId: job.id, queue: queue.name });
+  return { success: true, jobId: job.id, queueName: queue.name };
+}
+
+async function getStatsForNumber(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const [waiting, active, failed] = await Promise.all([
+      queue.getWaitingCount(),
+      queue.getActiveCount(),
+      queue.getFailedCount()
+    ]);
+    return {
+      phone: phoneNumber,
+      waiting,
+      active,
+      failed,
+      total: waiting + active + failed
+    };
+  } catch (err) {
+    logger.error(`Erreur stats pour ${phoneNumber}`, err);
+    return { phone: phoneNumber, error: err.message };
+  }
+}
+
+async function getAllStats() {
+  try {
+    const res = await query(
+      'SELECT phone_number FROM whatsapp_numbers WHERE is_active = true'
+    );
+    const stats = [];
+    for (const { phone_number } of res.rows) {
+      stats.push(await getStatsForNumber(phone_number));
+    }
+    return stats;
+  } catch (err) {
+    logger.error('Erreur getAllStats', err);
+    throw err;
+  }
+}
+
+async function pauseQueueForNumber(phoneNumber) {
+  const queue = getQueue(phoneNumber);
+  await queue.pause();
+  logger.info(`Queue ${queue.name} mise en pause`);
+  return { success: true };
+}
+
+async function resumeQueueForNumber(phoneNumber) {
+  const queue = getQueue(phoneNumber);
+  await queue.resume();
+  logger.info(`Queue ${queue.name} reprise`);
+  return { success: true };
+}
+
+async function retryAllFailedForPhone(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const failedJobs = await queue.getFailed(0, -1);
+    let count = 0;
+    for (const job of failedJobs) {
+      await job.retry();
+      count++;
+    }
+    logger.info(`[RETRY] ${count} jobs relancés pour ${phoneNumber}`);
+    return count;
+  } catch (err) {
+    logger.error(`Erreur retryAllFailedForPhone ${phoneNumber}:`, err);
+    throw err;
+  }
+}
+
+async function clearFailedForPhone(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const cleaned = await queue.clean(0, 0, 'failed');
+    const count = cleaned.length;
+    logger.info(`[CLEAR] ${count} jobs supprimés pour ${phoneNumber}`);
+    return count;
+  } catch (err) {
+    logger.error(`Erreur clearFailedForPhone ${phoneNumber}:`, err);
+    throw err;
+  }
+}
+
+async function numberExists(phoneNumber) {
+  try {
+    const res = await query(
+      'SELECT 1 FROM whatsapp_numbers WHERE phone_number = $1 AND is_active = true',
+      [phoneNumber]
+    );
+    return res.rowCount > 0;
+  } catch (err) {
+    logger.error(`Erreur numberExists ${phoneNumber}:`, err);
+    return false;
+  }
+}
+
+async function getAllQueues() {
+  try {
+    const res = await query(
+      'SELECT phone_number FROM whatsapp_numbers WHERE is_active = true'
+    );
+    const queueList = [];
+    for (const { phone_number } of res.rows) {
+      try {
+        const queue = getQueue(phone_number);
+        queueList.push(queue);
+      } catch (err) {
+        logger.error(`Erreur récupération queue ${phone_number}:`, err);
+      }
+    }
+    return queueList;
+  } catch (err) {
+    logger.error('Erreur getAllQueues:', err);
+    return [];
+  }
+}
+
+module.exports = {
+  getQueue,
+  addMessageToQueue,
+  getStatsForNumber,
+  getAllStats,
+  pauseQueueForNumber,
+  resumeQueueForNumber,
+  retryAllFailedForPhone,
+  clearFailedForPhone,
+  numberExists,
+  getAllQueues
+};

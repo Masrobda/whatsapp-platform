@@ -1,0 +1,2577 @@
+const { query, getClient } = require('../config/database');
+const { generateInvoiceNumber, generateDisbursementNumber } = require('../utils/crypto');
+const { sendTeamNotification } = require('./email.service');
+const logger = require('../utils/logger');
+const fs = require('fs').promises;
+const path = require('path');
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+const QRCode = require('qrcode');
+const crypto = require('crypto');
+
+/**
+ * Nettoyer le texte pour l'encodage WinAnsi
+ */
+function cleanTextForPDF(text) {
+  if (typeof text !== 'string') return '';
+  return text
+    .replace(/[\u00A0\u202F\u2009]/g, ' ')     // espaces problématiques
+    .replace(/[\u2019\u2018]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013]/g, '-')
+    .replace(/[\u2014]/g, '--')
+    .replace(/[\u2026]/g, '...')
+    .replace(/[^\x00-\xFF]/g, '?')
+    .trim();
+}
+
+/**
+ * Vérifier si un fichier existe
+ */
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Formater un nombre pour pdf-lib (format français)
+ */
+function formatNumberForPDF(number) {
+  if (number === null || number === undefined) return '0,00';
+  const formatted = new Intl.NumberFormat('fr-FR', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(number);
+  return formatted.replace(/[\u00A0\u202F]/g, ' ');
+}
+
+/**
+ * Formater une date pour pdf-lib
+ */
+function formatDateForPDF(date) {
+  if (!date) return '';
+
+  const d = new Date(date);
+  return cleanTextForPDF(d.toLocaleDateString('fr-FR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric'
+  }));
+}
+
+/**
+ * Formater une date complète
+ */
+function formatFullDateForPDF(date) {
+  if (!date) return '';
+
+  const d = new Date(date);
+  return cleanTextForPDF(d.toLocaleDateString('fr-FR', {
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric'
+  }));
+}
+
+/**
+ * Convertir un nombre en lettres (français) - Version compatible WinAnsi
+ */
+function convertNumberToWords(num) {
+  if (!num || num === 0) return 'ZERO';
+
+  const units = ['', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf'];
+  const teens = ['dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize', 'dix-sept', 'dix-huit', 'dix-neuf'];
+  const tens = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante-dix', 'quatre-vingt', 'quatre-vingt-dix'];
+
+  let result = '';
+  const integerPart = Math.floor(num);
+  let remaining = integerPart;
+
+  // Millions
+  if (remaining >= 1000000) {
+    const millions = Math.floor(remaining / 1000000);
+    result += convertSmallNumber(millions) + ' million' + (millions > 1 ? 's' : '') + ' ';
+    remaining = remaining % 1000000;
+  }
+
+  // Milliers
+  if (remaining >= 1000) {
+    const thousands = Math.floor(remaining / 1000);
+    if (thousands === 1) {
+      result += 'mille ';
+    } else {
+      result += convertSmallNumber(thousands) + ' mille ';
+    }
+    remaining = remaining % 1000;
+  }
+
+  // Centaines et dizaines
+  if (remaining > 0) {
+    result += convertSmallNumber(remaining);
+  }
+
+  // Ajouter les centimes si nécessaire
+  const cents = Math.round((num - integerPart) * 100);
+  if (cents > 0) {
+    result += ' et ' + convertSmallNumber(cents) + ' centime' + (cents > 1 ? 's' : '');
+  }
+
+  return cleanTextForPDF(result.trim().toUpperCase());
+}
+
+function convertSmallNumber(num) {
+  const units = ['', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf'];
+  const teens = ['dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize', 'dix-sept', 'dix-huit', 'dix-neuf'];
+  const tens = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante-dix', 'quatre-vingt', 'quatre-vingt-dix'];
+
+  if (num < 10) return units[num];
+  if (num < 20) return teens[num - 10];
+  if (num < 100) {
+    const ten = Math.floor(num / 10);
+    const unit = num % 10;
+    if (unit === 0) return tens[ten];
+    if (unit === 1 && ten !== 8 && ten !== 9) return tens[ten] + '-et-un';
+    if (ten === 7 || ten === 9) {
+      const base = ten === 7 ? 'soixante' : 'quatre-vingt';
+      const remainder = ten === 7 ? unit + 10 : unit;
+      if (remainder === 0) return base;
+      if (remainder === 1) return base + '-et-un';
+      return base + '-' + convertSmallNumber(remainder);
+    }
+    return tens[ten] + '-' + units[unit];
+  }
+  if (num < 200) return 'cent' + (num % 100 > 0 ? ' ' + convertSmallNumber(num % 100) : '');
+  if (num < 1000) {
+    const hundred = Math.floor(num / 100);
+    const rest = num % 100;
+    return units[hundred] + ' cent' + (hundred > 1 ? 's' : '') + (rest > 0 ? ' ' + convertSmallNumber(rest) : '');
+  }
+  return convertSmallNumber(Math.floor(num / 1000)) + ' mille' + (num % 1000 > 0 ? ' ' + convertSmallNumber(num % 1000) : '');
+}
+
+/**
+ * Générer le QR code en image PNG
+ */
+async function generateQRCodeImage(text) {
+  try {
+    if (!text) {
+      logger.warn('Texte vide pour QR code');
+      return null;
+    }
+
+    const qrBuffer = await QRCode.toBuffer(cleanTextForPDF(text), {
+      width: 120,
+      margin: 1,
+      color: {
+        dark: '#1a5d1a',
+        light: '#FFFFFF'
+      }
+    });
+    return qrBuffer;
+  } catch (error) {
+    logger.warn('QR code non généré:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Dessiner du texte centré avec nettoyage automatique
+ */
+function drawCenteredText(page, text, y, size, font, color, width = 595.28) {
+  const cleanedText = cleanTextForPDF(text);
+  const textWidth = font.widthOfTextAtSize(cleanedText, size);
+  const x = (width - textWidth) / 2;
+  page.drawText(cleanedText, { x, y, size, font, color });
+}
+
+/**
+ * Dessiner du texte aligné à droite avec nettoyage automatique
+ */
+function drawRightText(page, text, y, size, font, color, maxX = 545) {
+  const cleanedText = cleanTextForPDF(text);
+  const textWidth = font.widthOfTextAtSize(cleanedText, size);
+  const x = maxX - textWidth;
+  page.drawText(cleanedText, { x, y, size, font, color });
+}
+
+/**
+ * Dessiner une ligne pointillée
+ */
+function drawDashedLine(page, start, end, dashArray = [5, 5], thickness = 1, color = rgb(0.8, 0.8, 0.8)) {
+  page.drawLine({
+    start,
+    end,
+    thickness,
+    color,
+    dashArray
+  });
+}
+
+/**
+ * Dessiner une ligne pleine
+ */
+function drawSolidLine(page, start, end, thickness = 1, color = rgb(0, 0, 0)) {
+  page.drawLine({
+    start,
+    end,
+    thickness,
+    color
+  });
+}
+
+/**
+ * Générer la facture proforma avec pdf-lib (VERSION PROFESSIONNELLE AMÉLIORÉE)
+ */
+/**
+ * Générer la facture proforma avec pdf-lib (VERSION CORRIGÉE)
+ */
+async function generateProformaPDF(invoice, orderData, verificationToken = null) {
+  try {
+    logger.info('🚀 Début génération PDF proforma professionnel');
+    const invoicesDir = process.env.INVOICES_PATH || '/var/www/numericexport/media/invoices';
+    await fs.mkdir(invoicesDir, { recursive: true });
+    const fileName = `FACTURE_PROFORMA_${invoice.invoice_number}.pdf`;
+    const pdfPath = path.join(invoicesDir, fileName);
+
+    // Créer un nouveau document PDF
+    const pdfDoc = await PDFDocument.create();
+
+    // Polices
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    // Page A4
+    const page = pdfDoc.addPage([595.28, 841.89]);
+    const { width, height } = page.getSize();
+
+    // Palette couleurs
+    const brandGreen = rgb(26/255, 93/255, 26/255);
+    const lightGreen = rgb(224/255, 242/255, 233/255);
+    const accentGreen = rgb(15/255, 65/255, 15/255);
+    const white = rgb(1, 1, 1);
+    const black = rgb(0, 0, 0);
+    const grayUltraLight = rgb(0.98, 0.98, 0.98);
+    const grayLight = rgb(0.93, 0.93, 0.93);
+    const grayMedium = rgb(0.6, 0.6, 0.6);
+    const grayDark = rgb(0.3, 0.3, 0.3);
+    const borderGray = rgb(0.85, 0.85, 0.85);
+
+    const marginLeft = 45;
+    const marginRight = 45;
+    const contentWidth = width - marginLeft - marginRight;
+    let currentY = height - 30;
+
+    // Bande verte supérieure
+    page.drawRectangle({
+      x: 0,
+      y: height - 8,
+      width: width,
+      height: 8,
+      color: brandGreen
+    });
+    currentY -= 25;
+
+    // LOGO
+    const logoPath = '/var/www/numericexport/dashboard/public/logook2.png';
+    try {
+      const logoExists = await fileExists(logoPath);
+      if (logoExists) {
+        const logoBytes = await fs.readFile(logoPath);
+        const logoImage = await pdfDoc.embedPng(logoBytes);
+        page.drawImage(logoImage, {
+          x: marginLeft,
+          y: currentY - 10,
+          width: 110,
+          height: 50
+        });
+      } else {
+        page.drawRectangle({
+          x: marginLeft,
+          y: currentY - 50,
+          width: 110,
+          height: 50,
+          color: lightGreen,
+          borderWidth: 2,
+          borderColor: brandGreen
+        });
+        page.drawText(cleanTextForPDF('NEXT LTD'), {
+          x: marginLeft + 20,
+          y: currentY - 30,
+          size: 14,
+          font: fontBold,
+          color: brandGreen
+        });
+      }
+    } catch (error) {
+      logger.error('Erreur chargement logo:', error);
+    }
+
+    // TITRE ET INFOS FACTURE (droite)
+    const rightHeaderX = width - marginRight - 220;
+
+    page.drawText(cleanTextForPDF('PROFORMA INVOICE'), {
+      x: rightHeaderX,
+      y: currentY - 10,
+      size: 22,
+      font: fontBold,
+      color: accentGreen
+    });
+
+    page.drawLine({
+      start: { x: rightHeaderX, y: currentY - 15 },
+      end: { x: width - marginRight, y: currentY - 15 },
+      thickness: 2,
+      color: brandGreen
+    });
+
+    const infoBoxY = currentY - 18;
+    const infoBoxHeight = 55;
+
+    page.drawRectangle({
+      x: rightHeaderX,
+      y: infoBoxY - infoBoxHeight,
+      width: 220,
+      height: infoBoxHeight,
+      color: grayUltraLight,
+      borderWidth: 1,
+      borderColor: borderGray
+    });
+
+    const infoLines = [
+      { label: 'Date:', value: formatDateForPDF(new Date(invoice.issue_date)) },
+      { label: 'Proforma N°:', value: invoice.invoice_number || '' },
+      { label: 'Représentant:', value: 'NEXT Team' }
+    ];
+
+    let infoY = infoBoxY - 15;
+    infoLines.forEach((info, index) => {
+      page.drawText(cleanTextForPDF(info.label), {
+        x: rightHeaderX + 10,
+        y: infoY - (index * 16),
+        size: 9,
+        font: fontBold,
+        color: grayDark
+      });
+
+      page.drawText(cleanTextForPDF(info.value), {
+        x: rightHeaderX + 110,
+        y: infoY - (index * 16),
+        size: 9,
+        font: fontRegular,
+        color: black
+      });
+    });
+
+    currentY -= 14;
+
+    // Ligne séparation
+    page.drawLine({
+      start: { x: marginLeft, y: currentY },
+      end: { x: width - marginRight, y: currentY },
+      thickness: 1,
+      color: borderGray
+    });
+    currentY -= 25;
+
+    // === INFORMATIONS ENTREPRISE ET CLIENT ===
+    const leftColWidth = contentWidth * 0.48;
+    const rightColX = marginLeft + leftColWidth + (contentWidth * 0.04);
+
+    // ÉMETTEUR
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - 20,
+      width: leftColWidth,
+      height: 20,
+      color: brandGreen
+    });
+
+    page.drawText(cleanTextForPDF('NEXT LTD'), {
+      x: marginLeft + 8,
+      y: currentY - 14,
+      size: 10,
+      font: fontBold,
+      color: white
+    });
+    currentY -= 30;
+
+    page.drawText(cleanTextForPDF('NEXT LTD'), {
+      x: marginLeft + 8,
+      y: currentY,
+      size: 13,
+      font: fontBold,
+      color: accentGreen
+    });
+    currentY -= 18;
+
+    const companyInfo = [
+      'Numeric Export Technologies',
+      'RCM: CM-DLA-02-2026-B12-00012',
+      'BP 15368 Douala, Cameroun',
+      '',
+      'Tel: +237 696 578 107',
+      ' +237 651 019 069',
+      '',
+      'Email: team@numericexport.com',
+      'Web: numericexport.com'
+    ];
+
+    companyInfo.forEach((info, index) => {
+      if (info === '') {
+        currentY -= 6;
+      } else {
+        const isBold = info.startsWith('RCM:') || info.startsWith('Tel:') || info.startsWith('Email:') || info.startsWith('Web:');
+        page.drawText(cleanTextForPDF(info), {
+          x: marginLeft + 8,
+          y: currentY - (index * 13),
+          size: 9,
+          font: isBold ? fontBold : fontRegular,
+          color: grayDark
+        });
+      }
+    });
+
+    // DESTINATAIRE
+    let clientY = height - 120;
+
+    page.drawRectangle({
+      x: rightColX,
+      y: clientY - 25,
+      width: leftColWidth,
+      height: 20,
+      color: brandGreen
+    });
+
+    page.drawText(cleanTextForPDF('DESTINATAIRE'), {
+      x: rightColX + 8,
+      y: clientY - 14,
+      size: 10,
+      font: fontBold,
+      color: white
+    });
+    clientY -= 30;
+
+    page.drawText(cleanTextForPDF(orderData.company_name || 'Client'), {
+      x: rightColX + 8,
+      y: clientY,
+      size: 13,
+      font: fontBold,
+      color: accentGreen
+    });
+    clientY -= 18;
+
+    const clientInfo = [];
+    if (orderData.address) clientInfo.push(orderData.address);
+    if (orderData.city || orderData.country) {
+      clientInfo.push(`${orderData.city || ''}${orderData.city && orderData.country ? ', ' : ''}${orderData.country || ''}`);
+    }
+    if (orderData.phone) {
+      clientInfo.push('');
+      clientInfo.push(`Tel: ${orderData.phone}`);
+    }
+    if (orderData.email) {
+      clientInfo.push('');
+      clientInfo.push(`Email: ${orderData.email}`);
+    }
+    if (orderData.tax_id) {
+      clientInfo.push(`NIF: ${orderData.tax_id}`);
+    }
+
+    clientInfo.forEach((info, index) => {
+      if (info === '') {
+        clientY -= 6;
+      } else {
+        const isBold = info.startsWith('Tel:') || info.startsWith('Email:') || info.startsWith('NIF:');
+        page.drawText(cleanTextForPDF(info), {
+          x: rightColX + 8,
+          y: clientY - (index * 13),
+          size: 9,
+          font: isBold ? fontBold : fontRegular,
+          color: grayDark
+        });
+      }
+    });
+
+    // === TABLEAU PRESTATIONS ===
+    currentY = height - 350;
+
+    page.drawText(cleanTextForPDF('DÉTAIL DE LA PRESTATION'), {
+      x: marginLeft,
+      y: currentY,
+      size: 12,
+      font: fontBold,
+      color: accentGreen
+    });
+
+    page.drawLine({
+      start: { x: marginLeft, y: currentY - 3 },
+      end: { x: marginLeft + 180, y: currentY - 3 },
+      thickness: 2,
+      color: brandGreen
+    });
+    currentY -= 25;
+
+    const tableHeaders = ['DESCRIPTION', 'QUANTITÉ', 'PRIX UNITAIRE', 'MONTANT'];
+    const columnWidths = [contentWidth * 0.45, contentWidth * 0.18, contentWidth * 0.18, contentWidth * 0.19];
+    const headerHeight = 28;
+
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - headerHeight,
+      width: contentWidth,
+      height: headerHeight,
+      color: brandGreen
+    });
+
+    let columnX = marginLeft;
+    tableHeaders.forEach((header, index) => {
+      page.drawText(cleanTextForPDF(header), {
+        x: columnX + 8,
+        y: currentY - 18,
+        size: 9,
+        font: fontBold,
+        color: white
+      });
+      columnX += columnWidths[index];
+    });
+
+    currentY -= headerHeight + 2;
+
+    const rowHeight = 55;
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - rowHeight,
+      width: contentWidth,
+      height: rowHeight,
+      color: grayUltraLight,
+      borderWidth: 1,
+      borderColor: borderGray
+    });
+
+    columnX = marginLeft;
+    for (let i = 0; i < columnWidths.length - 1; i++) {
+      columnX += columnWidths[i];
+      page.drawLine({
+        start: { x: columnX, y: currentY },
+        end: { x: columnX, y: currentY - rowHeight },
+        thickness: 0.5,
+        color: borderGray
+      });
+    }
+
+    // Description
+    page.drawText(cleanTextForPDF('Messages WhatsApp Business API'), {
+      x: marginLeft + 8,
+      y: currentY - 18,
+      size: 10,
+      font: fontBold,
+      color: black
+    });
+
+    page.drawText(cleanTextForPDF('Service de messagerie professionnelle'), {
+      x: marginLeft + 8,
+      y: currentY - 33,
+      size: 8,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    page.drawText(cleanTextForPDF('Plateforme 360dialog'), {
+      x: marginLeft + 8,
+      y: currentY - 45,
+      size: 8,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    // Quantité
+    const quantity = orderData.quantity || 0;
+    const quantityText = formatNumberForPDF(quantity);
+    const quantityWidth = fontBold.widthOfTextAtSize(quantityText, 10);
+    page.drawText(cleanTextForPDF(quantityText), {
+      x: marginLeft + columnWidths[0] + (columnWidths[1] - quantityWidth) / 2,
+      y: currentY - 28,
+      size: 10,
+      font: fontBold,
+      color: black
+    });
+
+    // Prix unitaire
+    const unitPrice = orderData.unit_price || 0;
+    page.drawText(cleanTextForPDF(formatNumberForPDF(unitPrice)), {
+      x: marginLeft + columnWidths[0] + columnWidths[1] + 15,
+      y: currentY - 23,
+      size: 9,
+      font: fontRegular,
+      color: black
+    });
+
+    page.drawText(cleanTextForPDF('FCFA'), {
+      x: marginLeft + columnWidths[0] + columnWidths[1] + 15,
+      y: currentY - 35,
+      size: 8,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    // Montant
+    const subtotal = orderData.subtotal || 0;
+    page.drawText(cleanTextForPDF(formatNumberForPDF(subtotal)), {
+      x: marginLeft + columnWidths[0] + columnWidths[1] + columnWidths[2] + 15,
+      y: currentY - 23,
+      size: 10,
+      font: fontBold,
+      color: brandGreen
+    });
+
+    page.drawText(cleanTextForPDF('FCFA'), {
+      x: marginLeft + columnWidths[0] + columnWidths[1] + columnWidths[2] + 15,
+      y: currentY - 35,
+      size: 8,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    currentY -= rowHeight + 15;
+
+    // === TOTAUX ===
+    const totalsBoxWidth = 280;
+    const totalsBoxX = width - marginRight - totalsBoxWidth;
+    const totalsBoxHeight = 100;
+
+    page.drawRectangle({
+      x: totalsBoxX,
+      y: currentY - totalsBoxHeight,
+      width: totalsBoxWidth,
+      height: totalsBoxHeight,
+      color: grayUltraLight,
+      borderWidth: 1,
+      borderColor: borderGray
+    });
+
+    let totalsY = currentY - 20;
+
+    // Sous-total
+    page.drawText(cleanTextForPDF('Sous-total HT:'), {
+      x: totalsBoxX + 15,
+      y: totalsY,
+      size: 10,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    drawRightText(
+      page,
+      `${formatNumberForPDF(subtotal)} FCFA`,
+      totalsY,
+      10,
+      fontRegular,
+      black,
+      width - marginRight - 15
+    );
+    totalsY -= 20;
+
+    // TVA
+    const vatRate = orderData.vat_rate || 0;
+    const vatAmount = orderData.vat_amount || 0;
+    page.drawText(cleanTextForPDF(`TVA (${vatRate}%):`), {
+      x: totalsBoxX + 15,
+      y: totalsY,
+      size: 10,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    drawRightText(
+      page,
+      `${formatNumberForPDF(vatAmount)} FCFA`,
+      totalsY,
+      10,
+      fontRegular,
+      black,
+      width - marginRight - 15
+    );
+    totalsY -= 25;
+
+    page.drawLine({
+      start: { x: totalsBoxX + 15, y: totalsY + 5 },
+      end: { x: width - marginRight - 15, y: totalsY + 5 },
+      thickness: 1,
+      color: brandGreen
+    });
+    totalsY -= 10;
+
+    // TOTAL TTC
+    const totalAmount = orderData.total_amount || 0;
+    page.drawText(cleanTextForPDF('TOTAL TTC:'), {
+      x: totalsBoxX + 15,
+      y: totalsY,
+      size: 12,
+      font: fontBold,
+      color: accentGreen
+    });
+
+    drawRightText(
+      page,
+      `${formatNumberForPDF(totalAmount)} FCFA`,
+      totalsY,
+      12,
+      fontBold,
+      brandGreen,
+      width - marginRight - 15
+    );
+
+    currentY -= totalsBoxHeight + 20;
+
+    // Montant en lettres
+    const amountInWords = convertNumberToWords(totalAmount);
+
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - 40,
+      width: contentWidth,
+      height: 40,
+      color: lightGreen,
+      borderWidth: 1,
+      borderColor: brandGreen
+    });
+
+    page.drawText(cleanTextForPDF('Arrêté la présente facture à la somme de:'), {
+      x: marginLeft + 10,
+      y: currentY - 18,
+      size: 8,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    page.drawText(cleanTextForPDF(`${amountInWords} FRANCS CFA`), {
+      x: marginLeft + 10,
+      y: currentY - 32,
+      size: 9,
+      font: fontBold,
+      color: brandGreen
+    });
+
+    currentY -= 60;
+
+    // === CONDITIONS ET SIGNATURES ===
+    page.drawLine({
+      start: { x: marginLeft, y: currentY },
+      end: { x: width - marginRight, y: currentY },
+      thickness: 1,
+      color: borderGray
+    });
+    currentY -= 20;
+
+    const conditionsWidth = contentWidth * 0.55;
+    const signatureX = marginLeft + conditionsWidth + 20;
+
+    let conditionsY = currentY;
+
+    page.drawRectangle({
+      x: marginLeft,
+      y: conditionsY - 18,
+      width: 200,
+      height: 18,
+      color: lightGreen
+    });
+
+    page.drawText(cleanTextForPDF('CONDITIONS DE PAIEMENT'), {
+      x: marginLeft + 8,
+      y: conditionsY - 13,
+      size: 10,
+      font: fontBold,
+      color: brandGreen
+    });
+    conditionsY -= 35;
+
+    const conditions = [
+      { icon: '•', text: 'Paiement: 60 jours après dépôt de facture' },
+      { icon: '•', text: 'Mode: Virement bancaire ou espèces' },
+      { icon: '•', text: 'Banque: CCA BANK' },
+      { icon: '•', text: 'Compte: 10039 10038 00280436301 03' },
+      { icon: '', text: '' },
+      { icon: '•', text: 'Délai de livraison: 3 jours' },
+      { icon: '•', text: 'Variation possible: +/- 30%' },
+      { icon: '', text: '' },
+      { icon: '•', text: 'Validité: 30 jours' }
+    ];
+
+    conditions.forEach((condition, index) => {
+      if (condition.text === '') {
+        conditionsY -= 8;
+      } else {
+        page.drawText(cleanTextForPDF(condition.icon), {
+          x: marginLeft + 5,
+          y: conditionsY,
+          size: 10,
+          font: fontBold,
+          color: brandGreen
+        });
+
+        page.drawText(cleanTextForPDF(condition.text), {
+          x: marginLeft + 18,
+          y: conditionsY,
+          size: 8,
+          font: fontRegular,
+          color: grayDark
+        });
+
+        conditionsY -= 14;
+      }
+    });
+
+   // SIGNATURE + QR
+    let signatureY = currentY;
+
+    // Titre VALIDATION
+    page.drawRectangle({
+      x: signatureX,
+      y: signatureY - 18,
+      width: 160,
+      height: 18,
+      color: lightGreen
+    });
+
+    page.drawText(cleanTextForPDF('VALIDATION'), {
+      x: signatureX + 8,
+      y: signatureY - 13,
+      size: 10,
+      font: fontBold,
+      color: brandGreen
+    });
+
+    signatureY -= 40;
+
+    // === ZONE TAMON + QR (alignés côte à côte) ===
+
+    const stampBoxSize = 100;     // un peu plus grand
+    const qrSize       = 100;     // même taille que le tampon pour harmonie
+    const spacing      = 20;      // espace entre tampon et QR
+
+    // Centre du tampon
+    const stampCenterX = signatureX + 60;
+
+    // Centre du QR (juste à droite du tampon)
+    const qrCenterX = stampCenterX + (stampBoxSize / 2) + (qrSize / 2) + spacing;
+
+    // === Tampon ===
+    const tamponPath = '/var/www/numericexport/assets/tampon.png';
+    try {
+      const tamponExists = await fileExists(tamponPath);
+      if (tamponExists) {
+        const tamponBytes = await fs.readFile(tamponPath);
+        const tamponImage = await pdfDoc.embedPng(tamponBytes);
+        page.drawImage(tamponImage, {
+          x: stampCenterX - stampBoxSize / 2,
+          y: signatureY - stampBoxSize,
+          width: stampBoxSize,
+          height: stampBoxSize
+        });
+      } else {
+        // Placeholder cercle
+        page.drawCircle({
+          x: stampCenterX,
+          y: signatureY - stampBoxSize / 2,
+          size: stampBoxSize / 2,
+          borderWidth: 2,
+          borderColor: brandGreen,
+          borderDashArray: [4, 4]
+        });
+        page.drawText(cleanTextForPDF('CACHET'), {
+          x: stampCenterX - 22,
+          y: signatureY - stampBoxSize / 2 - 5,
+          size: 9,
+          font: fontBold,
+          color: grayMedium
+        });
+      }
+    } catch (error) {
+      logger.error('Erreur chargement tampon:', error);
+    }
+
+    // === QR Code ===
+    let qrDrawn = false;
+    if (verificationToken) {
+      const baseApiUrl = process.env.API_BASE_URL || 'https://api.numericexport.com';
+      const qrUrl = `${baseApiUrl}/api/v1/orders/invoices/${invoice.id}/verify?token=${verificationToken}`;
+
+      logger.info(`[QR] Tentative de génération pour URL : ${qrUrl}`);
+
+      const qrImageBuffer = await generateQRCodeImage(qrUrl);
+      if (qrImageBuffer) {
+        try {
+          const qrImage = await pdfDoc.embedPng(qrImageBuffer);
+          page.drawImage(qrImage, {
+            x: qrCenterX - qrSize / 2,
+            y: signatureY - qrSize,
+            width: qrSize,
+            height: qrSize
+          });
+          qrDrawn = true;
+
+          // Petit label sous le QR
+          page.drawText(cleanTextForPDF('Vérification'), {
+            x: qrCenterX - 35,
+            y: signatureY - qrSize - 18,
+            size: 8,
+            font: fontRegular,
+            color: grayMedium
+          });
+
+          logger.info('[QR] QR code ajouté avec succès');
+        } catch (embedError) {
+          logger.error('[QR] Erreur embed PNG du QR:', embedError);
+        }
+      } else {
+        logger.warn('[QR] generateQRCodeImage a retourné null');
+      }
+    } else {
+      logger.warn('[QR] Aucun verificationToken fourni → QR non généré');
+    }
+
+    // Placeholder si QR non dessiné (pour debug visuel)
+    if (!qrDrawn) {
+      page.drawRectangle({
+        x: qrCenterX - qrSize / 2,
+        y: signatureY - qrSize,
+        width: qrSize,
+        height: qrSize,
+        borderWidth: 1,
+        borderColor: rgb(1, 0, 0),
+        color: rgb(0.98, 0.9, 0.9)
+      });
+      page.drawText(cleanTextForPDF('QR NON GÉNÉRÉ'), {
+        x: qrCenterX - 45,
+        y: signatureY - qrSize / 2 - 5,
+        size: 9,
+        font: fontBold,
+        color: rgb(0.8, 0, 0)
+      });
+    }
+
+    // Ligne signature (sous le tampon uniquement)
+    signatureY -= stampBoxSize + 15;
+
+    page.drawText(cleanTextForPDF('Le Directeur'), {
+      x: stampCenterX - 28,
+      y: signatureY,
+      size: 9,
+      font: fontBold,
+      color: grayDark
+    });
+
+    page.drawLine({
+      start: { x: stampCenterX - 40, y: signatureY - 5 },
+      end: { x: stampCenterX + 40, y: signatureY - 5 },
+      thickness: 1,
+      color: grayMedium
+    });
+    signatureY -= 25;
+
+    // QR Code
+    if (verificationToken) {
+      const baseApiUrl = process.env.API_BASE_URL || 'https://api.numericexport.com';
+      const qrUrl = `${baseApiUrl}/api/v1/orders/invoices/${invoice.id}/verify?token=${verificationToken}`;
+      const qrImageBuffer = await generateQRCodeImage(qrUrl);
+      if (qrImageBuffer) {
+        const qrImage = await pdfDoc.embedPng(qrImageBuffer);
+        const qrSize = 80;
+        page.drawImage(qrImage, {
+          x: stampCenterX - qrSize / 2,
+          y: signatureY - qrSize,
+          width: qrSize,
+          height: qrSize
+        });
+        page.drawText(cleanTextForPDF('Vérification'), {
+          x: stampCenterX - 28,
+          y: signatureY - qrSize - 12,
+          size: 7,
+          font: fontRegular,
+          color: grayMedium
+        });
+      }
+    }
+
+    // === PIED DE PAGE ===
+    const footerY = 70;
+
+    page.drawLine({
+      start: { x: marginLeft, y: footerY + 15 },
+      end: { x: width - marginRight, y: footerY + 15 },
+      thickness: 2,
+      color: brandGreen
+    });
+
+    const legalTexts = [
+      'Cette facture proforma est valable 30 jours à compter de sa date d\'émission.',
+      'Document non contractuel - Sous réserve de validation.',
+      'Pour toute question: team@numericexport.com'
+    ];
+
+    let legalY = footerY;
+    legalTexts.forEach((text, index) => {
+      page.drawText(cleanTextForPDF(text), {
+        x: marginLeft,
+        y: legalY - (index * 11),
+        size: 7,
+        font: fontRegular,
+        color: grayMedium
+      });
+    });
+
+    page.drawText(cleanTextForPDF(`© ${new Date().getFullYear()} NEXT LTD - Tous droits réservés`), {
+      x: marginLeft,
+      y: 25,
+      size: 7,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    drawRightText(
+      page,
+      `Générée le ${formatDateForPDF(new Date())}`,
+      25,
+      7,
+      fontRegular,
+      grayMedium,
+      width - marginRight
+    );
+
+    page.drawRectangle({
+      x: 0,
+      y: 0,
+      width: width,
+      height: 8,
+      color: brandGreen
+    });
+
+    // Sauvegarde
+    const pdfBytes = await pdfDoc.save();
+    await fs.writeFile(pdfPath, pdfBytes);
+
+    logger.info(`✅ Facture proforma professionnelle générée: ${pdfPath}`);
+    return pdfPath;
+
+  } catch (error) {
+    logger.error('❌ Erreur dans generateProformaPDF:', error);
+    throw error;
+  }
+}
+
+/**
+ * Générer la facture finale avec pdf-lib (CONSERVÉE TELLE QUELLE)
+ */
+async function generateFinalInvoicePDF(invoice, orderData, verificationToken = null) {
+  try {
+    logger.info('🚀 Début génération PDF facture finale');
+
+    const invoicesDir = process.env.INVOICES_PATH || '/var/www/numericexport/media/invoices';
+    await fs.mkdir(invoicesDir, { recursive: true });
+
+    const fileName = `FACTURE_FINALE_${invoice.invoice_number}.pdf`;
+    const pdfPath = path.join(invoicesDir, fileName);
+
+    // Créer un nouveau document PDF
+    const pdfDoc = await PDFDocument.create();
+
+    // Ajouter des polices
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    // Créer une page A4
+    const page = pdfDoc.addPage([595.28, 841.89]);
+    const { width, height } = page.getSize();
+
+    // ==================== DÉFINITION DES COULEURS ====================
+    const primaryGreen = rgb(34/255, 197/255, 94/255);      // #22c55e - Vert vif
+    const secondaryGreen = rgb(21/255, 128/255, 61/255);    // #15803d - Vert foncé
+    const accentGreen = rgb(134/255, 239/255, 172/255);     // #86efac - Vert clair
+    const lightGreen = rgb(220/255, 252/255, 231/255);      // #dcfce7 - Vert très clair
+    const white = rgb(1, 1, 1);
+    const black = rgb(0, 0, 0);
+    const grayLight = rgb(0.95, 0.95, 0.95);
+    const grayMedium = rgb(0.6, 0.6, 0.6);
+    const grayDark = rgb(0.3, 0.3, 0.3);
+
+    // ==================== VARIABLES DE POSITION ====================
+    const marginLeft = 50;
+    const marginRight = 50;
+    const contentWidth = width - marginLeft - marginRight;
+    let currentY = height - 50;
+
+    // ==================== EN-TÊTE PRINCIPALE ====================
+    // Logo / Nom entreprise côté gauche
+    page.drawText(cleanTextForPDF('NEXT LTD'), {
+      x: marginLeft,
+      y: currentY,
+      size: 28,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    currentY -= 25;
+    page.drawText(cleanTextForPDF('Numeric Export Technologies'), {
+      x: marginLeft,
+      y: currentY,
+      size: 14,
+      font: fontBold,
+      color: primaryGreen
+    });
+
+    currentY -= 15;
+    page.drawText(cleanTextForPDF('Société à responsabilité limitée'), {
+      x: marginLeft,
+      y: currentY,
+      size: 10,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    // Informations entreprise
+    const companyInfo = [
+      'RCCM: CM-DLA-02-2026-B12-00012',
+      'BP 15368 Douala, Cameroun',
+      'Tel: +237 696 578 107 | +237 651 019 069',
+      'Email: team@numericexport.com',
+      'Site: https://numericexport.com'
+    ];
+
+    currentY -= 25;
+    companyInfo.forEach((info, index) => {
+      page.drawText(cleanTextForPDF(info), {
+        x: marginLeft,
+        y: currentY - (index * 14),
+        size: 9,
+        font: fontRegular,
+        color: grayMedium
+      });
+    });
+
+    // Titre facture côté droit avec badge PAYÉ
+    page.drawText(cleanTextForPDF('FACTURE FINALE'), {
+      x: width - marginRight - 200,
+      y: height - 50,
+      size: 26,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    // Badge PAYÉ
+    page.drawRectangle({
+      x: width - marginRight - 100,
+      y: height - 85,
+      width: 100,
+      height: 30,
+      color: rgb(0.9, 1, 0.9),
+      borderRadius: 15,
+      borderWidth: 2,
+      borderColor: primaryGreen
+    });
+
+    page.drawText(cleanTextForPDF('✅ PAYÉ'), {
+      x: width - marginRight - 85,
+      y: height - 72,
+      size: 14,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    page.drawText(cleanTextForPDF(`N° ${invoice.invoice_number}`), {
+      x: width - marginRight - 200,
+      y: height - 110,
+      size: 16,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    // Informations facture
+    currentY = height - 130;
+    const invoiceInfo = [
+      { label: "Date d'émission:", value: formatDateForPDF(new Date(invoice.issue_date)) },
+      { label: 'Date de paiement:', value: formatDateForPDF(new Date()) },
+      { label: 'Mode de paiement:', value: 'Virement bancaire' },
+      { label: 'Référence:', value: orderData.order_code || 'N/A' }
+    ];
+
+    invoiceInfo.forEach((info, index) => {
+      page.drawText(cleanTextForPDF(info.label), {
+        x: width - marginRight - 200,
+        y: currentY - (index * 18),
+        size: 10,
+        font: fontRegular,
+        color: grayDark
+      });
+
+      drawRightText(page, info.value, currentY - (index * 18), 10, fontBold, grayDark, width - marginRight);
+    });
+
+    // ==================== LIGNE DE SÉPARATION ====================
+    currentY = height - 210;
+    page.drawLine({
+      start: { x: marginLeft, y: currentY },
+      end: { x: width - marginRight, y: currentY },
+      thickness: 2,
+      color: primaryGreen
+    });
+
+    currentY -= 20;
+
+    // ==================== INFORMATIONS CLIENT ====================
+    page.drawText(cleanTextForPDF('CLIENT'), {
+      x: marginLeft,
+      y: currentY,
+      size: 14,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    currentY -= 10;
+    drawDashedLine(page,
+      { x: marginLeft, y: currentY },
+      { x: marginLeft + 100, y: currentY },
+      [3, 3], 1, primaryGreen
+    );
+
+    currentY -= 25;
+    page.drawText(cleanTextForPDF(orderData.company_name || orderData.email || 'Client'), {
+      x: marginLeft,
+      y: currentY,
+      size: 16,
+      font: fontBold,
+      color: black
+    });
+
+    // Détails client
+    currentY -= 20;
+    const clientDetails = [
+      { label: 'Email:', value: orderData.email },
+      { label: 'Adresse:', value: orderData.address },
+      { label: 'Ville/Pays:', value: `${orderData.city || ''}${orderData.city && orderData.country ? ', ' : ''}${orderData.country || ''}` },
+      { label: 'ID Fiscal:', value: orderData.tax_id }
+    ].filter(detail => detail.value);
+
+    clientDetails.forEach((detail, index) => {
+      page.drawText(cleanTextForPDF(`${detail.label} ${detail.value}`), {
+        x: marginLeft,
+        y: currentY - (index * 16),
+        size: 11,
+        font: fontRegular,
+        color: grayDark
+      });
+    });
+
+    // ==================== BADGE MESSAGES CRÉDITÉS ====================
+    const badgeX = width - marginRight - 250;
+    page.drawRectangle({
+      x: badgeX,
+      y: currentY + 40,
+      width: 250,
+      height: 60,
+      color: lightGreen,
+      borderRadius: 8,
+      borderWidth: 2,
+      borderColor: accentGreen
+    });
+
+    const badgeCenterX = badgeX + 125;
+    drawCenteredText(page, '✅ MESSAGES CRÉDITÉS', currentY + 50, 14, fontBold, secondaryGreen, 250);
+    
+    page.drawText(cleanTextForPDF(`${orderData.quantity || 0} messages WhatsApp Business API`), {
+      x: badgeX + 20,
+      y: currentY + 30,
+      size: 12,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    page.drawText(cleanTextForPDF(`Commande: ${orderData.order_code || 'N/A'}`), {
+      x: badgeX + 20,
+      y: currentY + 15,
+      size: 10,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    // ==================== TABLEAU DES ARTICLES ====================
+    currentY -= 130;
+    page.drawText(cleanTextForPDF('PRESTATIONS EFFECTUÉES'), {
+      x: marginLeft,
+      y: currentY,
+      size: 14,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    currentY -= 10;
+    drawDashedLine(page,
+      { x: marginLeft, y: currentY },
+      { x: marginLeft + 180, y: currentY },
+      [3, 3], 1, primaryGreen
+    );
+
+    currentY -= 30;
+
+    // En-tête du tableau
+    const tableHeaders = ['DESCRIPTION', 'QUANTITÉ', 'PRIX UNITAIRE HT', 'MONTANT HT'];
+    const columnWidths = [contentWidth * 0.45, contentWidth * 0.15, contentWidth * 0.20, contentWidth * 0.20];
+    const headerHeight = 30;
+
+    // Fond en-tête
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - headerHeight,
+      width: contentWidth,
+      height: headerHeight,
+      color: secondaryGreen,
+      borderRadius: 4
+    });
+
+    // Textes en-tête
+    let columnX = marginLeft;
+    tableHeaders.forEach((header, index) => {
+      page.drawText(cleanTextForPDF(header), {
+        x: columnX + 10,
+        y: currentY - 20,
+        size: 11,
+        font: fontBold,
+        color: white
+      });
+      columnX += columnWidths[index];
+    });
+
+    // Ligne de l'article
+    currentY -= 50;
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - 40,
+      width: contentWidth,
+      height: 40,
+      color: rgb(0.98, 0.98, 0.98),
+      borderRadius: 4,
+      borderWidth: 1,
+      borderColor: lightGreen
+    });
+
+    // Description
+    page.drawText(cleanTextForPDF('Messages WhatsApp Business API'), {
+      x: marginLeft + 15,
+      y: currentY - 20,
+      size: 12,
+      font: fontBold,
+      color: black
+    });
+
+    page.drawText(cleanTextForPDF('Service de messagerie professionnelle - Plateforme 360dialog'), {
+      x: marginLeft + 15,
+      y: currentY - 35,
+      size: 9,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    // Quantité
+    const quantity = orderData.quantity || 0;
+    page.drawText(cleanTextForPDF(formatNumberForPDF(quantity)), {
+      x: marginLeft + columnWidths[0] + 30,
+      y: currentY - 27,
+      size: 12,
+      font: fontBold,
+      color: black
+    });
+
+    // Prix unitaire
+    const unitPrice = orderData.unit_price || 0;
+    page.drawText(cleanTextForPDF(`${formatNumberForPDF(unitPrice)} FCFA`), {
+      x: marginLeft + columnWidths[0] + columnWidths[1] + 20,
+      y: currentY - 27,
+      size: 12,
+      font: fontBold,
+      color: black
+    });
+
+    // Montant HT
+    const subtotal = orderData.subtotal || 0;
+    drawRightText(page, `${formatNumberForPDF(subtotal)} FCFA`, currentY - 27, 12, fontBold, black, width - marginRight - 10);
+
+    // ==================== CALCUL DES TOTAUX ====================
+    currentY -= 80;
+    const totalsX = width - marginRight - 300;
+    const totalsWidth = 300;
+
+    // Cadre totaux avec fond
+    page.drawRectangle({
+      x: totalsX,
+      y: currentY - 200,
+      width: totalsWidth,
+      height: 200,
+      color: rgb(0.99, 0.99, 0.99),
+      borderRadius: 8,
+      borderWidth: 2,
+      borderColor: accentGreen
+    });
+
+    page.drawText(cleanTextForPDF('RÉCAPITULATIF DU PAIEMENT'), {
+      x: totalsX + 10,
+      y: currentY - 20,
+      size: 16,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    // Ligne séparatrice
+    page.drawLine({
+      start: { x: totalsX + 10, y: currentY - 35 },
+      end: { x: totalsX + totalsWidth - 20, y: currentY - 35 },
+      thickness: 1,
+      color: primaryGreen
+    });
+
+    let totalY = currentY - 60;
+    const totals = [
+      { label: 'Sous-total HT', value: subtotal },
+      { label: `TVA (${orderData.vat_rate || 0}%)`, value: orderData.vat_amount || 0 },
+      { label: 'TOTAL TTC', value: orderData.total_amount || 0 }
+    ];
+
+    totals.forEach((item, index) => {
+      const isTotal = index === totals.length - 1;
+
+      page.drawText(cleanTextForPDF(item.label), {
+        x: totalsX + 20,
+        y: totalY,
+        size: isTotal ? 16 : 13,
+        font: isTotal ? fontBold : fontRegular,
+        color: isTotal ? secondaryGreen : grayDark
+      });
+
+      drawRightText(page, `${formatNumberForPDF(item.value)} FCFA`, totalY, isTotal ? 16 : 13, isTotal ? fontBold : fontRegular, isTotal ? secondaryGreen : grayDark, totalsX + totalsWidth - 20);
+
+      if (!isTotal) {
+        totalY -= 25;
+        drawDashedLine(page,
+          { x: totalsX + 20, y: totalY + 5 },
+          { x: totalsX + totalsWidth - 20, y: totalY + 5 },
+          [2, 2], 0.5, grayLight
+        );
+        totalY -= 20;
+      }
+    });
+
+    // Montant en lettres
+    totalY -= 30;
+    const amountInWords = convertNumberToWords(orderData.total_amount || 0);
+    page.drawText(cleanTextForPDF(`Montant en toutes lettres:`), {
+      x: totalsX + 20,
+      y: totalY,
+      size: 9,
+      font: fontBold,
+      color: grayDark
+    });
+    
+    totalY -= 12;
+    page.drawText(cleanTextForPDF(`${amountInWords} FRANCS CFA`), {
+      x: totalsX + 20,
+      y: totalY,
+      size: 9,
+      font: fontRegular,
+      color: grayDark
+    });
+
+    // Badge de confirmation
+    totalY -= 40;
+    page.drawRectangle({
+      x: totalsX + 20,
+      y: totalY - 40,
+      width: totalsWidth - 40,
+      height: 40,
+      color: rgb(0.9, 1, 0.9),
+      borderRadius: 6,
+      borderWidth: 2,
+      borderColor: primaryGreen
+    });
+
+    page.drawText(cleanTextForPDF('✅ PAIEMENT CONFIRMÉ - FACTURE ACQUITTÉE'), {
+      x: totalsX + totalsWidth / 2 - 110,
+      y: totalY - 20,
+      size: 12,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    // ==================== INFORMATIONS DE TRANSACTION ====================
+    currentY = 350;
+    page.drawText(cleanTextForPDF('DÉTAILS DE LA TRANSACTION'), {
+      x: marginLeft,
+      y: currentY,
+      size: 12,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    currentY -= 25;
+    page.drawRectangle({
+      x: marginLeft,
+      y: currentY - 100,
+      width: contentWidth,
+      height: 100,
+      borderWidth: 1,
+      borderColor: lightGreen,
+      borderRadius: 6,
+      color: rgb(0.99, 0.99, 0.99)
+    });
+
+    const transactionDetails = [
+      { label: 'Date de transaction:', value: formatDateForPDF(new Date()) },
+      { label: 'Référence bancaire:', value: `TRX-${invoice.invoice_number}` },
+      { label: 'Mode de paiement:', value: 'Virement bancaire' },
+      { label: 'Statut:', value: 'Complète' },
+      { label: 'Messages crédités:', value: `${quantity} unités` }
+    ];
+
+    let transactionY = currentY - 15;
+    transactionDetails.forEach((detail, index) => {
+      page.drawText(cleanTextForPDF(detail.label), {
+        x: marginLeft + 20,
+        y: transactionY - (index * 18),
+        size: 10,
+        font: fontRegular,
+        color: grayMedium
+      });
+
+      page.drawText(cleanTextForPDF(detail.value), {
+        x: marginLeft + 180,
+        y: transactionY - (index * 18),
+        size: 10,
+        font: fontBold,
+        color: detail.label === 'Statut:' ? primaryGreen : grayDark
+      });
+    });
+
+    // ==================== QR CODE ET SIGNATURE ====================
+    currentY = 240;
+
+    // Générer QR code
+    const baseApiUrl = process.env.API_BASE_URL || 'https://api.numericexport.com';
+    let qrUrl;
+
+    if (verificationToken) {
+      const qrUrl = `${baseApiUrl}/api/v1/orders/invoices/${invoice.id}/verify?token=${verificationToken}`;
+    } else {
+      qrUrl = `${baseApiUrl}/api/v1/invoices/${invoice.id}`;
+      logger.warn('Aucun token de vérification fourni -> QR sans token');
+    }
+
+    const qrImageBuffer = await generateQRCodeImage(qrUrl);
+    if (qrImageBuffer) {
+      const qrImage = await pdfDoc.embedPng(qrImageBuffer);
+
+      page.drawText(cleanTextForPDF('CERTIFICAT NUMÉRIQUE'), {
+        x: marginLeft + 100,
+        y: currentY + 20,
+        size: 11,
+        font: fontBold,
+        color: secondaryGreen
+      });
+
+      page.drawImage(qrImage, {
+        x: marginLeft + 75,
+        y: currentY - 100,
+        width: 100,
+        height: 100
+      });
+
+      page.drawText(cleanTextForPDF('Authentification numérique'), {
+        x: marginLeft + 125,
+        y: currentY - 115,
+        size: 9,
+        font: fontRegular,
+        color: grayMedium
+      });
+    }
+
+    // Signature
+    page.drawText(cleanTextForPDF('POUR VALIDATION'), {
+      x: width - marginRight - 150,
+      y: currentY + 20,
+      size: 11,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    page.drawRectangle({
+      x: width - marginRight - 125,
+      y: currentY - 100,
+      width: 100,
+      height: 100,
+      borderWidth: 2,
+      borderColor: accentGreen,
+      borderRadius: 4
+    });
+
+    page.drawText(cleanTextForPDF('Le Directeur'), {
+      x: width - marginRight - 75,
+      y: currentY - 40,
+      size: 12,
+      font: fontBold,
+      color: grayDark
+    });
+
+    page.drawLine({
+      start: { x: width - marginRight - 100, y: currentY - 55 },
+      end: { x: width - marginRight - 50, y: currentY - 55 },
+      thickness: 1,
+      color: grayMedium
+    });
+
+    page.drawText(cleanTextForPDF('Signature et cachet'), {
+      x: width - marginRight - 75,
+      y: currentY - 70,
+      size: 9,
+      font: fontRegular,
+      color: grayMedium
+    });
+
+    // ==================== MENTIONS LÉGALES ====================
+    currentY = 120;
+    page.drawLine({
+      start: { x: marginLeft, y: currentY },
+      end: { x: width - marginRight, y: currentY },
+      thickness: 1,
+      color: grayLight
+    });
+
+    currentY -= 20;
+    page.drawText(cleanTextForPDF('ATTESTATION LÉGALE'), {
+      x: marginLeft,
+      y: currentY,
+      size: 10,
+      font: fontBold,
+      color: secondaryGreen
+    });
+
+    currentY -= 15;
+    const legalText = [
+      '• Cette facture atteste du paiement complet des services mentionnés.',
+      '• Les messages WhatsApp Business API ont été crédités sur le compte client.',
+      '• Document légal valable comme preuve de paiement et de livraison.',
+      '• Pour toute réclamation, contactez-nous dans les 30 jours suivant la date de facture.',
+      '• Facture électronique - Équivalent à une facture originale signée.'
+    ];
+
+    legalText.forEach((text, index) => {
+      page.drawText(cleanTextForPDF(text), {
+        x: marginLeft + 10,
+        y: currentY - (index * 12),
+        size: 8,
+        font: fontRegular,
+        color: grayMedium
+      });
+    });
+
+    // ==================== PIED DE PAGE ====================
+    currentY = 50;
+    page.drawLine({
+      start: { x: marginLeft, y: currentY },
+      end: { x: width - marginRight, y: currentY },
+      thickness: 0.5,
+      color: grayLight
+    });
+
+    // Colonnes du pied de page
+    const footerColumns = [
+      {
+        title: 'COORDONNÉES',
+        lines: [
+          'BP 15368 Douala',
+          'team@numericexport.com',
+          '+237 696 578 107'
+        ]
+      },
+      {
+        title: 'SUPPORT CLIENT',
+        lines: [
+          'support@numericexport.com',
+          '+237 651 019 069',
+          'Lun-Ven: 8h-18h'
+        ]
+      },
+      {
+        title: 'INFORMATIONS',
+        lines: [
+          'RCCM: CM-DLA-02-2026-B12-00012',
+          'Capital: 10.000.000 FCFA',
+          'NIF: P1234567890'
+        ]
+      }
+    ];
+
+    const footerColWidth = contentWidth / 3;
+    let footerX = marginLeft;
+
+    footerColumns.forEach((column, colIndex) => {
+      page.drawText(cleanTextForPDF(column.title), {
+        x: footerX + 10,
+        y: currentY - 15,
+        size: 9,
+        font: fontBold,
+        color: secondaryGreen
+      });
+
+      column.lines.forEach((line, lineIndex) => {
+        page.drawText(cleanTextForPDF(line), {
+          x: footerX + 10,
+          y: currentY - 30 - (lineIndex * 12),
+          size: 8,
+          font: fontRegular,
+          color: grayMedium
+        });
+      });
+
+      footerX += footerColWidth;
+    });
+
+    // Copyright
+    drawCenteredText(page, `© ${new Date().getFullYear()} NEXT LTD - Facture finale générée le ${formatDateForPDF(new Date())}`, 20, 7, fontRegular, grayMedium, width);
+
+    // ==================== SAUVEGARDE DU PDF ====================
+    const pdfBytes = await pdfDoc.save();
+    await fs.writeFile(pdfPath, pdfBytes);
+
+    logger.info(`✅ Facture finale PDF générée avec succès: ${pdfPath}`);
+    return pdfPath;
+
+  } catch (error) {
+    logger.error('❌ Erreur dans generateFinalInvoicePDF:', error);
+    throw error;
+  }
+}
+
+/**
+ * Générer la facture proforma
+ */
+async function generateProforma(orderId, userId) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la commande
+    const orderResult = await client.query(
+      `SELECT o.*, c.company_name, c.email, c.address, c.city, c.country, c.tax_id, c.phone
+       FROM orders o
+       JOIN clients c ON o.client_id = c.id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+
+    if (orderResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      };
+    }
+
+    const order = orderResult.rows[0];
+
+    if (order.status !== 'validated_financial') {
+      throw {
+        statusCode: 400,
+        code: 'INVALID_STATUS',
+        message: 'La commande doit être validée par le responsable financier'
+      };
+    }
+
+    // Vérifier si une proforma n'existe pas déjà
+    const existingInvoice = await client.query(
+      'SELECT id FROM invoices WHERE order_id = $1 AND invoice_type = $2',
+      [orderId, 'proforma']
+    );
+
+    if (existingInvoice.rows.length > 0) {
+      throw {
+        statusCode: 400,
+        code: 'PROFORMA_EXISTS',
+        message: 'Une facture proforma existe déjà pour cette commande'
+      };
+    }
+
+    // Générer le numéro de facture
+    const invoiceNumber = generateInvoiceNumber('proforma');
+
+    // Créer la facture proforma
+    const invoiceResult = await client.query(
+      `INSERT INTO invoices (
+        invoice_number, order_id, client_id, invoice_type,
+        subtotal, vat_amount, total_amount, status,
+        issue_date, created_by, due_date
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 days')
+      RETURNING *`,
+      [
+        invoiceNumber,
+        orderId,
+        order.client_id,
+        'proforma',
+        order.subtotal || 0,
+        order.vat_amount || 0,
+        order.total_amount || 0,
+        'proforma_generated',
+        new Date(),
+        userId
+      ]
+    );
+
+    const invoice = invoiceResult.rows[0];
+
+    // Générer le PDF proforma avec la nouvelle structure
+    const pdfPath = await generateProformaPDF(invoice, order, null);
+
+    // Mettre à jour le chemin du PDF
+    await client.query(
+      'UPDATE invoices SET pdf_path = $1 WHERE id = $2',
+      [pdfPath, invoice.id]
+    );
+
+    // Mettre à jour le statut de la commande
+    await client.query(
+      'UPDATE orders SET status = $1 WHERE id = $2',
+      ['invoice_generated', orderId]
+    );
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'PROFORMA_GENERATED',
+        'invoice',
+        invoice.id,
+        JSON.stringify({ invoice_number: invoiceNumber })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Notification à l'équipe
+    sendTeamNotification(
+      'Facture proforma générée',
+      `
+      <h2>Facture proforma générée</h2>
+      <p><strong>Numéro facture:</strong> ${invoiceNumber}</p>
+      <p><strong>Commande:</strong> ${order.order_code}</p>
+      <p><strong>Montant:</strong> ${Number(order.total_amount || 0).toFixed(2)} FCFA</p>
+      <p><strong>Prochaine étape:</strong> Validation responsable achats</p>
+      `
+    ).catch(err => logger.error('Erreur notification:', err));
+
+    logger.info('Facture proforma générée:', invoiceNumber);
+
+    return {
+      success: true,
+      message: 'Facture proforma générée avec succès',
+      invoice: {
+        id: invoice.id,
+        invoice_number: invoice.invoice_number,
+        pdf_path: pdfPath
+      }
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur génération proforma:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Générer la facture proforma avec tampon et QR code
+ */
+async function generateProformaWithStamp(orderId, userId) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    logger.info('📋 Début génération facture avec tampon pour commande:', orderId);
+
+    // Récupérer les informations de la commande
+    const orderResult = await client.query(
+      `SELECT o.*, c.company_name, c.email as client_email, c.address as client_address,
+              c.city, c.country, c.tax_id, c.phone
+       FROM orders o
+       JOIN clients c ON o.client_id = c.id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+
+    if (orderResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      };
+    }
+
+    const order = orderResult.rows[0];
+
+    // Vérifier le statut
+    if (order.status !== 'validated_financial' && order.status !== 'invoice_generated') {
+      throw {
+        statusCode: 400,
+        code: 'INVALID_STATUS',
+        message: `Statut invalide: ${order.status}. Doit être 'validated_financial' ou 'invoice_generated'`
+      };
+    }
+
+    // Vérifier si une facture existe déjà
+    const existingInvoice = await client.query(
+      'SELECT * FROM invoices WHERE order_id = $1 AND invoice_type = $2',
+      [orderId, 'proforma']
+    );
+
+    let invoice;
+    if (existingInvoice.rows.length > 0) {
+      invoice = existingInvoice.rows[0];
+      logger.info('📄 Facture existante trouvée:', invoice.invoice_number);
+    } else {
+      // Créer une nouvelle facture proforma
+      const invoiceNumber = generateInvoiceNumber('proforma');
+      logger.info('🆕 Création nouvelle facture:', invoiceNumber);
+
+      const newInvoice = await client.query(
+        `INSERT INTO invoices (
+          invoice_number, order_id, client_id, invoice_type,
+          subtotal, vat_amount, total_amount, status,
+          issue_date, created_by, due_date
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 days')
+        RETURNING *`,
+        [
+          invoiceNumber,
+          orderId,
+          order.client_id,
+          'proforma',
+          order.subtotal || 0,
+          order.vat_amount || 0,
+          order.total_amount || 0,
+          'proforma_generated',
+          new Date(),
+          userId
+        ]
+      );
+
+      invoice = newInvoice.rows[0];
+      logger.info('✅ Nouvelle facture créée avec statut:', invoice.status);
+    }
+
+    // Générer le QR code
+    logger.info('🔐 Génération QR code...');
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+
+    // Générer le PDF avec tampon (nouvelle structure)
+    logger.info('🖨️  Génération PDF proforma...');
+    const pdfPath = await generateProformaPDF(invoice, order, verificationToken);
+
+    // Construire l'URL du QR code
+    const qrUrl = `${process.env.API_BASE_URL || 'https://api.numericexport.com'}/api/v1/orders/invoices/${invoice.id}/verify?token=${verificationToken}`;
+
+    // Mettre à jour l'invoice avec le token et chemin PDF
+    await client.query(
+      `UPDATE invoices
+       SET verification_token = $1,
+           qr_code_url = $2,
+           stamp_applied = true,
+           pdf_path = $3,
+           stamp_applied_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $4`,
+      [verificationToken, qrUrl, pdfPath, invoice.id]
+    );
+
+    // Mettre à jour le statut de la commande
+    await client.query(
+      `UPDATE orders
+       SET status = 'invoice_generated',
+           invoice_generated_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [orderId]
+    );
+
+    // Créer un log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        userId,
+        'PROFORMA_GENERATED_WITH_STAMP',
+        'invoice',
+        invoice.id,
+        JSON.stringify({
+          invoice_number: invoice.invoice_number,
+          with_stamp: true,
+          pdf_generated: !!pdfPath
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Envoyer notification
+    sendTeamNotification(
+      'Facture proforma avec tampon générée',
+      `
+      <h2>✅ Facture proforma avec tampon générée</h2>
+      <p><strong>Numéro facture:</strong> ${invoice.invoice_number}</p>
+      <p><strong>Commande:</strong> ${order.order_code}</p>
+      <p><strong>Client:</strong> ${order.company_name}</p>
+      <p><strong>Montant:</strong> ${Number(order.total_amount || 0).toFixed(2)} FCFA</p>
+      <p><strong>Tampon et QR code:</strong> Ajoutés</p>
+      `
+    ).catch(err => logger.error('Erreur notification:', err));
+
+    logger.info('🎉 Facture avec tampon générée avec succès');
+
+    // Construire l'URL de téléchargement
+    const baseUrl = process.env.API_BASE_URL || 'https://api.numericexport.com';
+    const downloadUrl = pdfPath ? `${baseUrl}/api/v1/invoices/${invoice.id}/download` : null;
+
+    return {
+      success: true,
+      message: 'Facture proforma générée avec succès',
+      invoice: {
+        ...invoice,
+        pdf_path: pdfPath,
+        qr_code_url: qrUrl,
+        stamp_applied: true,
+        verification_token: verificationToken
+      },
+      download_url: downloadUrl,
+      qr_code_url: qrUrl
+    };
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('❌ Erreur génération proforma avec tampon:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Confirmer l'achat et générer la facture finale
+ */
+async function confirmPurchase(orderId, userId) {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la commande et le client
+    const orderResult = await client.query(
+      `SELECT o.*, c.quota_remaining, c.company_name, c.email, c.address, c.city, c.country, c.tax_id, c.phone
+       FROM orders o
+       JOIN clients c ON o.client_id = c.id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+
+    if (orderResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'ORDER_NOT_FOUND',
+        message: 'Commande non trouvée'
+      };
+    }
+
+    const order = orderResult.rows[0];
+
+    // Vérifier s'il y a une proforma
+    const proformaResult = await client.query(
+      'SELECT * FROM invoices WHERE order_id = $1 AND invoice_type = $2',
+      [orderId, 'proforma']
+    );
+
+    // Générer la facture finale
+    const finalInvoiceNumber = generateInvoiceNumber('final');
+
+    const finalInvoice = await client.query(
+      `INSERT INTO invoices (
+        invoice_number, order_id, client_id, invoice_type,
+        subtotal, vat_amount, total_amount, status,
+        issue_date, created_by, due_date
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 days')
+      RETURNING *`,
+      [
+        finalInvoiceNumber,
+        orderId,
+        order.client_id,
+        'final',
+        order.subtotal || 0,
+        order.vat_amount || 0,
+        order.total_amount || 0,
+        'final_generated',
+        new Date(),
+        userId
+      ]
+    );
+
+    const invoice = finalInvoice.rows[0];
+
+    // Générer le PDF de la facture finale
+    const pdfPath = await generateFinalInvoicePDF(invoice, order, invoice.verification_token || null);
+
+    // Mettre à jour le chemin du PDF
+    await client.query(
+      'UPDATE invoices SET pdf_path = $1 WHERE id = $2',
+      [pdfPath, invoice.id]
+    );
+
+    // Créditer le compte client
+    await client.query(
+      `UPDATE clients
+       SET quota_total = COALESCE(quota_total, 0) + $1,
+           quota_remaining = COALESCE(quota_remaining, 0) + $1
+       WHERE id = $2`,
+      [order.quantity || 0, order.client_id]
+    );
+
+    // Mettre à jour la commande
+    await client.query(
+      `UPDATE orders
+       SET status = $1,
+           purchase_confirmed_by = $2,
+           purchase_confirmed_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      ['purchase_completed', userId, orderId]
+    );
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'PURCHASE_CONFIRMED',
+        'order',
+        orderId,
+        JSON.stringify({
+          messages_added: order.quantity || 0,
+          final_invoice: finalInvoiceNumber
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Notification au client et à l'équipe
+    sendTeamNotification(
+      'Commande complétée - Facture finale générée',
+      `
+      <h2>✅ Commande complétée</h2>
+      <p><strong>Client:</strong> ${order.company_name || order.email}</p>
+      <p><strong>Commande:</strong> ${order.order_code}</p>
+      <p><strong>Messages ajoutés:</strong> ${order.quantity || 0}</p>
+      <p><strong>Facture finale:</strong> ${finalInvoiceNumber}</p>
+      <p><strong>Montant:</strong> ${Number(order.total_amount || 0).toFixed(2)} FCFA</p>
+      <p><strong>PDF généré:</strong> ${pdfPath ? 'Oui' : 'Non'}</p>
+      `
+    ).catch(err => logger.error('Erreur notification:', err));
+
+    logger.info('Achat confirmé et compte crédité:', order.order_code);
+
+    return {
+      success: true,
+      message: `Achat confirmé. ${order.quantity || 0} messages ajoutés au compte client.`,
+      invoice: {
+        id: invoice.id,
+        invoice_number: finalInvoiceNumber,
+        pdf_path: pdfPath
+      }
+    };
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur confirmation achat:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Créer une fiche de décaissement
+ */
+async function createDisbursementSlip(orderId, userId, disbursementData) {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // Récupérer la facture proforma
+    const invoiceResult = await client.query(
+      `SELECT i.*, o.quantity, o.total_amount
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       WHERE i.order_id = $1 AND i.invoice_type = $2`,
+      [orderId, 'proforma']
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'PROFORMA_NOT_FOUND',
+        message: 'Facture proforma non trouvée'
+      };
+    }
+
+    const invoice = invoiceResult.rows[0];
+
+    // Générer le numéro de fiche
+    const slipNumber = generateDisbursementNumber();
+
+    // Créer la fiche de décaissement
+    const slipResult = await client.query(
+      `INSERT INTO disbursement_slips (
+        slip_number, invoice_id, order_id, amount, purpose,
+        messages_to_purchase, purchase_cost, status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *`,
+      [
+        slipNumber,
+        invoice.id,
+        orderId,
+        disbursementData.amount || 0,
+        disbursementData.purpose || 'Achat messages WhatsApp 360dialog',
+        disbursementData.messages_to_purchase || invoice.quantity || 0,
+        disbursementData.purchase_cost || 0,
+        'pending',
+        userId
+      ]
+    );
+
+    const slip = slipResult.rows[0];
+
+    // Log d'audit
+    await client.query(
+      `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, new_values)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        userId,
+        'DISBURSEMENT_SLIP_CREATED',
+        'disbursement_slip',
+        slip.id,
+        JSON.stringify({ slip_number: slipNumber, amount: disbursementData.amount || 0 })
+      ]
+    );
+
+    // Récupérer les données complètes pour le PDF
+    const orderResult = await client.query(
+      `SELECT * FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    const order = orderResult.rows[0];
+
+    // Générer un PDF simple pour l'instant
+    const disbursementsDir = process.env.DISBURSEMENTS_PATH || '/var/www/numericexport/media/disbursements';
+    await fs.mkdir(disbursementsDir, { recursive: true });
+
+    const fileName = `DECAISSEMENT_${slip.slip_number}_${new Date().toISOString().split('T')[0]}.pdf`;
+    const pdfPath = path.join(disbursementsDir, fileName);
+    const pdfRelativePath = `disbursements/${fileName}`;
+
+    // Créer un PDF simple
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([595.28, 841.89]);
+    const { width, height } = page.getSize();
+
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    page.drawText(cleanTextForPDF('FICHE DE DÉCAISSEMENT'), {
+      x: 50,
+      y: height - 50,
+      size: 24,
+      font: fontBold,
+      color: rgb(45/255, 80/255, 22/255)
+    });
+
+    page.drawText(cleanTextForPDF(`Numéro: ${slip.slip_number}`), {
+      x: 50,
+      y: height - 100,
+      size: 16,
+      font: fontBold
+    });
+
+    page.drawText(cleanTextForPDF(`Montant: ${disbursementData.amount || 0} FCFA`), {
+      x: 50,
+      y: height - 130,
+      size: 14,
+      font: fontRegular
+    });
+
+    page.drawText(cleanTextForPDF(`Objet: ${disbursementData.purpose || 'Achat messages WhatsApp 360dialog'}`), {
+      x: 50,
+      y: height - 160,
+      size: 12,
+      font: fontRegular
+    });
+
+    page.drawText(cleanTextForPDF(`Commandé par: ${userId}`), {
+      x: 50,
+      y: height - 190,
+      size: 12,
+      font: fontRegular
+    });
+
+    page.drawText(cleanTextForPDF(`Date: ${formatDateForPDF(new Date())}`), {
+      x: 50,
+      y: height - 220,
+      size: 12,
+      font: fontRegular
+    });
+
+    const pdfBytes = await pdfDoc.save();
+    await fs.writeFile(pdfPath, pdfBytes);
+
+    // Mettre à jour pdf_path dans disbursement_slips
+    await client.query(
+      `UPDATE disbursement_slips SET pdf_path = $1 WHERE id = $2`,
+      [pdfRelativePath, slip.id]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info('Fiche de décaissement créée:', slipNumber);
+    logger.info('PDF décaissement généré et enregistré:', pdfRelativePath);
+
+    return {
+      success: true,
+      message: 'Fiche de décaissement créée avec succès',
+      slip
+    };
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur création fiche décaissement:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Récupérer les factures d'un client
+ */
+async function getClientInvoices(clientId, filters = {}) {
+  const client = await getClient();
+  try {
+    const { page = 1, limit = 5, status, type } = filters;
+    const offset = (page - 1) * limit;
+
+    let whereClause = 'WHERE i.client_id = $1';
+    const params = [clientId];
+    let paramIndex = 2;
+
+    if (status) {
+      whereClause += ` AND i.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    if (type) {
+      whereClause += ` AND i.invoice_type = $${paramIndex}`;
+      params.push(type);
+      paramIndex++;
+    }
+
+    // Compter le total avec alias
+    const countResult = await client.query(
+      `SELECT COUNT(*) FROM invoices i ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Récupérer les factures
+    const invoicesResult = await client.query(
+      `SELECT
+        i.*,
+        o.order_code, o.quantity
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       ${whereClause}
+       ORDER BY i.created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    );
+
+    return {
+      success: true,
+      invoices: invoicesResult.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur récupération factures client:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Récupérer les factures (pour les administrateurs)
+ */
+async function getInvoices(filters = {}) {
+  const client = await getClient();
+  try {
+    const { page = 1, limit = 10, status, type, client_id } = filters;
+    const offset = (page - 1) * limit;
+
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+
+    if (client_id) {
+      whereClause += ` AND i.client_id = $${paramIndex}`;
+      params.push(client_id);
+      paramIndex++;
+    }
+    if (status) {
+      whereClause += ` AND i.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    if (type) {
+      whereClause += ` AND i.invoice_type = $${paramIndex}`;
+      params.push(type);
+      paramIndex++;
+    }
+
+    // Compter le total
+    const countResult = await client.query(
+      `SELECT COUNT(*) FROM invoices i ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Récupérer les factures avec jointures + infos client/commande
+    const invoicesResult = await client.query(
+      `SELECT
+        i.*,
+        o.order_code,
+        c.company_name,
+        c.email as client_email
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       JOIN clients c ON i.client_id = c.id
+       ${whereClause}
+       ORDER BY i.created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    );
+
+    return {
+      success: true,
+      invoices: invoicesResult.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur récupération factures:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Récupérer une fiche de décaissement
+ */
+async function getDisbursementSlip(orderId) {
+  const client = await getClient();
+
+  try {
+    // Récupérer la fiche de décaissement avec ses informations
+    const result = await client.query(
+      `SELECT
+        ds.*,
+        o.order_code,
+        c.company_name,
+        c.email as client_email,
+        i.invoice_number as proforma_invoice_number
+       FROM disbursement_slips ds
+       LEFT JOIN orders o ON ds.order_id = o.id
+       LEFT JOIN clients c ON o.client_id = c.id
+       LEFT JOIN invoices i ON ds.invoice_id = i.id
+       WHERE ds.order_id = $1`,
+      [orderId]
+    );
+
+    if (result.rows.length === 0) {
+      throw {
+        statusCode: 404,
+        code: 'DISBURSEMENT_NOT_FOUND',
+        message: 'Fiche de décaissement non trouvée'
+      };
+    }
+
+    const slip = result.rows[0];
+
+    // Construire l'URL complète du PDF
+    const pdfUrl = slip.pdf_path
+      ? `${process.env.API_BASE_URL || 'https://api.numericexport.com'}/media/${slip.pdf_path}`
+      : null;
+
+    return {
+      success: true,
+      disbursement: {
+        ...slip,
+        pdf_url: pdfUrl
+      }
+    };
+
+  } catch (error) {
+    logger.error('Erreur récupération fiche décaissement:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+
+
+// ==================== EXPORT DES FONCTIONS ====================
+
+module.exports = {
+  generateProforma,
+  generateProformaWithStamp,
+  generateProformaPDF,
+  generateFinalInvoicePDF,
+  createDisbursementSlip,
+  confirmPurchase,
+  getClientInvoices,
+  getDisbursementSlip,
+  getInvoices,
+  fileExists,
+  convertNumberToWords,
+  formatNumberForPDF,
+  formatDateForPDF,
+  formatFullDateForPDF,
+  cleanTextForPDF,
+  drawCenteredText,
+  drawRightText,
+  drawDashedLine,
+  drawSolidLine
+};

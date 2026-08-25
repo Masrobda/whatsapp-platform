@@ -1,0 +1,147 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const FormData = require('form-data');
+
+class WatiService {
+  constructor() {
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+if (!this.apiKey) {
+  throw new Error('WATI_API_KEY manquant dans les variables d\'environnement');
+}
+  }
+
+  async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, language = 'fr') {
+    try {
+      let cleanPhone = recipientPhone.replace(/\s/g, '');
+      if (!cleanPhone.startsWith('+')) {
+        cleanPhone = `+${cleanPhone}`;
+      }
+
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `broadcast_${Date.now()}`,
+        language: language,
+        parameters: this.formatTemplateParameters(templateParams)
+      };
+
+      console.log("Payload envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: {
+          whatsappNumber: cleanPhone
+        },
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("Réponse WATI:", response.data);
+
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.local_message_id
+      };
+
+    } catch (error) {
+      let errorInfo = error.message;
+      if (error.response) {
+        errorInfo = `Status: ${error.response.status} - Data: ${JSON.stringify(error.response.data)}`;
+        console.error('Détails erreur WATI:', error.response.data);
+      }
+      console.error('Erreur sendTemplateMessage:', errorInfo);
+      return { success: false, error: errorInfo };
+    }
+  }
+
+  async sendInvoiceWithPDF(recipientPhone, templateName, templateParams, invoiceData) {
+    console.log("--- ENVOI TEMPLATE + PDF ---");
+
+    try {
+      let cleanPhone = recipientPhone.replace(/\s/g, '');
+      if (!cleanPhone.startsWith('+')) {
+        cleanPhone = `+${cleanPhone}`;
+      }
+
+      const pdfUrl = invoiceData.pdfUrl;
+      const invoiceNumber = invoiceData.number || '001';
+
+      console.log("PDF URL:", pdfUrl);
+
+      // Vérifier si le PDF est accessible
+      try {
+        const pdfCheck = await axios.head(pdfUrl, { timeout: 10000 });
+        console.log("PDF accessible - Status:", pdfCheck.status);
+      } catch (pdfError) {
+        console.error("PDF inaccessible:", pdfError.message);
+        return {
+          success: false,
+          error: `PDF inaccessible: ${pdfError.message}`
+        };
+      }
+
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `invoice_${invoiceNumber}_${Date.now()}`,
+        language: "fr",
+        parameters: this.formatTemplateParameters(templateParams),
+        media_url: pdfUrl,
+        filename: `Facture-${invoiceNumber}.pdf`
+      };
+
+      console.log("Payload envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: {
+          whatsappNumber: cleanPhone
+        },
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 60000
+      });
+
+      console.log("RÉPONSE WATI SUCCÈS:", response.data);
+
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.local_message_id
+      };
+
+    } catch (error) {
+      let errorInfo = error.message;
+
+      if (error.response) {
+        errorInfo = `Status: ${error.response.status} - Data: ${JSON.stringify(error.response.data)}`;
+        console.error("Détails erreur WATI:", error.response.data);
+      }
+
+      console.error("ERREUR WATI (Template+PDF):", errorInfo);
+      return { success: false, error: errorInfo };
+    }
+  }
+
+  formatTemplateParameters(params) {
+    if (!params) return [];
+
+    const formatted = [];
+    for (const [key, value] of Object.entries(params)) {
+      formatted.push({
+        name: key,
+        value: String(value || '')
+      });
+    }
+    return formatted;
+  }
+}
+
+module.exports = new WatiService();

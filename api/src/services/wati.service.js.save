@@ -1,0 +1,149 @@
+// src/services/wati.service.js
+const axios = require('axios');
+
+class WatiService {
+  constructor() {
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+if (!this.apiKey) {
+  throw new Error('WATI_API_KEY manquant dans les variables d\'environnement');
+}
+  }
+
+  // Fonction pour les messages templates standards (SANS PDF)
+async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, language = 'fr') {
+  try {
+    let cleanPhone = recipientPhone.replace(/\s/g, '');
+    if (!cleanPhone.startsWith('+')) cleanPhone = `+${cleanPhone}`;
+
+    const payload = {
+      template_name: templateName,
+      broadcast_name: `msg_${Date.now()}`,
+      language: language,
+      parameters: this.formatTemplateParameters(templateParams)
+    };
+
+    const response = await axios({
+      method: 'post',
+      url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+      params: { whatsappNumber: cleanPhone },
+      data: payload,
+      headers: {
+        'Authorization': `Bearer ${this.apiKey.trim()}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    });
+
+    console.log("=== RÉPONSE WATI COMPLÈTE ===");
+    console.log(JSON.stringify(response.data, null, 2));
+    console.log("=== RÉPONSE COMPLÈTE DE WATI ===");
+    console.log(JSON.stringify(response.data, null, 2));
+    console.log("Clés disponibles:", Object.keys(response.data));
+
+    // 🔥 CORRECTION : Retourner le BON ID
+    return {
+      success: true,
+      localMessageId: response.data.local_message_id,  // Votre UUID (pour référence)
+      watiMessageId: response.data.message_id || response.data.id,  // L'ID WATI pour les webhooks
+      status: response.data.status || 'sent'
+    };
+  } catch (error) {
+    console.error('Erreur sendTemplateMessage:', error.response?.data || error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+  // Fonction Spéciale pour les Factures PDF
+ async sendInvoiceWithPDF(recipientPhone, templateName, templateParams, invoiceData) {
+    console.log("--- DÉBUT ENVOI TEMPLATE + PDF ---");
+    console.log("=== RÉPONSE OFFICIELLE WATI ===");
+  console.log(JSON.stringify(response.data, null, 2));
+ 
+   try {
+      // 1. Nettoyage du template name
+      let tName = typeof templateName === 'object' ? (templateName.template_name || templateName.name) : templateName;
+      tName = String(tName || "").trim();
+
+      // 2. Nettoyage du téléphone
+      let cleanPhone = recipientPhone.replace(/\s/g, '');
+      if (!cleanPhone.startsWith('+')) cleanPhone = `+${cleanPhone}`;
+
+      // 3. Extraction de l'URL du PDF
+      let pdfUrl = (invoiceData?.pdfUrl || invoiceData?.url || "").trim();
+      if (!pdfUrl.startsWith('http')) {
+        throw new Error(`URL du PDF invalide : "${pdfUrl}"`);
+      }
+
+      // 4. PROTECTION CRITIQUE : Gestion des paramètres
+      // Si templateParams arrive en String (JSON), on le parse. Sinon on assure un objet vide.
+      let safeParams = {};
+      if (typeof templateParams === 'string') {
+        try { safeParams = JSON.parse(templateParams); } catch (e) { safeParams = {}; }
+      } else if (templateParams && typeof templateParams === 'object') {
+        safeParams = templateParams;
+      }
+
+      // Extraction de 'file' sans risquer de crash
+      const { file, ...textOnlyParams } = safeParams;
+
+      // 5. Payload conforme aux exigences Support WATI (Pas de 'file' dans parameters)
+      const payload = {
+        template_name: tName,
+        broadcast_name: `inv_${invoiceData?.number || Date.now()}`,
+        language: "fr",
+        parameters: this.formatTemplateParameters(textOnlyParams),
+        media_url: pdfUrl,
+        header_parameters: [
+          {
+            name: "file",
+            value: pdfUrl
+          }
+        ],
+        filename: `Facture-${invoiceData?.number || '001'}.pdf`
+      };
+
+      console.log("Payload final envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: { whatsappNumber: cleanPhone },
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+      console.log("=== RÉPONSE OFFICIELLE WATI ===");
+      console.log(JSON.stringify(response.data, null, 2));
+
+      return {
+        success: true,
+    localMessageId: response.data.local_message_id,
+    watiMessageId: response.data.message_id || response.data.id,
+    status: response.data.status || 'sent'
+      };
+
+    } catch (error) {
+      const errorDetail = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+      console.error("ERREUR CRITIQUE WATI SERVICE:", errorDetail);
+      return { success: false, error: errorDetail };
+    }
+  }
+
+  formatTemplateParameters(params) {
+    if (!params) return [];
+    let parameters = params;
+    if (typeof params === 'string') {
+      try { parameters = JSON.parse(params); } catch (e) { return []; }
+    }
+    return Object.entries(parameters).map(([key, value]) => ({
+      name: key,
+      value: String(value)
+    }));
+  }
+}
+
+module.exports = new WatiService();

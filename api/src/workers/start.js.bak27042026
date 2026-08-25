@@ -1,0 +1,41 @@
+/**
+ * Point d'entrée pour démarrer tous les workers
+ */
+require('dotenv').config();
+
+const logger = require('../utils/logger');
+
+// Importer les workers
+const messageWorker = require('./message.worker');
+const { scheduleCleanupTasks } = require('./cleanup.worker');
+
+// Démarrer les tâches de nettoyage planifiées
+scheduleCleanupTasks();
+
+logger.info(`
+╔═══════════════════════════════════════════════╗
+║                                               ║
+║        🔧 WORKERS NEXTLTD DÉMARRÉS 🔧        ║
+║                                               ║
+║  Message Worker: Active                      ║
+║  Concurrency: 5                              ║
+║  Rate Limit: 50/sec                          ║
+║                                               ║
+║  Cleanup Worker: Planifié                    ║
+║  Schedule: Tous les jours à 2h00             ║
+║                                               ║
+╚═══════════════════════════════════════════════╝
+`);
+
+// Gestion de l'arrêt gracieux
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM reçu, arrêt des workers...');
+  await messageWorker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT reçu, arrêt des workers...');
+  await messageWorker.close();
+  process.exit(0);
+});
