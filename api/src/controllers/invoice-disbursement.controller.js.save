@@ -1,0 +1,1017 @@
+    if (start_date) {
+      whereConditions.push(`i.created_at >= $${params.length + 1}`);
+      params.push(start_date);
+    }
+    if (end_date) {
+      whereConditions.push(`i.created_at <= $${params.length + 1}`);
+      params.push(end_date);
+    }
+
+    // Filtre par statut de décaissement
+    if (filter === 'pending') {
+      whereConditions.push(`(ds.status IS NULL OR ds.status = 'pending')`);
+    } else if (filter === 'with_receipts') {
+      whereConditions.push(`ds.receipt_path IS NOT NULL`);
+    } else if (filter === 'validated') {
+      whereConditions.push(`ds.status IN ('approved', 'validated', 'disbursed')`);
+    }
+
+    // Ajouter les conditions WHERE si elles existent
+    if (whereConditions.length > 0) {
+      sql += ` AND ${whereConditions.join(' AND ')}`;
+    }
+
+    // REQUÊTE DE COMPTAGE
+    const countSql = `
+      SELECT COUNT(*) as total
+      FROM invoices i
+      JOIN orders o ON i.order_id = o.id
+      JOIN clients c ON o.client_id = c.id
+      LEFT JOIN disbursement_slips ds ON o.id = ds.order_id
+      LEFT JOIN bsp_providers bsp ON o.selected_bsp_id = bsp.id
+      WHERE i.invoice_type = 'proforma'
+      ${whereConditions.length > 0 ? `AND ${whereConditions.join(' AND ')}` : ''}
+    `;
+
+    // Exécuter d'abord le count
+    const countResult = await query(countSql, params);
+    const total = parseInt(countResult.rows[0]?.total || 0);
+
+    // Ajouter ORDER BY et pagination à la requête principale
+    sql += ` ORDER BY i.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    // Ajouter les paramètres de pagination
+    const queryParams = [...params, limit, offset];
+
+    // Exécuter la requête principale
+    const result = await query(sql, queryParams);
+
+    console.log(`✅ ${result.rowCount} factures/décaissements récupérés sur ${total} total`);
+
+    // Enrichissement URLs
+    const baseMediaUrl = process.env.MEDIA_BASE_URL || 'https://api.numericexport.com/media';
+    const enriched = result.rows.map(row => {
+      // Extraire uniquement le nom de fichier pour les URLs
+      const getFileName = (filePath) => {
+        if (!filePath) return null;
+        return filePath.split('/').pop();
+      };
+
+      return {
+        ...row,
+        invoice_pdf_url: row.invoice_pdf_path ? `${baseMediaUrl}/invoices/${getFileName(row.invoice_pdf_path)}` : null,
+        disbursement_pdf_url: row.disbursement_pdf_path ? `${baseMediaUrl}/disbursements/${getFileName(row.disbursement_pdf_path)}` : null,
+        receipt_url: row.receipt_path ? `${baseMediaUrl}/receipts/${getFileName(row.receipt_path)}` : null
+      };
+    });
+
+    return reply.code(200).send({
+      success: true,
+      data: enriched,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Erreur getAllInvoiceDisbursements:', {
+      message: err.message,
+      stack: err.stack,
+      query: err.query || 'N/A',
+      parameters: err.parameters || 'N/A'
+    });
+
+    return reply.code(500).send({
+      success: false,
+      code: 'INTERNAL_ERROR',
+      message: 'Erreur lors de la récupération des données',
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+  }
+}
+
+async function getDisbursementDetails(request, reply) {
+  try {
+    const { id } = request.params;
+
+    const result = await query(
+      `SELECT
+        ds.*,
+        ds.messages_to_purchase,
+        ds.purchase_cost,
+        o.order_code,
+        o.quantity as order_quantity,
+        o.total_amount as order_amount,
+        i.invoice_number,
+        i.pdf_path as invoice_pdf_path,
+        bsp.name as bsp_name,
+        c.company_name,
+        c.id as client_id,
+        c.email as client_email
+       FROM disbursement_slips ds
+       JOIN orders o ON ds.order_id = o.id
+       JOIN invoices i ON ds.invoice_id = i.id
+       LEFT JOIN bsp_providers bsp ON ds.bsp_id = bsp.id
+       JOIN clients c ON o.client_id = c.id
+       WHERE ds.id = $1`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return reply.code(404).send({
+        success: false,
+        message: 'Décaissement non trouvé'
+      });
+    }
+
+    const item = result.rows[0];
+    const baseMedia = process.env.MEDIA_BASE_URL || 'https://api.numericexport.com/media';
+
+    // Extraire les noms de fichiers pour les URLs
+    const getFileName = (filePath) => filePath ? filePath.split('/').pop() : null;
+
+    return reply.send({
+      success: true,
+      data: {
+        ...item,
+        disbursement_pdf_url: item.pdf_path ? `${baseMedia}/disbursements/${getFileName(item.pdf_path)}` : null,
+        receipt_url: item.receipt_path ? `${baseMedia}/receipts/${getFileName(item.receipt_path)}` : null
+      }
+    });
+
+  } catch (err) {
+    logger.error('Erreur getDisbursementDetails:', err);
+    return reply.code(500).send({
+      success: false,
+      message: 'Erreur serveur'
+    });
+  }
+}
+
+async function generateDisbursementSlip(request, reply) {
+  try {
+    const { orderId } = request.params;
+    const { bsp_id, messages_to_purchase, purpose, purchase_cost = 0, notes = '' } = request.body;
+    const userId = request.user.id;
+
+    console.log('🔍 Début génération décaissement:', { orderId, bsp_id, purpose });
+
+    // 1. Vérifications
+    const orderRes = await query(
+      `SELECT o.*, i.id as invoice_id, i.invoice_number
+       FROM orders o
+       JOIN invoices i ON o.id = i.order_id AND i.invoice_type = 'proforma'
+       WHERE o.id = $1 AND o.status = 'invoice_generated'`,
+      [orderId]
+    );
+
+    if (!orderRes.rowCount) {
+      return reply.code(400).send({
+        success: false,
+        message: 'Commande non prête pour décaissement'
+      });
+    }
+
+    const order = orderRes.rows[0];
+    console.log('✅ Commande trouvée:', order.order_code);
+
+    // Vérifier BSP
+    const bspRes = await query('SELECT * FROM bsp_providers WHERE id = $1', [bsp_id]);
+    if (!bspRes.rowCount) {
+      return reply.code(400).send({
+        success: false,
+        message: 'BSP non trouvé'
+      });
+    }
+
+    const bsp = bspRes.rows[0];
+    console.log('✅ BSP trouvé:', bsp.name);
+
+    // Pas de doublon
+    const existRes = await query('SELECT id FROM disbursement_slips WHERE order_id = $1', [orderId]);
+    if (existRes.rowCount) {
+      return reply.code(400).send({
+        success: false,
+        message: 'Décaissement déjà créé'
+      });
+    }
+
+    // 2. Création du décaissement
+    const now = new Date();
+    const yearMonth = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}`;
+    const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+    const slipNumber = `DEC-${yearMonth}-${randomNum}`;
+
+    console.log('📝 Création slip:', slipNumber);
+
+    const slipRes = await query(
+      `INSERT INTO disbursement_slips (
+        slip_number, order_id, invoice_id, bsp_id,
+        amount, purpose, messages_to_purchase, purchase_cost,
+        notes, status, created_by, created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,NOW())
+      RETURNING id, slip_number, created_at`,
+      [
+        slipNumber,
+        orderId,
+        order.invoice_id,
+        bsp_id,
+        order.total_amount,
+        purpose,
+        messages_to_purchase || order.quantity,
+        purchase_cost,
+        notes,
+        userId
+      ]
+    );
+
+    const slip = slipRes.rows[0];
+    console.log('✅ Décaissement créé:', slip.id);
+
+    // 3. Mettre à jour la commande
+    await query(
+      `UPDATE orders
+       SET selected_bsp_id = $1,
+           messages_to_purchase = $2,
+           estimated_purchase_cost = $3,
+           financial_purpose = $4,
+           updated_at = NOW()
+       WHERE id = $5`,
+      [bsp_id, messages_to_purchase || order.quantity, purchase_cost, purpose, orderId]
+    );
+
+    // 4. Générer PDF
+    let pdfPath = null;
+    let pdfRelativePath = null;
+    try {
+      const orderWithBsp = {
+        ...order,
+        order_code: order.order_code,
+        total_amount: order.total_amount,
+        quantity: order.quantity,
+        bsp_name: bsp.name
+      };
+      
+      pdfPath = await generateDisbursementPdf(slip, orderWithBsp);
+      
+      // Enregistrer le chemin relatif pour l'URL
+      pdfRelativePath = `disbursements/${path.basename(pdfPath)}`;
+      
+      await query(
+        'UPDATE disbursement_slips SET pdf_path = $1 WHERE id = $2',
+        [pdfRelativePath, slip.id]
+      );
+      
+      console.log('✅ PDF généré:', pdfRelativePath);
+    } catch (pdfErr) {
+      console.error('❌ PDF non généré:', pdfErr.message);
+      // Ne pas bloquer si le PDF échoue
+    }
+
+    // 5. Log d'audit
+    try {
+      await query(
+        `INSERT INTO audit_logs (
+          action, entity_type, entity_id, user_id, details
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          'DISBURSEMENT_CREATED',
+          'disbursement',
+          slip.id,
+          userId,
+          JSON.stringify({
+            slip_number: slipNumber,
+            order_id: orderId,
+            bsp_id: bsp_id,
+            purpose: purpose
+          })
+        ]
+      );
+    } catch (auditError) {
+      console.error('Erreur log audit (non bloquant):', auditError);
+    }
+
+    const baseMediaUrl = process.env.MEDIA_BASE_URL || 'https://api.numericexport.com/media';
+
+    return reply.code(201).send({
+      success: true,
+      message: 'Fiche de décaissement créée',
+      data: {
+        disbursement_id: slip.id,
+        slip_number: slipNumber,
+        order_id: orderId,
+        invoice_id: order.invoice_id,
+        invoice_number: order.invoice_number,
+        pdf_path: pdfRelativePath,
+        disbursement_pdf_url: pdfRelativePath ? `${baseMediaUrl}/${pdfRelativePath}` : null,
+        created_at: slip.created_at
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ generateDisbursementSlip error:', err);
+    return reply.code(500).send({
+      success: false,
+      message: err.message
+    });
+  }
+}
+
+async function generateDisbursementPdf(slip, order) {
+  try {
+    console.log('📄 Début génération PDF décaissement...');
+    
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([595, 842]);
+    const { width, height } = page.getSize();
+
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+    const green = rgb(0, 0.5, 0.2);
+    const dark = rgb(0.1, 0.1, 0.1);
+    const gray = rgb(0.5, 0.5, 0.5);
+
+    // En-tête
+    page.drawText('FICHE DE DÉCAISSEMENT', {
+      x: 50, y: height - 60, size: 20, font: fontBold, color: green
+    });
+
+    page.drawText(`N° ${slip.slip_number}`, {
+      x: 50, y: height - 100, size: 14, font: fontBold, color: dark
+    });
+
+    page.drawText(`Date: ${new Date().toLocaleDateString('fr-FR')}`, {
+      x: 50, y: height - 125, size: 11, font: fontReg, color: gray
+    });
+
+    // Ligne de séparation
+    page.drawLine({
+      start: { x: 50, y: height - 140 },
+      end: { x: width - 50, y: height - 140 },
+      thickness: 1,
+      color: green
+    });
+
+    // Section Commande
+    page.drawText('INFORMATIONS COMMANDE', {
+      x: 50, y: height - 170, size: 12, font: fontBold, color: dark
+    });
+
+    page.drawText(`Référence: ${order.order_code || 'N/A'}`, {
+      x: 50, y: height - 195, size: 11, font: fontReg
+    });
+
+    page.drawText(`Montant: ${(order.total_amount || 0).toLocaleString('fr-FR')} FCFA`, {
+      x: 50, y: height - 215, size: 11, font: fontReg
+    });
+
+    page.drawText(`Quantité messages: ${order.quantity || 0}`, {
+      x: 50, y: height - 235, size: 11, font: fontReg
+    });
+
+    // Section Décaissement
+    page.drawText('INFORMATIONS DÉCAISSEMENT', {
+      x: 300, y: height - 170, size: 12, font: fontBold, color: dark
+    });
+
+    page.drawText(`BSP: ${order.bsp_name || 'Non spécifié'}`, {
+      x: 300, y: height - 195, size: 11, font: fontReg
+    });
+
+    page.drawText(`Messages à acheter: ${slip.messages_to_purchase || order.quantity || 0}`, {
+      x: 300, y: height - 215, size: 11, font: fontReg
+    });
+
+    page.drawText(`Coût estimé: ${(slip.purchase_cost || 0).toLocaleString('fr-FR')} FCFA`, {
+      x: 300, y: height - 235, size: 11, font: fontReg
+    });
+
+    // Section But du décaissement
+    if (slip.purpose) {
+      page.drawText('BUT DU DÉCAISSEMENT', {
+        x: 50, y: height - 280, size: 12, font: fontBold, color: dark
+      });
+
+      // Diviser le texte en plusieurs lignes si nécessaire
+      const purposeText = slip.purpose;
+      const maxWidth = width - 100;
+      const lineHeight = 15;
+      let yPos = height - 305;
+
+      // Fonction pour diviser le texte
+      const wrapText = (text, maxWidth, fontSize) => {
+        const words = text.split(' ');
+        const lines = [];
+        let currentLine = words[0];
+
+        for (let i = 1; i < words.length; i++) {
+          const word = words[i];
+          const testLine = currentLine + ' ' + word;
+          const testWidth = fontReg.widthOfTextAtSize(testLine, fontSize);
+          
+          if (testWidth <= maxWidth) {
+            currentLine = testLine;
+          } else {
+            lines.push(currentLine);
+            currentLine = word;
+          }
+        }
+        lines.push(currentLine);
+        return lines;
+      };
+
+      const lines = wrapText(purposeText, maxWidth, 11);
+      lines.forEach((line, index) => {
+        page.drawText(line, {
+          x: 50,
+          y: yPos - (index * lineHeight),
+          size: 11,
+          font: fontReg
+        });
+      });
+    }
+
+    // Pied de page
+    page.drawText('Document généré le ' + new Date().toLocaleString('fr-FR'), {
+      x: 50, y: 40, size: 8, font: fontReg, color: gray
+    });
+
+    page.drawText('NEXT LTD - Numeric Export Technologies', {
+      x: width - 200, y: 40, size: 8, font: fontReg, color: gray
+    });
+
+    // Ligne de bas de page
+    page.drawLine({
+      start: { x: 0, y: 30 },
+      end: { x: width, y: 30 },
+      thickness: 1,
+      color: green
+    });
+
+    // Sauvegarde
+    const pdfBytes = await pdfDoc.save();
+    const dir = process.env.DISBURSEMENTS_PATH || '/var/www/numericexport/media/disbursements';
+    await fs.mkdir(dir, { recursive: true });
+
+    const fileName = `DEC-${slip.slip_number}.pdf`;
+    const fullPath = path.join(dir, fileName);
+
+    await fs.writeFile(fullPath, pdfBytes);
+    console.log(`✅ PDF sauvegardé: ${fullPath}`);
+
+    return fullPath;
+
+  } catch (error) {
+    console.error('❌ Erreur generateDisbursementPdf:', error);
+    throw error;
+  }
+}
+
+async function uploadReceipt(request, reply) {
+  try {
+    const { disbursementId } = request.params;
+    const userId = request.user.id;
+
+    console.log('📤 Début upload reçu pour décaissement:', disbursementId);
+
+    // Vérifier si un fichier a été uploadé
+    const file = request.file;
+    if (!file) {
+      return reply.code(400).send({
+        success: false,
+        message: 'Aucun fichier uploadé'
+      });
+    }
+
+    console.log('📄 Fichier reçu:', {
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size,
+      path: file.path
+    });
+
+    // Vérifier que le décaissement existe
+    const disbursementResult = await query(
+      'SELECT * FROM disbursement_slips WHERE id = $1',
+      [disbursementId]
+    );
+
+    if (disbursementResult.rowCount === 0) {
+      // Supprimer le fichier uploadé s'il existe
+      if (file.path && fs.existsSync(file.path)) {
+        await fs.unlink(file.path);
+      }
+      return reply.code(404).send({
+        success: false,
+        message: 'Décaissement non trouvé'
+      });
+    }
+
+    const disbursement = disbursementResult.rows[0];
+    console.log('✅ Décaissement trouvé:', disbursement.slip_number);
+
+    // Déplacer/copier le fichier vers le dossier de stockage
+    const receiptsDir = process.env.RECEIPTS_PATH || '/var/www/numericexport/media/receipts';
+    await fs.mkdir(receiptsDir, { recursive: true });
+
+    // Générer un nom de fichier sécurisé
+    const fileExt = path.extname(file.originalname || '.jpg');
+    const safeFileName = `receipt-${disbursementId}-${Date.now()}${fileExt}`;
+    const newPath = path.join(receiptsDir, safeFileName);
+
+    console.log('💾 Sauvegarde fichier vers:', newPath);
+
+    // Si le fichier a été sauvegardé par multer, le déplacer
+    if (file.path && fs.existsSync(file.path)) {
+      await fs.rename(file.path, newPath);
+    } else if (file.buffer) {
+      // Sinon, écrire le buffer
+      await fs.writeFile(newPath, file.buffer);
+    } else {
+      throw new Error('Format de fichier non supporté');
+    }
+
+    // Mettre à jour le décaissement avec le chemin relatif
+    const relativePath = `receipts/${safeFileName}`;
+    await query(
+      'UPDATE disbursement_slips SET receipt_path = $1 WHERE id = $2',
+      [relativePath, disbursementId]
+    );
+
+    console.log('✅ Reçu enregistré:', relativePath);
+
+    // Log d'audit
+    try {
+      await query(
+        `INSERT INTO audit_logs (
+          action, entity_type, entity_id, user_id, details
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          'RECEIPT_UPLOADED',
+          'disbursement',
+          disbursementId,
+          userId,
+          JSON.stringify({
+            file_name: file.originalname,
+            file_path: relativePath,
+            size: file.size,
+            mime_type: file.mimetype
+          })
+        ]
+      );
+    } catch (auditError) {
+      console.error('Erreur log audit (non bloquant):', auditError);
+    }
+
+    const baseMediaUrl = process.env.MEDIA_BASE_URL || 'https://api.numericexport.com/media';
+    const receiptUrl = `${baseMediaUrl}/${relativePath}`;
+
+    return reply.code(200).send({
+      success: true,
+      message: 'Reçu uploadé avec succès',
+      data: {
+        receipt_path: relativePath,
+        receipt_url: receiptUrl,
+        download_url: `/api/v1/invoice-disbursements/media/receipts/${safeFileName}`,
+        file_name: file.originalname
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur upload reçu:', error);
+    return reply.code(500).send({
+      success: false,
+      message: 'Erreur lors de l\'upload du reçu: ' + error.message
+    });
+  }
+}
+
+async function validateSupply(request, reply) {
+  try {
+    const { disbursementId } = request.params;
+    const { with_receipt = true, notes = '' } = request.body;
+    const userId = request.user.id;
+
+    console.log('🔍 Validation approvisionnement:', { disbursementId, with_receipt });
+
+    // Vérifier que le décaissement existe
+    const disbursementResult = await query(
+      `SELECT ds.*, o.id as order_id, o.client_id, o.quantity
+       FROM disbursement_slips ds
+       JOIN orders o ON ds.order_id = o.id
+       WHERE ds.id = $1`,
+      [disbursementId]
+    );
+
+    if (disbursementResult.rowCount === 0) {
+      return reply.code(404).send({
+        success: false,
+        message: 'Décaissement non trouvé'
+      });
+    }
+
+    const disbursement = disbursementResult.rows[0];
+    console.log('✅ Décaissement trouvé - Statut:', disbursement.status);
+
+    // Vérifier si déjà validé
+    if (disbursement.status === 'validated' || disbursement.status === 'approved') {
+      return reply.code(400).send({
+        success: false,
+        message: 'Ce décaissement a déjà été validé'
+      });
+    }
+
+    // Si validation avec reçu requis mais pas de reçu uploadé
+    if (with_receipt && !disbursement.receipt_path) {
+      return reply.code(400).send({
+        success: false,
+        code: 'MISSING_RECEIPT',
+        message: 'Un reçu doit être uploadé avant la validation'
+      });
+    }
+
+    // Statut différent selon si avec ou sans reçu
+    const newStatus = with_receipt ? 'validated' : 'pending_with_receipt';
+
+    // Mettre à jour le statut du décaissement
+    await query(
+      `UPDATE disbursement_slips
+       SET status = $1,
+           validated_at = NOW(),
+           notes = COALESCE($2, notes)
+       WHERE id = $3`,
+      [newStatus, notes, disbursementId]
+    );
+
+    // Mettre à jour le statut de la commande seulement si validation complète
+    if (with_receipt) {
+      await query(
+        'UPDATE orders SET status = $1 WHERE id = $2',
+        ['disbursement_validated', disbursement.order_id]
+      );
+    }
+
+    // Log d'audit
+    try {
+      await query(
+        `INSERT INTO audit_logs (
+          action, entity_type, entity_id, user_id, details
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          'SUPPLY_VALIDATED',
+          'disbursement',
+          disbursementId,
+          userId,
+          JSON.stringify({
+            with_receipt,
+            notes,
+            order_id: disbursement.order_id,
+            new_status: newStatus
+          })
+        ]
+      );
+    } catch (auditError) {
+      console.error('Erreur log audit (non bloquant):', auditError);
+    }
+
+    console.log('✅ Approvisionnement validé - Statut:', newStatus);
+
+    return reply.code(200).send({
+      success: true,
+      message: with_receipt 
+        ? 'Approvisionnement validé avec succès' 
+        : 'Validation enregistrée - Attente reçu',
+      data: {
+        disbursement_id: disbursementId,
+        validated_at: new Date().toISOString(),
+        status: newStatus,
+        with_receipt
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Erreur validation approvisionnement:', error);
+    return reply.code(500).send({
+      success: false,
+      message: 'Erreur lors de la validation: ' + error.message
+    });
+  }
+}
+
+async function completeSupply(request, reply) {
+  try {
+    const { disbursementId } = request.params;
+    const { notes = '' } = request.body;
+    const userId = request.user.id;
+
+    console.log('🔍 Finalisation approvisionnement:', disbursementId);
+
+    // Récupérer infos complètes
+    const res = await query(
+      `SELECT
+         ds.id, ds.order_id, ds.messages_to_purchase, ds.status, ds.receipt_path,
+         o.client_id, o.quantity,
+         c.quota_total, c.quota_remaining
+       FROM disbursement_slips ds
+       JOIN orders o ON ds.order_id = o.id
+       JOIN clients c ON o.client_id = c.id
+       WHERE ds.id = $1`,
+      [disbursementId]
+    );
+
+    if (!res.rowCount) {
+      return reply.code(404).send({
+        success: false,
+        message: 'Décaissement introuvable'
+      });
+    }
+
+    const ds = res.rows[0];
+    console.log('✅ Décaissement trouvé - Client:', ds.client_id);
+
+    if (ds.status === 'approved' || ds.status === 'disbursed') {
+      return reply.code(400).send({
+        success: false,
+        message: 'Déjà validé et crédité'
+      });
+    }
+
+    if (!ds.receipt_path) {
+      return reply.code(400).send({
+        success: false,
+        code: 'MISSING_RECEIPT',
+        message: 'Un reçu est obligatoire avant validation finale'
+      });
+    }
+
+    // Calculer la quantité à créditer
+    const qty = ds.messages_to_purchase || ds.quantity || 0;
+    console.log('💰 Quantité à créditer:', qty);
+
+    // Mise à jour décaissement
+    await query(
+      `UPDATE disbursement_slips
+       SET status = 'approved',
+           validated_at = NOW(),
+           approved_by = $1,
+           notes = COALESCE($2, notes)
+       WHERE id = $3`,
+      [userId, notes, disbursementId]
+    );
+
+    // Mise à jour commande
+    await query(
+      `UPDATE orders
+       SET status = 'purchase_completed',
+           purchase_confirmed_at = NOW(),
+           purchase_confirmed_by = $1
+       WHERE id = $2`,
+      [userId, ds.order_id]
+    );
+
+    // Crédit client
+    if (qty > 0) {
+      await query(
+        `UPDATE clients
+         SET quota_total = COALESCE(quota_total, 0) + $1,
+             quota_remaining = COALESCE(quota_remaining, 0) + $1,
+             updated_at = NOW(),
+             credited_by = $2,
+             credited_at = NOW()
+         WHERE id = $3`,
+        [qty, userId, ds.client_id]
+      );
+      console.log('✅ Client crédité:', ds.client_id);
+    }
+
+    // Log d'audit
+    try {
+      await query(
+        `INSERT INTO audit_logs (
+          action, entity_type, entity_id, user_id, details
+        ) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          'SUPPLY_COMPLETED',
+          'disbursement',
+          disbursementId,
+          userId,
+          JSON.stringify({
+            order_id: ds.order_id,
+            quantity: qty,
+            client_id: ds.client_id,
+            notes: notes
+          })
+        ]
+      );
+    } catch (auditError) {
+      console.error('Erreur log audit (non bloquant):', auditError);
+    }
+
+    console.log('🎉 Approvisionnement finalisé avec succès');
+
+    return reply.send({
+      success: true,
+      message: 'Approvisionnement validé et client crédité',
+      data: {
+        disbursement_id: disbursementId,
+        quantity_credited: qty,
+        status: 'approved',
+        credited_at: new Date().toISOString()
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ completeSupply error:', err);
+    return reply.code(500).send({
+      success: false,
+      message: err.message
+    });
+  }
+}
+
+async function verifyInvoice(request, reply) {
+  try {
+    const { invoiceId } = request.params;
+    const { token } = request.query;
+
+    console.log('🔍 Vérification facture:', { invoiceId, token });
+
+    const result = await query(
+      `SELECT
+        i.*,
+        o.order_code,
+        o.quantity,
+        o.total_amount,
+        c.company_name,
+        c.email as client_email
+       FROM invoices i
+       JOIN orders o ON i.order_id = o.id
+       JOIN clients c ON o.client_id = c.id
+       WHERE i.id = $1 AND i.verification_token = $2 AND i.stamp_applied = true`,
+      [invoiceId, token]
+    );
+
+    if (result.rowCount === 0) {
+      return reply.code(404).send({
+        valid: false,
+        message: 'Facture non trouvée ou non vérifiable'
+      });
+    }
+
+    const invoice = result.rows[0];
+    console.log('✅ Facture vérifiée:', invoice.invoice_number);
+
+    return reply.code(200).send({
+      valid: true,
+      invoice: {
+        invoice_number: invoice.invoice_number,
+        amount: invoice.total_amount,
+        created_at: invoice.created_at,
+        order_code: invoice.order_code,
+        company_name: invoice.company_name,
+        stamp_applied: invoice.stamp_applied,
+        qr_code_url: invoice.qr_code_url
+      },
+      verification_date: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ Erreur vérification facture:', error);
+    return reply.code(500).send({
+      valid: false,
+      message: 'Erreur lors de la vérification'
+    });
+  }
+}
+
+async function downloadReceipt(request, reply) {
+  try {
+    const { disbursementId } = request.params;
+
+    console.log('📥 Téléchargement reçu:', disbursementId);
+
+    const result = await query(
+      'SELECT receipt_path FROM disbursement_slips WHERE id = $1',
+      [disbursementId]
+    );
+
+    if (!result.rowCount || !result.rows[0].receipt_path) {
+      return reply.code(404).send({
+        success: false,
+        message: 'Reçu non trouvé'
+      });
+    }
+
+    let receiptPath = result.rows[0].receipt_path;
+    
+    // Si c'est un chemin relatif, le convertir en absolu
+    if (!path.isAbsolute(receiptPath)) {
+      const receiptsDir = process.env.RECEIPTS_PATH || '/var/www/numericexport/media/receipts';
+      receiptPath = path.join(receiptsDir, path.basename(receiptPath));
+    }
+
+    console.log('🔍 Chemin reçu:', receiptPath);
+
+    // Vérifier si le fichier existe
+    try {
+      await fs.access(receiptPath);
+    } catch {
+      return reply.code(404).send({
+        success: false,
+        message: 'Fichier reçu introuvable sur le serveur'
+      });
+    }
+
+    // Déterminer le type MIME
+    const ext = path.extname(receiptPath).toLowerCase();
+    const mimeTypes = {
+      '.pdf': 'application/pdf',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.heic': 'image/heic'
+    };
+    
+    const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+    // Lire et envoyer le fichier
+    const fileStream = require('fs').createReadStream(receiptPath);
+    
+    reply.header('Content-Type', contentType);
+    reply.header('Content-Disposition', `inline; filename="receipt-${disbursementId}${ext}"`);
+    
+    console.log('✅ Envoi reçu...');
+    return reply.send(fileStream);
+
+  } catch (error) {
+    console.error('❌ Erreur téléchargement reçu:', error);
+    return reply.code(500).send({
+      success: false,
+      message: 'Erreur lors du téléchargement'
+    });
+  }
+}
+
+async function getDisbursementStatistics(request, reply) {
+  try {
+    const { start_date, end_date } = request.query;
+    
+    console.log('📊 Statistiques décaissements:', { start_date, end_date });
+
+    let sql = `
+      SELECT 
+        COUNT(*) as total_disbursements,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'validated' THEN 1 ELSE 0 END) as validated,
+        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
+        SUM(amount) as total_amount,
+        SUM(purchase_cost) as total_purchase_cost,
+        SUM(messages_to_purchase) as total_messages
+      FROM disbursement_slips
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    let paramCount = 1;
+    
+    if (start_date) {
+      sql += ` AND created_at >= $${paramCount++}`;
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      sql += ` AND created_at <= $${paramCount++}`;
+      params.push(end_date);
+    }
+    
+    const result = await query(sql, params);
+    
+    console.log('✅ Statistiques récupérées');
+    
+    return reply.send({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('❌ Erreur statistiques décaissements:', error);
+    return reply.code(500).send({
+      success: false,
+      message: 'Erreur lors du calcul des statistiques'
+    });
+  }
+}
+
+module.exports = {
+  getAllInvoiceDisbursements,
+  getDisbursementDetails,
+  generateDisbursementSlip,
+  uploadReceipt,
+  validateSupply,
+  completeSupply,
+  verifyInvoice,
+  downloadReceipt,
+  getDisbursementStatistics
+};

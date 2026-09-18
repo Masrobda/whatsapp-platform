@@ -1,0 +1,17 @@
+
+FACTURE PROFORMA PRO-202602-ML6RWY8B
+Client: Ma Super Entreprise
+Date: 03/02/2026
+Montant total: 18047825.66 FCFA
+Sous-total: 15134445.00 FCFA
+TVA (19.25%): 2913380.66 FCFA
+
+⚠️ PDF non généré - Erreur: Failed to launch the browser process!
+internal error, please report: running "chromium" failed: transient scope could not be started, job /org/freedesktop/systemd1/job/345 finished with result failed
+
+
+TROUBLESHOOTING: https://pptr.dev/troubleshooting
+
+
+NEXT LTD - Merci pour votre confiance !
+      

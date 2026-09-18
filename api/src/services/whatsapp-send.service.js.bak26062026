@@ -1,0 +1,19 @@
+const watiService = require('./wati.service');
+
+async function sendAlarmTemplate(recipientPhone, videoUrl, alarmLabel, licensePlate, dateTime, channelNumber) {
+  const templateParams = {
+    "1": videoUrl,
+    "2": alarmLabel,
+    "3": licensePlate,
+    "4": dateTime
+  };
+  return await watiService.sendTemplateMessage(
+    recipientPhone,
+    "next_alarm_video_01",   // Template à créer dans WATI
+    templateParams,
+    'fr',
+    channelNumber
+  );
+}
+
+module.exports = { sendAlarmTemplate };

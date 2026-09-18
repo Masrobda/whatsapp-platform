@@ -1,0 +1,192 @@
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const whatsappService = require('../services/whatsapp.service');
+const logger = require('../utils/logger');
+
+/**
+ * Worker pour traiter les messages WhatsApp
+ */
+const messageWorker = new Worker(
+  'whatsapp-messages',
+  async (job) => {
+    const { 
+      messageId, 
+      client_id, 
+      recipient_phone, 
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url 
+    } = job.data;
+
+    logger.info('Traitement message:', {
+      jobId: job.id,
+      messageId,
+      recipient: recipient_phone,
+      type: message_type,
+    });
+
+    try {
+      // Vérifier le quota du client
+      const quotaCheck = await query(
+        'SELECT quota_remaining, is_active FROM clients WHERE id = $1',
+        [client_id]
+      );
+
+      if (quotaCheck.rows.length === 0 || !quotaCheck.rows[0].is_active) {
+        throw new Error('Client inactif ou non trouvé');
+      }
+
+      if (quotaCheck.rows[0].quota_remaining <= 0) {
+        throw new Error('Quota insuffisant');
+      }
+
+      // Envoyer le message selon le type
+      let result;
+
+      switch (message_type) {
+        case 'text':
+          result = await whatsappService.sendTextMessage(recipient_phone, message_content);
+          break;
+
+        case 'template':
+          result = await whatsappService.sendTemplateMessage(
+            recipient_phone,
+            template_name,
+            template_language || 'fr',
+            template_params || []
+          );
+          break;
+
+        case 'media':
+          // Extraire le type de média de l'URL ou utiliser 'image' par défaut
+          const mediaType = job.data.media_type || 'image';
+          result = await whatsappService.sendMediaMessage(
+            recipient_phone,
+            mediaType,
+            media_url,
+            message_content || ''
+          );
+          break;
+
+        default:
+          throw new Error(`Type de message non supporté: ${message_type}`);
+      }
+
+      // Si l'envoi a échoué
+      if (!result.success) {
+        // Mettre à jour le statut en échec
+        await query(
+          `UPDATE messages 
+           SET wa_status = $1, 
+               wa_error_code = $2, 
+               wa_error_message = $3,
+               failed_at = CURRENT_TIMESTAMP
+           WHERE id = $4`,
+          ['failed', result.errorCode, result.error, messageId]
+        );
+
+        throw new Error(result.error);
+      }
+
+      // Succès : mettre à jour avec le message ID de 360dialog
+      await query(
+        `UPDATE messages 
+         SET wa_message_id = $1, 
+             wa_status = $2,
+             sent_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [result.messageId, 'sent', messageId]
+      );
+
+      // Note: Le quota sera décrémenté via le trigger SQL quand wa_status = 'sent'
+
+      logger.info('Message envoyé avec succès:', {
+        messageId,
+        waMessageId: result.messageId,
+      });
+
+      // Progression du job
+      await job.updateProgress(100);
+
+      return {
+        success: true,
+        waMessageId: result.messageId,
+        status: result.status,
+      };
+
+    } catch (error) {
+      logger.error('Erreur traitement message:', {
+        messageId,
+        error: error.message,
+      });
+
+      // Mettre à jour le statut en échec si pas déjà fait
+      await query(
+        `UPDATE messages 
+         SET wa_status = $1, 
+             wa_error_message = $2,
+             failed_at = CURRENT_TIMESTAMP
+         WHERE id = $3 AND wa_status != 'failed'`,
+        ['failed', error.message, messageId]
+      );
+
+      throw error;
+    }
+  },
+  {
+    connection: redisConnection,
+    concurrency: 5, // Traiter 5 messages en parallèle
+    limiter: {
+      max: 50, // Maximum 50 jobs
+      duration: 1000, // par seconde (respecter les limites de Meta)
+    },
+  }
+);
+
+// Événements du worker
+messageWorker.on('completed', (job) => {
+  logger.info('Job complété:', {
+    jobId: job.id,
+    returnvalue: job.returnvalue,
+  });
+});
+
+messageWorker.on('failed', (job, err) => {
+  logger.error('Job échoué:', {
+    jobId: job?.id,
+    error: err.message,
+    attempts: job?.attemptsMade,
+  });
+});
+
+messageWorker.on('error', (err) => {
+  logger.error('Erreur worker:', err);
+});
+
+messageWorker.on('active', (job) => {
+  logger.debug('Job actif:', {
+    jobId: job.id,
+    recipient: job.data.recipient_phone,
+  });
+});
+
+// Arrêt gracieux
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM reçu, arrêt du worker...');
+  await messageWorker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT reçu, arrêt du worker...');
+  await messageWorker.close();
+  process.exit(0);
+});
+
+logger.info('✅ Message Worker démarré');
+
+module.exports = messageWorker;

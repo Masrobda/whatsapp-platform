@@ -1,0 +1,230 @@
+// src/controllers/campaign.controller.js
+const campaignService = require('../services/campaign.service');
+const logger = require('../utils/logger');
+const multipart = require('@fastify/multipart');
+
+/**
+ * GET /api/v1/campaigns/stats
+ */
+async function getGlobalStatsHandler(request, reply) {
+  try {
+    // Correction: Ne pas utiliser clientId = null pour admin
+    let clientId = request.user.id;
+    
+    // Si admin et clientId spécifié dans query
+    if (request.user.role === 'admin' && request.query.clientId) {
+      clientId = request.query.clientId;
+    }
+    
+    const result = await campaignService.getGlobalCampaignStats(clientId);
+    return reply.code(200).send(result);
+  } catch (error) {
+    logger.error('Erreur stats globales campagnes:', error);
+    return reply.code(500).send({ success: false, code: 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * GET /api/v1/campaigns
+ */
+async function listCampaignsHandler(request, reply) {
+  try {
+    const clientId = request.user.role === 'admin' ? request.query.clientId : request.user.id;
+    const filters = {
+      page: request.query.page || 1,
+      limit: request.query.limit || 20,
+      status: request.query.status,
+      search: request.query.search,
+      category: request.query.category,
+      campaign_type: request.query.campaign_type,
+    };
+    const result = await campaignService.getCampaigns(clientId, filters);
+    return reply.code(200).send(result);
+  } catch (error) {
+    logger.error('Erreur liste campagnes:', error);
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * POST /api/v1/campaigns
+ */
+async function createCampaignHandler(request, reply) {
+  try {
+    const clientId = request.user.id;
+    const userId = request.user.id;
+    const result = await campaignService.createCampaign(clientId, userId, request.body);
+    return reply.code(201).send(result);
+  } catch (error) {
+    logger.error('Erreur création campagne:', error);
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * GET /api/v1/campaigns/:id
+ */
+async function getCampaignHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.role === 'admin' ? null : request.user.id;
+    const campaign = await campaignService.getCampaignById(id, clientId);
+    return reply.code(200).send({ success: true, campaign });
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * PUT /api/v1/campaigns/:id
+ */
+async function updateCampaignHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.id;
+    const result = await campaignService.updateCampaign(id, clientId, request.user.id, request.body);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * POST /api/v1/campaigns/:id/launch
+ */
+async function launchCampaignHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.id;
+    const result = await campaignService.launchCampaign(id, clientId, request.user.id);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * POST /api/v1/campaigns/:id/pause
+ */
+async function pauseCampaignHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const result = await campaignService.pauseCampaign(id, request.user.id, request.user.id);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * POST /api/v1/campaigns/:id/cancel
+ */
+async function cancelCampaignHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const result = await campaignService.cancelCampaign(id, request.user.id, request.user.id);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * GET /api/v1/campaigns/:id/stats
+ */
+async function getCampaignStatsHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.role === 'admin' ? null : request.user.id;
+    const result = await campaignService.getCampaignStats(id, clientId);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * GET /api/v1/campaigns/:id/contacts
+ */
+async function getCampaignContactsHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.role === 'admin' ? null : request.user.id;
+    const filters = {
+      page: request.query.page || 1,
+      limit: request.query.limit || 50,
+      status: request.query.status,
+      search: request.query.search,
+    };
+    const result = await campaignService.getCampaignContacts(id, clientId, filters);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * POST /api/v1/campaigns/:id/contacts/import
+ * Import CSV ou Excel
+ */
+async function importContactsHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.id;
+
+    const data = await request.file();
+    if (!data) {
+      return reply.code(400).send({ success: false, code: 'NO_FILE', message: 'Aucun fichier fourni' });
+    }
+
+    const buffer = await data.toBuffer();
+    const filename = data.filename?.toLowerCase() || '';
+
+    let result;
+    if (filename.endsWith('.csv') || data.mimetype === 'text/csv') {
+      result = await campaignService.importContactsFromCSV(id, clientId, buffer);
+    } else if (filename.endsWith('.xlsx') || filename.endsWith('.xls')) {
+      result = await campaignService.importContactsFromExcel(id, clientId, buffer);
+    } else {
+      return reply.code(400).send({ success: false, code: 'INVALID_FORMAT', message: 'Format non supporté. Utilisez CSV ou Excel (.xlsx)' });
+    }
+
+    return reply.code(200).send(result);
+  } catch (error) {
+    logger.error('Erreur import contacts:', error);
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+/**
+ * GET /api/v1/campaigns/:id/logs
+ */
+async function getCampaignLogsHandler(request, reply) {
+  try {
+    const { id } = request.params;
+    const clientId = request.user.role === 'admin' ? null : request.user.id;
+    const filters = {
+      limit: request.query.limit || 100,
+      level: request.query.level,
+    };
+    const result = await campaignService.getCampaignLogs(id, clientId, filters);
+    return reply.code(200).send(result);
+  } catch (error) {
+    return reply.code(error.statusCode || 500).send({ success: false, code: error.code || 'INTERNAL_ERROR', message: error.message });
+  }
+}
+
+module.exports = {
+  getGlobalStatsHandler,
+  listCampaignsHandler,
+  createCampaignHandler,
+  getCampaignHandler,
+  updateCampaignHandler,
+  launchCampaignHandler,
+  pauseCampaignHandler,
+  cancelCampaignHandler,
+  getCampaignStatsHandler,
+  getCampaignContactsHandler,
+  importContactsHandler,
+  getCampaignLogsHandler,
+};

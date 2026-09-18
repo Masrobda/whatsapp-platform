@@ -1,0 +1,245 @@
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const cron = require('node-cron');
+
+/**
+ * Nettoyer les messages de plus de 90 jours
+ */
+async function cleanupOldMessages() {
+  try {
+    logger.info('Début du nettoyage des anciens messages...');
+
+    // Supprimer les messages dont delete_after est dépassé
+    const result = await query(
+      `DELETE FROM messages 
+       WHERE delete_after < CURRENT_TIMESTAMP
+       RETURNING id`,
+      []
+    );
+
+    const deletedCount = result.rowCount;
+
+    if (deletedCount > 0) {
+      logger.info(`${deletedCount} messages supprimés (> 90 jours)`);
+
+      // Log d'audit
+      await query(
+        `INSERT INTO audit_logs (action, entity_type, new_values)
+         VALUES ($1, $2, $3)`,
+        [
+          'MESSAGES_CLEANUP',
+          'message',
+          JSON.stringify({ deleted_count: deletedCount })
+        ]
+      );
+    } else {
+      logger.info('Aucun message à supprimer');
+    }
+
+    return { success: true, deletedCount };
+
+  } catch (error) {
+    logger.error('Erreur nettoyage messages:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Nettoyer les sessions expirées de réinitialisation de mot de passe
+ */
+async function cleanupExpiredPasswordResets() {
+  try {
+    const result = await query(
+      `DELETE FROM password_resets 
+       WHERE expires_at < CURRENT_TIMESTAMP OR used = true`,
+      []
+    );
+
+    if (result.rowCount > 0) {
+      logger.info(`${result.rowCount} tokens de réinitialisation supprimés`);
+    }
+
+    return { success: true, deletedCount: result.rowCount };
+
+  } catch (error) {
+    logger.error('Erreur nettoyage password resets:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Nettoyer les liens d'invitation expirés
+ */
+async function cleanupExpiredInvitations() {
+  try {
+    const result = await query(
+      `DELETE FROM invitation_links 
+       WHERE expires_at < CURRENT_TIMESTAMP`,
+      []
+    );
+
+    if (result.rowCount > 0) {
+      logger.info(`${result.rowCount} invitations expirées supprimées`);
+    }
+
+    return { success: true, deletedCount: result.rowCount };
+
+  } catch (error) {
+    logger.error('Erreur nettoyage invitations:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Nettoyer les anciens logs d'audit (> 1 an)
+ */
+async function cleanupOldAuditLogs() {
+  try {
+    const result = await query(
+      `DELETE FROM audit_logs 
+       WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '1 year'`,
+      []
+    );
+
+    if (result.rowCount > 0) {
+      logger.info(`${result.rowCount} logs d'audit supprimés (> 1 an)`);
+    }
+
+    return { success: true, deletedCount: result.rowCount };
+
+  } catch (error) {
+    logger.error('Erreur nettoyage audit logs:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Réinitialiser les quotas d'essai expirés
+ */
+async function resetExpiredTrials() {
+  try {
+    const result = await query(
+      `UPDATE clients 
+       SET quota_remaining = 0
+       WHERE trial_expires_at < CURRENT_TIMESTAMP 
+       AND quota_remaining > 0
+       AND quota_total = ${process.env.TRIAL_MESSAGES || 25}
+       RETURNING id, email`,
+      []
+    );
+
+    if (result.rowCount > 0) {
+      logger.info(`${result.rowCount} essais expirés réinitialisés`);
+      
+      // Logger les emails pour info
+      result.rows.forEach(client => {
+        logger.info(`Essai expiré pour: ${client.email}`);
+      });
+    }
+
+    return { success: true, resetCount: result.rowCount };
+
+  } catch (error) {
+    logger.error('Erreur réinitialisation essais:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Nettoyer l'index message_id (fonction stockée)
+ */
+async function cleanupMessageIdIndex() {
+  try {
+    logger.info('Nettoyage de l\'index message_id...');
+    await query('SELECT cleanup_message_id_index();');
+    logger.info('✅ Index message_id nettoyé avec succès');
+    return { success: true };
+  } catch (error) {
+    logger.error('Erreur lors du nettoyage de l\'index message_id:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Tâche de nettoyage complète
+ */
+async function runCleanupTasks() {
+  logger.info('='.repeat(50));
+  logger.info('Exécution des tâches de nettoyage planifiées');
+  logger.info('='.repeat(50));
+
+  const results = await Promise.allSettled([
+    cleanupOldMessages(),
+    cleanupExpiredPasswordResets(),
+    cleanupExpiredInvitations(),
+    cleanupOldAuditLogs(),
+    resetExpiredTrials(),
+    cleanupMessageIdIndex(),
+  ]);
+
+  results.forEach((result, index) => {
+    const taskNames = [
+      'Messages anciens',
+      'Tokens réinitialisation',
+      'Invitations expirées',
+      'Logs d\'audit',
+      'Essais expirés',
+      'Index message_id'
+    ];
+
+    if (result.status === 'fulfilled') {
+      logger.info(`✅ ${taskNames[index]}: ${JSON.stringify(result.value)}`);
+    } else {
+      logger.error(`❌ ${taskNames[index]}: ${result.reason}`);
+    }
+  });
+
+  logger.info('='.repeat(50));
+  logger.info('Tâches de nettoyage terminées');
+  logger.info('='.repeat(50));
+}
+
+/**
+ * Planifier les tâches de nettoyage
+ * Cron: Tous les jours à 2h du matin
+ */
+function scheduleCleanupTasks() {
+  // Tous les jours à 2h du matin
+  cron.schedule('0 2 * * *', async () => {
+    await runCleanupTasks();
+  });
+
+  logger.info('✅ Tâches de nettoyage planifiées (tous les jours à 2h00)');
+
+  // Exécuter une fois au démarrage (après 1 minute)
+  setTimeout(() => {
+    logger.info('Exécution initiale du nettoyage...');
+    runCleanupTasks();
+  }, 60000);
+}
+
+// Démarrer la planification si ce fichier est exécuté directement
+if (require.main === module) {
+  scheduleCleanupTasks();
+  
+  // Garder le processus actif
+  process.on('SIGTERM', () => {
+    logger.info('SIGTERM reçu, arrêt du worker de nettoyage...');
+    process.exit(0);
+  });
+
+  process.on('SIGINT', () => {
+    logger.info('SIGINT reçu, arrêt du worker de nettoyage...');
+    process.exit(0);
+  });
+}
+
+module.exports = {
+  cleanupOldMessages,
+  cleanupExpiredPasswordResets,
+  cleanupExpiredInvitations,
+  cleanupOldAuditLogs,
+  resetExpiredTrials,
+  runCleanupTasks,
+  scheduleCleanupTasks,
+};

@@ -1,0 +1,238 @@
+// lib/campaigns/api.js
+// Hook et utilitaires partagés pour le module campagnes
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+
+// ============================================================
+// CLIENT HTTP CENTRAL
+// ============================================================
+export async function campaignFetch(path, options = {}) {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  
+  let body = options.body;
+  if (options.method === 'POST' && !options.body && !(options.body instanceof FormData)) {
+    body = JSON.stringify({});
+  }
+  
+  const headers = {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...options.headers,
+  };
+  
+  if (!(body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+  }
+  
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    body,
+    headers,
+  });
+  
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const error = new Error(err.message || `HTTP ${res.status}`);
+    error.statusCode = res.status;
+    error.code = err.code;
+    throw error;
+  }
+  return res.json();
+}
+
+// ============================================================
+// API CAMPAGNES
+// ============================================================
+export const CampaignAPI = {
+  list: (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== '' && v !== null) params.append(k, v);
+    });
+    const qs = params.toString();
+    return campaignFetch(`/campaigns${qs ? `?${qs}` : ''}`);
+  },
+
+  get: (id) => campaignFetch(`/campaigns/${id}`),
+
+  create: (data) => campaignFetch('/campaigns', { method: 'POST', body: JSON.stringify(data) }),
+
+  update: (id, data) => campaignFetch(`/campaigns/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+
+  launch: (id) => campaignFetch(`/campaigns/${id}/launch`, { method: 'POST', body: JSON.stringify({}) }),
+  
+  pause: (id) => campaignFetch(`/campaigns/${id}/pause`, { method: 'POST', body: JSON.stringify({}) }),
+  
+  cancel: (id) => campaignFetch(`/campaigns/${id}/cancel`, { method: 'POST', body: JSON.stringify({}) }),
+
+  // CORRECTION : Route unique /campaigns/stats (pas /campaigns/stats/stats)
+  globalStats: () => campaignFetch('/campaigns/stats'),
+  
+  stats: (id) => campaignFetch(`/campaigns/${id}/stats`),
+
+  contacts: (id, filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== '') params.append(k, v);
+    });
+    const qs = params.toString();
+    return campaignFetch(`/campaigns/${id}/contacts${qs ? `?${qs}` : ''}`);
+  },
+
+  importContacts: async (id, file) => {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/campaigns/${id}/contacts/import`, {
+      method: 'POST',
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || 'Erreur import');
+    }
+    return res.json();
+  },
+
+  logs: (id, filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== '') params.append(k, v);
+    });
+    const qs = params.toString();
+    return campaignFetch(`/campaigns/${id}/logs${qs ? `?${qs}` : ''}`);
+  },
+};
+
+// ============================================================
+// CONSTANTES PARTAGÉES
+// ============================================================
+export const CAMPAIGN_STATUS = {
+  draft: { label: 'Brouillon', color: '#6b7c74', bg: '#f0f7f3', dot: '#9eada5' },
+  scheduled: { label: 'Planifiée', color: '#1976d2', bg: '#e3f2fd', dot: '#42a5f5' },
+  running: { label: 'En cours', color: '#2d7a3e', bg: '#e8f5e9', dot: '#4caf50' },
+  paused: { label: 'En pause', color: '#f57c00', bg: '#fff3e0', dot: '#ff9800' },
+  completed: { label: 'Terminée', color: '#1e5a2f', bg: '#e8f5e9', dot: '#8bc34a' },
+  cancelled: { label: 'Annulée', color: '#c62828', bg: '#ffebee', dot: '#ef5350' },
+  failed: { label: 'Échouée', color: '#b71c1c', bg: '#ffebee', dot: '#f44336' },
+};
+
+export const CONTACT_STATUS = {
+  pending: { label: 'En attente', color: '#6b7c74', bg: '#f0f7f3' },
+  queued: { label: 'En file', color: '#1976d2', bg: '#e3f2fd' },
+  sent: { label: 'Envoyé', color: '#0288d1', bg: '#e1f5fe' },
+  delivered: { label: 'Livré', color: '#2d7a3e', bg: '#e8f5e9' },
+  read: { label: 'Lu', color: '#1e5a2f', bg: '#c8e6c9' },
+  failed: { label: 'Échoué', color: '#c62828', bg: '#ffebee' },
+  skipped: { label: 'Ignoré', color: '#9eada5', bg: '#f8faf9' },
+  optedout: { label: 'Désabonné', color: '#c62828', bg: '#ffebee' },
+};
+
+export const SEND_MODES = {
+  instant: { label: 'Instantané', icon: '⚡', desc: 'Envoi immédiat' },
+  batch: { label: 'Par lots', icon: '📦', desc: 'Groupes espacés' },
+  scheduled: { label: 'Planifié', icon: '📅', desc: 'Date/heure précise' },
+  smart: { label: 'Intelligent', icon: '🧠', desc: 'Optimisé par IA' },
+};
+
+export const CAMPAIGN_TYPES = {
+  broadcast: { label: 'Broadcast', icon: '📡', desc: 'Envoi de masse' },
+  drip: { label: 'Drip', icon: '💧', desc: 'Séquence temporelle' },
+  trigger: { label: 'Déclenchée', icon: '⚡', desc: 'Basée sur événements' },
+  ab_test: { label: 'A/B Test', icon: '🧪', desc: 'Test de variantes' },
+};
+
+export const CATEGORIES = ['Facturation', 'Marketing', 'Recouvrement', 'Onboarding', 'Alertes', 'Promotions', 'Notifications', 'Rapport', 'Support'];
+
+// ============================================================
+// UTILITAIRES
+// ============================================================
+export function normalizePhoneNumber(phone) {
+  if (!phone) return null;
+  const cleaned = String(phone).replace(/[\s\-\(\)\.]/g, '').replace(/\D/g, '');
+  if (!cleaned) return null;
+  if (cleaned.startsWith('237') && cleaned.length >= 12) return `+${cleaned}`;
+  if (cleaned.length === 9) return `+237${cleaned}`;
+  if (cleaned.length === 8) return `+2376${cleaned}`;
+  if (cleaned.length >= 10) return `+${cleaned}`;
+  return null;
+}
+
+export function formatDate(dateStr, options = {}) {
+  if (!dateStr) return '—';
+  return new Date(dateStr).toLocaleDateString('fr-FR', {
+    day: '2-digit', month: 'short', year: 'numeric', ...options
+  });
+}
+
+export function formatDateTime(dateStr) {
+  if (!dateStr) return '—';
+  return new Date(dateStr).toLocaleString('fr-FR', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+}
+
+export function formatNumber(n) {
+  if (n === undefined || n === null) return '0';
+  // Convertir en nombre si c'est une string
+  const num = typeof n === 'string' ? parseFloat(n) : n;
+  if (isNaN(num)) return '0';
+  return num.toLocaleString('fr-FR');
+}
+
+export function formatCost(usd, currency = 'USD') {
+  // CORRECTION : S'assurer que usd est un nombre
+  let val = 0;
+  if (usd === undefined || usd === null) {
+    val = 0;
+  } else if (typeof usd === 'string') {
+    val = parseFloat(usd);
+  } else if (typeof usd === 'number') {
+    val = usd;
+  } else {
+    val = 0;
+  }
+  
+  if (isNaN(val)) val = 0;
+  
+  if (currency === 'FCFA') {
+    const fcfa = Math.round(val * 620);
+    return `${fcfa.toLocaleString('fr-FR')} FCFA`;
+  }
+  return `${val.toFixed(2)} USD`;
+}
+
+export function estimateSendTime(contactCount, ratePerMinute) {
+  if (!contactCount || !ratePerMinute) return '—';
+  const mins = Math.ceil(contactCount / ratePerMinute);
+  if (mins < 60) return `~${mins} min`;
+  const h = (mins / 60).toFixed(1);
+  return `~${h} h`;
+}
+
+export function parseCSVContacts(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+
+  const phoneCol = headers.findIndex(h => ['phone_number','phone','telephone','téléphone','numero'].includes(h));
+  const nameCol = headers.findIndex(h => ['name','nom','prenom','prénom'].includes(h));
+  const emailCol = headers.findIndex(h => ['email'].includes(h));
+
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
+    const phone = phoneCol >= 0 ? vals[phoneCol] : vals[0];
+    const name = nameCol >= 0 ? vals[nameCol] : '';
+    const email = emailCol >= 0 ? vals[emailCol] : '';
+
+    const variables = {};
+    headers.forEach((h, i) => {
+      if (i !== phoneCol && i !== nameCol && i !== emailCol && vals[i]) {
+        variables[h] = vals[i];
+      }
+    });
+
+    return { phone_number: phone || '', name: name || '', email: email || '', variables };
+  }).filter(c => c.phone_number);
+}

@@ -1,0 +1,103 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+class WatiService {
+  constructor() {
+    // Nettoyage de l'URL pour éviter les doubles slashs
+    this.baseURL = (process.env.WATI_API_URL || 'https://live-mt-server.wati.io/10141984').replace(/\/$/, '');
+    this.apiKey = process.env.WATI_API_KEY;
+    this.testMode = process.env.WATI_TEST_MODE === 'true';
+
+    logger.info('WATI Service Multi-Tenant configuré', { testMode: this.testMode });
+  }
+
+  /**
+   * Envoie un template dynamique
+   * @param {string} recipientPhone - Destinataire
+   * @param {string} templateName - Nom du template
+   * @param {Object} templateParams - Paramètres JSON { name: "Patrick" }
+   * @param {Object} media - { url, filename }
+   * @param {string} senderNumber - Numéro émetteur (channel_number)
+   */
+   async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, media = null, senderNumber = null) {
+    if (this.testMode) return { success: true, status: 'sent', messageId: `test_${Date.now()}` };
+
+    try {
+      // 1. Nettoyage des numéros pour WATI (ils veulent souvent le format SANS le + dans les params)
+      const cleanRecipient = recipientPhone.replace('+', '').trim();
+      const cleanSender = senderNumber ? senderNumber.replace('+', '').trim() : "237687220272";
+
+      const url = `${this.baseURL}/api/v2/sendTemplateMessage`;
+
+      // 2. Formatage des paramètres
+      const parameters = Object.entries(templateParams).map(([key, value]) => ({
+        name: key,
+        value: String(value)
+      }));
+
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `broadcast_${templateName}`,
+        parameters: parameters,
+        channel_number: cleanSender // Doit être sans le +
+      };
+
+      if (media && media.url) {
+        payload.media = { url: media.url, filename: media.filename || "file.pdf" };
+      }
+
+      // 3. Appel avec les headers exacts de la doc
+      const response = await axios({
+        method: 'POST',
+        url: url,
+        data: payload,
+        params: { whatsappNumber: cleanRecipient }, // Numéro sans + pour le param
+        headers: {
+          'accept': 'application/json',
+          'content-type': 'application/json-patch+json',
+          'Authorization': `Bearer ${this.apiKey.trim()}`
+        },
+        timeout: 30000
+      });
+
+      // Si WATI répond avec success ou result: true
+      if (response.data.result === false || response.data.result === 'error') {
+        return { success: false, error: response.data.info || 'WATI Rejected' };
+      }
+
+      return { 
+        success: true, 
+        messageId: response.data.local_message_id || response.data.messageId, 
+        status: 'sent' 
+      };
+
+    } catch (error) {
+      // LOG IMPORTANT pour voir ce que WATI dit vraiment
+      const errorMsg = error.response?.data?.info || error.response?.data?.message || error.message;
+      logger.error('DÉTAIL ERREUR WATI:', error.response?.data || error.message);
+      return { success: false, error: errorMsg };
+    }
+  }
+
+  async sendTextMessage(recipientPhone, text, senderNumber = null) {
+    try {
+      const cleanRecipient = recipientPhone.replace('+', '').trim();
+      const cleanSender = senderNumber ? senderNumber.replace('+', '').trim() : null;
+      
+      const payload = { message: text };
+      if (cleanSender) payload.channel_number = cleanSender;
+
+      const response = await axios.post(`${this.baseURL}/api/v1/sendMessage`, payload, {
+        headers: { 'Authorization': `Bearer ${this.apiKey}` },
+        params: { whatsappNumber: cleanRecipient }
+      });
+      return { success: response.data.result, messageId: response.data.messageId, status: 'sent' };
+    } catch (error) {
+      logger.error('Erreur WATI Texte:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+}
+
+module.exports = new WatiService();

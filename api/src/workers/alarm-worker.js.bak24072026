@@ -1,0 +1,259 @@
+// api/src/workers/alarm-worker.js
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const watiService = require('../services/wati.service');
+const alarmVideoService = require('../services/alarm-video.service');
+const { uploadAndConvertVideoFromStream, uploadAndConvertImageFromStream } = require('../services/storage-upload.service');
+const { markVideoAsSent } = require('../services/alarm-notification.service');
+const { addAlarmToQueue } = require('../services/alarm-queue.service');
+const { normalizePhoneNumber } = require('../utils/phone-validator');
+const { v4: uuidv4 } = require('uuid');
+
+const alarmLabels = {
+  emergencyAlarm: "Alerte d'urgence détectée",
+  speedingAlarm: "Excès de vitesse détectée",
+  fatigueDrivingAlarm: "Conduite fatiguée détectée",
+  fatigueDriving: "Conduite fatiguée détectée",
+  makeCalls: "Appel au volant détectée",
+};
+function getAlarmLabel(type) { return alarmLabels[type] || `⚠️ Alarme ${type}`; }
+
+async function processAlarmJob(job) {
+  const data = job.data;
+  console.log(`[AlarmWorker] 🟢 Job reçu: ${job.id}, licenseNum: ${data.licenseNum}, alarmNo: ${data.alarmNo || 'n/a'}, messageId: ${data.messageId || 'non fourni'}`);
+
+  const {
+    licenseNum,
+    alarmType,
+    alarmNo,
+    startTime,
+    location,
+    latitude,
+    longitude,
+    speed,
+    alarmSpeed,
+    driverName,
+    motorcadeName,
+    recipientPhone,
+    clientId,
+    messageId,
+    retryCount = 0,
+    maxRetries = 5,
+    channelNumber
+  } = data;
+
+  try {
+    const finalMessageId = messageId || uuidv4();
+    console.log(`[AlarmWorker] 📌 finalMessageId: ${finalMessageId}`);
+
+    // 1. Vérifier doublon via messageId (dans messages)
+    const existing = await query('SELECT id FROM messages WHERE id = $1', [finalMessageId]);
+    if (existing.rowCount > 0) {
+      logger.info(`[AlarmWorker] Message ${finalMessageId} déjà traité, ignoré`);
+      return { success: true, skipped: true };
+    }
+
+    // 2. Téléphone
+    let recipient = normalizePhoneNumber(recipientPhone);
+    if (!recipient) {
+      logger.error(`[AlarmWorker] Pas de téléphone pour ${licenseNum}`);
+      return { success: false, error: 'No phone' };
+    }
+
+    // 3. Récupération du média (si pas déjà fourni dans le job)
+    let mediaUrl = null;
+    let fileId = null;
+    let filePath = null;
+    let mediaType = 'video';
+
+    // Si le job contient déjà les infos média (templateParams) on les utilise.
+    // C'est le cas normal désormais : hetu-websocket.service.js fournit le média
+    // via vehicleAlarmFile avant même de mettre le job en queue.
+    if (data.templateParams && data.templateParams["1"]) {
+      mediaUrl = data.templateParams["1"];
+      fileId = data.fileId;
+      filePath = data.filePath;
+      mediaType = mediaUrl.match(/\.(jpg|jpeg|png|gif)$/i) ? 'image' : 'video';
+      console.log(`[AlarmWorker] ✅ Média déjà fourni: ${mediaUrl}`);
+    } else if (startTime) {
+      // Filet de sécurité résiduel : ce chemin ne devrait normalement plus être pris
+      // que pour les jobs différés issus du fallback REST (alarmNo absent, ou
+      // vehicleAlarmFile non reçu dans le délai imparti côté hetu-websocket.service.js).
+      // Fenêtre élargie à 2 minutes (au lieu de 60s) pour laisser une marge à
+      // l'indexation de l'API historyreplay/media/file.
+      const start = new Date(startTime);
+      const end = new Date(start.getTime() + 120000);
+      const startStr = start.toISOString().replace('T', ' ').slice(0, 19);
+      const endStr = end.toISOString().replace('T', ' ').slice(0, 19);
+      console.log(`[AlarmWorker] 🔎 Recherche média (fallback) pour ${licenseNum} entre ${startStr} et ${endStr}, alarmNo=${alarmNo || 'n/a'}`);
+
+      try {
+        const result = await alarmVideoService.fetchAllVideos(licenseNum, startStr, endStr, alarmType);
+        const videos = result.data?.list || [];
+        // uploadStatus s'est révélé non fiable (voir hetu-websocket.service.js) :
+        // un fichier avec un filePath valide est exploitable même si uploadStatus
+        // n'est pas à 1. On essaie d'abord uploadStatus=1 par préférence, puis on
+        // se rabat sur n'importe quel filePath disponible.
+        const video = videos.find(v => v.uploadStatus === 1) || videos.find(v => !!v.filePath);
+        if (video) {
+          fileId = video.fileId;
+          filePath = video.filePath;
+          const { stream, originalName } = await alarmVideoService.downloadVideoByPath(filePath, licenseNum, alarmType);
+          const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(filePath);
+          const uploadResult = isImage
+            ? await uploadAndConvertImageFromStream(stream, originalName, clientId || process.env.SYSTEM_CLIENT_ID, licenseNum)
+            : await uploadAndConvertVideoFromStream(stream, originalName, clientId || process.env.SYSTEM_CLIENT_ID, licenseNum);
+          if (uploadResult.success) {
+            mediaUrl = uploadResult.publicUrl;
+            if (mediaUrl.match(/\.(jpg|jpeg|png|gif)$/i)) mediaType = 'image';
+            else if (mediaUrl.match(/\.mp4$/i)) mediaType = 'video';
+            console.log(`[AlarmWorker] ✅ Média uploadé: ${mediaUrl} (${mediaType})`);
+          }
+        }
+      } catch (err) {
+        console.log(`[AlarmWorker] ❌ Erreur récupération média: ${err.message}`);
+      }
+    }
+
+    // Si pas de média et qu'on a encore des tentatives
+    if (!mediaUrl && retryCount < maxRetries) {
+      console.log(`[AlarmWorker] 🔄 Retry ${retryCount+1}/${maxRetries} pour ${licenseNum} (alarmNo=${alarmNo || 'n/a'})`);
+      const nextData = { ...data, retryCount: retryCount + 1 };
+      await addAlarmToQueue(nextData, 120000);
+      return { success: true, retry: true };
+    } else if (!mediaUrl) {
+      console.log(`[AlarmWorker] ❌ Échec définitif: aucune vidéo pour ${licenseNum} après ${maxRetries} tentatives (alarmNo=${alarmNo || 'n/a'})`);
+      return { success: false, error: 'No media after retries' };
+    }
+
+    // 4. Construction du template
+    const alarmLabel = getAlarmLabel(alarmType);
+    const vehicleInfo = `${licenseNum}${motorcadeName ? ` (${motorcadeName})` : ''}`;
+    const driver = driverName || 'Non spécifié';
+    const driverPhone = recipient;
+    const position = location || `${latitude || ''},${longitude || ''}`;
+    const gps = latitude && longitude ? `${latitude},${longitude}` : 'N/A';
+    const speedValue = speed || alarmSpeed || 0;
+    const time = startTime ? startTime.replace('T', ' ').slice(0, 19) : new Date().toISOString().slice(0, 19);
+
+    const templateParams = {
+      "1": mediaUrl,
+      "2": alarmLabel,
+      "3": vehicleInfo,
+      "4": driver,
+      "5": driverPhone,
+      "6": position,
+      "7": gps,
+      "8": speedValue + ' km/h',
+      "9": time
+    };
+    const templateName = mediaType === 'image' ? 'next_alarm_image_02' : 'next_alarm_video_02';
+
+    // 5. Insérer en base
+    const effectiveClientId = clientId || process.env.SYSTEM_CLIENT_ID;
+    const clientTable = `messages_client_${effectiveClientId.replace(/-/g, '_')}`;
+    await query(
+      `INSERT INTO messages (id, client_id, recipient_phone, message_type, template_name,
+        template_language, template_params, wa_status, queued_at, channel)
+       VALUES ($1, $2, $3, 'template', $4, 'fr', $5, 'queued', NOW(), 'whatsapp')`,
+      [finalMessageId, effectiveClientId, recipient, templateName, templateParams]
+    );
+    await query(
+      `INSERT INTO ${clientTable} (id, recipient_phone, message_type, template_name,
+        template_language, template_params, wa_status, queued_at)
+       VALUES ($1, $2, 'template', $3, 'fr', $4, 'queued', NOW())`,
+      [finalMessageId, recipient, templateName, templateParams]
+    ).catch(err => logger.warn(`[AlarmWorker] Erreur insertion table client: ${err.message}`));
+
+    // 6. Envoyer via WATI
+    const sendResult = await watiService.sendTemplateMessage(
+      recipient,
+      templateName,
+      templateParams,
+      'fr',
+      channelNumber || process.env.DEFAULT_WHATSAPP_NUMBER
+    );
+    if (!sendResult.success) {
+      await query(
+        `UPDATE messages SET wa_status = 'failed', wa_error_message = $1, failed_at = NOW() WHERE id = $2`,
+        [sendResult.error || 'Échec WATI', finalMessageId]
+      );
+      throw new Error(sendResult.error || 'Échec WATI');
+    }
+
+    // 7. Mettre à jour succès
+    await query(
+      `UPDATE messages SET wa_status = 'sent', wati_local_id = $1, sent_at = NOW() WHERE id = $2`,
+      [sendResult.localMessageId, finalMessageId]
+    );
+    await query(
+      `UPDATE ${clientTable} SET wa_status = 'sent', wati_local_id = $1, sent_at = NOW() WHERE id = $2`,
+      [sendResult.localMessageId, finalMessageId]
+    ).catch(err => logger.warn(`[AlarmWorker] Erreur update table client: ${err.message}`));
+
+    // 8. Marquer comme envoyé dans alarm_notifications
+    if (fileId && filePath) {
+      await markVideoAsSent(fileId, filePath, licenseNum, alarmType, recipient, finalMessageId);
+    }
+
+    console.log(`[AlarmWorker] ✅ Alarme envoyée avec succès ! fileId=${fileId}, recipient=${recipient}, messageId=${finalMessageId}`);
+    return { success: true, fileId, recipient, messageId: finalMessageId };
+
+  } catch (error) {
+    console.error(`[AlarmWorker] ❌ Erreur dans le job ${job.id}: ${error.message}`);
+    if (retryCount < maxRetries) {
+      const nextData = { ...data, retryCount: retryCount + 1 };
+      await addAlarmToQueue(nextData, 120000);
+      return { success: true, retry: true };
+    }
+    throw error;
+  }
+}
+
+// Configuration du worker
+const worker = new Worker(
+  'alarm-processing',
+  processAlarmJob,
+  {
+    connection: redisConnection,
+    concurrency: 5,
+    lockDuration: 60000,
+    stalledInterval: 30000,
+    maxStalledCount: 2,
+    limiter: { max: 10, duration: 1000 },
+    removeOnComplete: { age: 86400, count: 1000 },
+    removeOnFail: { age: 604800, count: 5000 }
+  }
+);
+
+worker.on('completed', (job, result) => {
+  if (result?.retry) {
+    logger.info(`🔄 Job ${job.id} en retry`);
+  } else {
+    logger.info(`✅ Job ${job.id} terminé: ${result?.fileId || 'ok'}`);
+  }
+});
+
+worker.on('failed', (job, err) => {
+  logger.error(`❌ Job ${job.id} échoué: ${err.message}`);
+});
+
+worker.on('error', (err) => {
+  logger.error(`🔥 Worker error: ${err.message}`);
+});
+
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+module.exports = { worker };

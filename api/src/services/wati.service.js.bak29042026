@@ -1,0 +1,200 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const FormData = require('form-data');
+
+class WatiService {
+  constructor() {
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+if (!this.apiKey) {
+  throw new Error('WATI_API_KEY manquant dans les variables d\'environnement');
+}
+  }
+
+  async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, language = 'fr') {
+    try {
+      // Correction: S'assurer que le numéro est au bon format
+      let cleanPhone = recipientPhone.replace(/\s/g, '');
+      if (!cleanPhone.startsWith('+')) {
+        cleanPhone = `+${cleanPhone}`;
+      }
+      
+      // WATI demande broadcast_name OBLIGATOIRE
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `broadcast_${Date.now()}`,
+        language: language,
+        parameters: this.formatTemplateParameters(templateParams)
+      };
+
+      console.log("Payload envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: {
+          whatsappNumber: cleanPhone
+        },
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("Réponse WATI:", response.data);
+
+      return { 
+        success: true, 
+        messageId: response.data.result?.messageId || response.data.messageId 
+      };
+
+    } catch (error) {
+      let errorInfo = error.message;
+      if (error.response) {
+        errorInfo = `Status: ${error.response.status} - Data: ${JSON.stringify(error.response.data)}`;
+        console.error('Détails erreur WATI:', error.response.data);
+      }
+      console.error('Erreur sendTemplateMessage:', errorInfo);
+      return { success: false, error: errorInfo };
+    }
+  }
+
+  async sendInvoiceWithPDF(recipientPhone, templateName, templateParams, invoiceData) {
+  console.log("--- ENVOI TEMPLATE + PDF ---");
+  
+  try {
+    // Correction du format du numéro
+    let cleanPhone = recipientPhone.replace(/\s/g, '');
+    if (!cleanPhone.startsWith('+')) {
+      cleanPhone = `+${cleanPhone}`;
+    }
+    
+    const pdfUrl = invoiceData.pdfUrl;
+    const invoiceNumber = invoiceData.number || '001';
+    
+    console.log("PDF URL:", pdfUrl);
+    
+    // Vérifier si le PDF est accessible
+    try {
+      const pdfCheck = await axios.head(pdfUrl, { timeout: 10000 });
+      console.log("PDF accessible - Status:", pdfCheck.status);
+      console.log("PDF Content-Type:", pdfCheck.headers['content-type']);
+    } catch (pdfError) {
+      console.error("PDF inaccessible:", pdfError.message);
+      return { 
+        success: false, 
+        error: `PDF inaccessible: ${pdfError.message}. Vérifiez que l'URL est publique.` 
+      };
+    }
+    
+    // WATI utilise "media_url" et non pas un objet "media"
+    const payload = {
+      template_name: templateName,
+      broadcast_name: `invoice_${invoiceNumber}_${Date.now()}`,
+      language: "fr",
+      parameters: this.formatTemplateParameters(templateParams),
+      media_url: pdfUrl,  // ❗ Correction: media_url directement, pas un objet media
+      filename: `Facture-${invoiceNumber}.pdf`
+    };
+
+    console.log("Payload envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+    const response = await axios({
+      method: 'post',
+      url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+      params: {
+        whatsappNumber: cleanPhone
+      },
+      data: payload,
+      headers: {
+        'Authorization': `Bearer ${this.apiKey.trim()}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 60000  // Timeout plus long pour le téléchargement du PDF
+    });
+
+    console.log("RÉPONSE WATI SUCCÈS:", response.data);
+    
+    return { 
+      success: true, 
+      messageId: response.data.result?.messageId || response.data.local_message_id 
+    };
+
+  } catch (error) {
+    let errorInfo = error.message;
+    
+    if (error.response) {
+      errorInfo = `Status: ${error.response.status} - Data: ${JSON.stringify(error.response.data)}`;
+      console.error("Détails erreur WATI:", error.response.data);
+      
+      // Si l'erreur est à cause du PDF, essayer sans le PDF
+      if (error.response.data?.info?.includes("media") || error.response.status === 400) {
+        console.log("Tentative d'envoi sans PDF...");
+        return await this.sendTemplateMessage(recipientPhone, templateName, templateParams);
+      }
+    }
+    
+    console.error("ERREUR WATI (Template+PDF):", errorInfo);
+    return { success: false, error: errorInfo };
+  }
+}
+
+  // Méthode utilitaire pour formater les paramètres du template
+  formatTemplateParameters(params) {
+    if (!params) return [];
+    
+    const formatted = [];
+    for (const [key, value] of Object.entries(params)) {
+      formatted.push({
+        name: key,
+        value: String(value || '')
+      });
+    }
+    return formatted;
+  }
+
+  // Méthode de test corrigée
+  async testAPI() {
+    console.log("=== TEST WATI API ===");
+    console.log("Base URL:", this.baseURL);
+    console.log("API Key présente:", !!this.apiKey);
+    
+    try {
+      // Tester avec un numéro valide
+      const testPhone = "+237656939193";
+      
+      // Au lieu de GET sur /messages qui n'existe pas, testons un envoi simple
+      const testPayload = {
+        template_name: "test_template",
+        broadcast_name: "test_broadcast",
+        language: "fr",
+        parameters: []
+      };
+      
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        params: {
+          whatsappNumber: testPhone
+        },
+        data: testPayload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      });
+      
+      console.log("Test réussi:", response.status);
+      return { success: true };
+      
+    } catch (error) {
+      console.error("Test échoué:", error.response?.status, error.response?.data);
+      return { success: false, error: error.message };
+    }
+  }
+}
+
+module.exports = new WatiService();

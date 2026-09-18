@@ -1,0 +1,885 @@
+'use client';
+import { useState, useEffect, useCallback } from 'react';
+import { useRouter, useParams } from 'next/navigation';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+
+async function apiFetch(path, options = {}) {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ============================================================
+// DEMO DATA (fallback si API non dispo)
+// ============================================================
+const DEMO_CAMPAIGN = {
+  id: 'demo-1',
+  name: 'Factures Avril 2026',
+  description: 'Envoi des factures du mois d\'Avril 2026 aux clients Eneo',
+  status: 'running',
+  campaign_type: 'broadcast',
+  template_name: 'next_001_facture_en_01',
+  template_language: 'fr',
+  phone_number: '+237689588347',
+  send_mode: 'batch',
+  batch_size: 50,
+  rate_per_minute: 30,
+  daily_limit: 1000,
+  total_contacts: 8420,
+  sent_count: 6100,
+  delivered_count: 5780,
+  read_count: 3240,
+  failed_count: 180,
+  replied_count: 42,
+  optout_count: 8,
+  delivery_rate: 94.8,
+  read_rate: 56.1,
+  estimated_cost: 42.10,
+  actual_cost: 30.50,
+  category: 'Facturation',
+  priority: 8,
+  started_at: new Date(Date.now() - 3600000).toISOString(),
+  created_at: new Date(Date.now() - 86400000).toISOString(),
+};
+
+const DEMO_STATS = {
+  campaign: DEMO_CAMPAIGN,
+  contact_status_breakdown: { pending: 2140, queued: 180, sent: 320, delivered: 5780, read: 3240, failed: 180, skipped: 12 },
+  daily_stats: Array.from({ length: 7 }, (_, i) => ({
+    stat_date: new Date(Date.now() - (6 - i) * 86400000).toISOString().split('T')[0],
+    sent: Math.floor(Math.random() * 800 + 200),
+    delivered: Math.floor(Math.random() * 750 + 180),
+    read: Math.floor(Math.random() * 400 + 100),
+    failed: Math.floor(Math.random() * 30 + 5),
+  }))
+};
+
+const DEMO_CONTACTS = Array.from({ length: 20 }, (_, i) => ({
+  id: `c-${i}`,
+  phone_number: `+23767${Math.floor(Math.random() * 9000000 + 1000000)}`,
+  name: ['Jean Mbarga', 'Marie Ateba', 'Paul Essomba', 'Claire Nkodo', 'Henri Biyong', 'Suzanne Fouda', 'Robert Manga', 'Alice Ndongo'][i % 8],
+  status: ['delivered', 'read', 'sent', 'pending', 'failed'][Math.floor(Math.random() * 5)],
+  sent_at: i < 15 ? new Date(Date.now() - Math.random() * 3600000).toISOString() : null,
+  delivered_at: i < 12 ? new Date(Date.now() - Math.random() * 3600000).toISOString() : null,
+  read_at: i < 8 ? new Date(Date.now() - Math.random() * 1800000).toISOString() : null,
+  created_at: new Date(Date.now() - 86400000).toISOString(),
+}));
+
+const DEMO_LOGS = [
+  { id: '1', level: 'info', event: 'campaign.launched', message: 'Campagne lancée par admin@numericexport.com', created_at: new Date(Date.now() - 3600000).toISOString() },
+  { id: '2', level: 'info', event: 'batch.started', message: 'Envoi du batch 1/169 (50 contacts)', created_at: new Date(Date.now() - 3540000).toISOString() },
+  { id: '3', level: 'info', event: 'batch.completed', message: 'Batch 1 terminé : 48 envoyés, 2 ignorés', created_at: new Date(Date.now() - 3420000).toISOString() },
+  { id: '4', level: 'warn', event: 'contact.skipped', message: 'Contact +237670000001 ignoré (cooldown actif)', created_at: new Date(Date.now() - 3000000).toISOString() },
+  { id: '5', level: 'error', event: 'contact.failed', message: 'Erreur WATI: numéro invalide +237600000000', created_at: new Date(Date.now() - 2700000).toISOString() },
+  { id: '6', level: 'info', event: 'batch.started', message: 'Envoi du batch 2/169 (50 contacts)', created_at: new Date(Date.now() - 2400000).toISOString() },
+  { id: '7', level: 'info', event: 'stats.update', message: '6100 envoyés, 5780 livrés, 3240 lus', created_at: new Date(Date.now() - 600000).toISOString() },
+];
+
+// ============================================================
+// STATUS CONFIG
+// ============================================================
+const STATUS_CONFIG = {
+  draft: { label: 'Brouillon', color: '#6b7c74', bg: '#f0f7f3' },
+  scheduled: { label: 'Planifiée', color: '#1976d2', bg: '#e3f2fd' },
+  running: { label: 'En cours', color: '#2d7a3e', bg: '#e8f5e9' },
+  paused: { label: 'En pause', color: '#f57c00', bg: '#fff3e0' },
+  completed: { label: 'Terminée', color: '#1e5a2f', bg: '#e8f5e9' },
+  cancelled: { label: 'Annulée', color: '#c62828', bg: '#ffebee' },
+  failed: { label: 'Échouée', color: '#b71c1c', bg: '#ffebee' },
+  pending: { label: 'En attente', color: '#6b7c74', bg: '#f8faf9' },
+  queued: { label: 'En file', color: '#1976d2', bg: '#e3f2fd' },
+  sent: { label: 'Envoyé', color: '#0288d1', bg: '#e1f5fe' },
+  delivered: { label: 'Livré', color: '#2d7a3e', bg: '#e8f5e9' },
+  read: { label: 'Lu', color: '#1e5a2f', bg: '#c8e6c9' },
+  skipped: { label: 'Ignoré', color: '#9eada5', bg: '#f0f7f3' },
+  optedout: { label: 'Désabonné', color: '#c62828', bg: '#ffebee' },
+};
+
+const CONTACT_STATUS_ORDER = ['pending', 'queued', 'sent', 'delivered', 'read', 'failed', 'skipped', 'optedout'];
+const STATUS_COLORS_CHART = {
+  delivered: '#2d7a3e', read: '#8bc34a', sent: '#42a5f5',
+  pending: '#e5ebe8', failed: '#ef5350', skipped: '#9eada5',
+  queued: '#1976d2', optedout: '#c62828'
+};
+
+// ============================================================
+// SOUS-COMPOSANTS
+// ============================================================
+function MetricCard({ label, value, sub, color = '#2d7a3e', icon }) {
+  return (
+    <div style={{
+      background: 'white', borderRadius: 14, padding: '20px', border: '1px solid #e5ebe8',
+      display: 'flex', flexDirection: 'column', gap: 8
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div style={{ fontSize: 30, fontWeight: 800, color, lineHeight: 1, fontFamily: "'DM Mono', monospace" }}>
+          {typeof value === 'number' ? value.toLocaleString('fr-FR') : value}
+        </div>
+        {icon && <span style={{ fontSize: 22 }}>{icon}</span>}
+      </div>
+      <div style={{ fontSize: 12, color: '#6b7c74', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+      {sub && <div style={{ fontSize: 12, color, fontWeight: 500 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function DonutChart({ data, size = 180 }) {
+  const total = Object.values(data).reduce((a, b) => a + b, 0);
+  if (total === 0) return <div style={{ textAlign: 'center', color: '#9eada5', fontSize: 13 }}>Aucune donnée</div>;
+
+  const radius = 60;
+  const cx = size / 2;
+  const cy = size / 2;
+  let cumAngle = -90;
+
+  const slices = Object.entries(data)
+    .filter(([, v]) => v > 0)
+    .map(([key, val]) => {
+      const angle = (val / total) * 360;
+      const startAngle = cumAngle;
+      cumAngle += angle;
+      const endAngle = cumAngle;
+
+      const toRad = (deg) => (deg * Math.PI) / 180;
+      const x1 = cx + radius * Math.cos(toRad(startAngle));
+      const y1 = cy + radius * Math.sin(toRad(startAngle));
+      const x2 = cx + radius * Math.cos(toRad(endAngle));
+      const y2 = cy + radius * Math.sin(toRad(endAngle));
+      const largeArc = angle > 180 ? 1 : 0;
+
+      return { key, val, path: `M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArc} 1 ${x2} ${y2} Z`, color: STATUS_COLORS_CHART[key] || '#ccc' };
+    });
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        {slices.map(s => <path key={s.key} d={s.path} fill={s.color} stroke="white" strokeWidth="2" />)}
+        <circle cx={cx} cy={cy} r={radius * 0.55} fill="white" />
+        <text x={cx} y={cy - 6} textAnchor="middle" fontSize="18" fontWeight="700" fill="#1a1f1d">
+          {total.toLocaleString('fr-FR')}
+        </text>
+        <text x={cx} y={cy + 14} textAnchor="middle" fontSize="10" fill="#9eada5">contacts</text>
+      </svg>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {slices.map(s => (
+          <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+            <div style={{ width: 10, height: 10, borderRadius: 3, background: s.color, flexShrink: 0 }} />
+            <span style={{ color: '#6b7c74', minWidth: 70 }}>{STATUS_CONFIG[s.key]?.label || s.key}</span>
+            <span style={{ fontWeight: 700, color: '#1a1f1d' }}>{s.val.toLocaleString('fr-FR')}</span>
+            <span style={{ color: '#9eada5' }}>({((s.val / total) * 100).toFixed(1)}%)</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BarChart({ data = [], keys = ['sent', 'delivered', 'read', 'failed'] }) {
+  if (!data.length) return <div style={{ color: '#9eada5', fontSize: 13, padding: 20 }}>Aucune donnée historique</div>;
+  const maxVal = Math.max(...data.flatMap(d => keys.map(k => parseInt(d[k]) || 0)), 1);
+  const colors = { sent: '#42a5f5', delivered: '#2d7a3e', read: '#8bc34a', failed: '#ef5350' };
+  const labels = { sent: 'Envoyés', delivered: 'Livrés', read: 'Lus', failed: 'Échecs' };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Légende */}
+      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+        {keys.map(k => (
+          <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+            <div style={{ width: 10, height: 10, borderRadius: 3, background: colors[k] }} />
+            <span style={{ color: '#6b7c74' }}>{labels[k]}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Graphique */}
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, height: 140, paddingBottom: 24, position: 'relative' }}>
+        {/* Lignes de grille */}
+        {[0, 25, 50, 75, 100].map(pct => (
+          <div key={pct} style={{ position: 'absolute', left: 0, right: 0,
+            bottom: `calc(${pct}% + 24px)`, borderTop: '1px dashed #f0f7f3', zIndex: 0 }} />
+        ))}
+
+        {data.map((day, i) => (
+          <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, position: 'relative', zIndex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 1, height: 116, width: '100%' }}>
+              {keys.map(k => {
+                const val = parseInt(day[k]) || 0;
+                const h = `${Math.max((val / maxVal) * 100, 2)}%`;
+                return (
+                  <div key={k} title={`${labels[k]}: ${val}`} style={{
+                    flex: 1, height: h, background: colors[k], borderRadius: '3px 3px 0 0',
+                    transition: 'height 0.4s ease', opacity: 0.85, cursor: 'pointer',
+                    minHeight: 2,
+                  }} />
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 10, color: '#9eada5', textAlign: 'center', position: 'absolute', bottom: 0, width: '100%' }}>
+              {new Date(day.stat_date).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProgressRing({ value, max, color, size = 80, label, sublabel }) {
+  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  const r = (size / 2) - 8;
+  const circ = 2 * Math.PI * r;
+  const dash = (pct / 100) * circ;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+      <div style={{ position: 'relative', width: size, height: size }}>
+        <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
+          <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#f0f7f3" strokeWidth="8" />
+          <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="8"
+            strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
+            style={{ transition: 'stroke-dasharray 0.8s ease' }} />
+        </svg>
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center' }}>
+          <span style={{ fontSize: size > 90 ? 16 : 13, fontWeight: 700, color, lineHeight: 1 }}>
+            {pct.toFixed(1)}%
+          </span>
+        </div>
+      </div>
+      <div style={{ fontSize: 12, fontWeight: 600, color: '#6b7c74', textAlign: 'center' }}>{label}</div>
+      {sublabel && <div style={{ fontSize: 11, color: '#9eada5', textAlign: 'center' }}>{sublabel}</div>}
+    </div>
+  );
+}
+
+function ContactStatusBadge({ status }) {
+  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '2px 8px',
+      borderRadius: 12, fontSize: 11, fontWeight: 600, background: cfg.bg, color: cfg.color }}>
+      {status === 'read' ? '👁️' : status === 'delivered' ? '✓✓' : status === 'sent' ? '✓' :
+        status === 'failed' ? '✗' : status === 'pending' ? '⏳' : '—'}
+      {cfg.label}
+    </span>
+  );
+}
+
+function LogEntry({ log }) {
+  const levelConfig = {
+    info: { color: '#1976d2', bg: '#e3f2fd', icon: 'ℹ️' },
+    warn: { color: '#f57c00', bg: '#fff3e0', icon: '⚠️' },
+    error: { color: '#c62828', bg: '#ffebee', icon: '❌' },
+    critical: { color: '#b71c1c', bg: '#ffcdd2', icon: '🚨' },
+    debug: { color: '#9eada5', bg: '#f8faf9', icon: '🔍' },
+  };
+  const cfg = levelConfig[log.level] || levelConfig.info;
+
+  return (
+    <div style={{ display: 'flex', gap: 12, padding: '10px 0', borderBottom: '1px solid #f8faf9' }}>
+      <div style={{ flexShrink: 0, width: 28, height: 28, borderRadius: 8,
+        background: cfg.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>
+        {cfg.icon}
+      </div>
+      <div style={{ flex: 1 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 2 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: cfg.color, fontFamily: 'monospace' }}>{log.event}</span>
+          <span style={{ fontSize: 11, color: '#9eada5' }}>
+            {new Date(log.created_at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+          </span>
+        </div>
+        <div style={{ fontSize: 13, color: '#4a5852' }}>{log.message}</div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE PRINCIPALE
+// ============================================================
+export default function CampaignDetailPage() {
+  const router = useRouter();
+  const params = useParams();
+  const campaignId = params?.id;
+
+  const [tab, setTab] = useState('overview');
+  const [campaign, setCampaign] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [contacts, setContacts] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [contactFilters, setContactFilters] = useState({ status: '', search: '', page: 1 });
+  const [contactPagination, setContactPagination] = useState({});
+  const [logLevel, setLogLevel] = useState('');
+
+  // Import contacts state
+  const [showImport, setShowImport] = useState(false);
+  const [importFile, setImportFile] = useState(null);
+  const [importLoading, setImportLoading] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+
+  const showToast = (msg, type = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  const fetchCampaign = useCallback(async () => {
+  if (!campaignId) return;
+  try {
+    const [campRes, statsRes] = await Promise.all([
+      apiFetch(`/campaigns/${campaignId}`),
+      apiFetch(`/campaigns/${campaignId}/stats`),
+    ]);
+    if (campRes?.campaign) setCampaign(campRes.campaign);
+    if (statsRes) setStats(statsRes);
+  } catch (err) {
+    console.error('Erreur chargement campagne:', err);
+    // Ne pas utiliser DEMO_DATA, afficher une erreur
+    setCampaign(null);
+    setStats(null);
+    showToast('Erreur chargement des données', 'error');
+  }
+}, [campaignId]);
+
+  const fetchContacts = useCallback(async () => {
+    if (!campaignId) return;
+    try {
+      const qs = new URLSearchParams({
+        page: contactFilters.page,
+        limit: 20,
+        ...(contactFilters.status && { status: contactFilters.status }),
+        ...(contactFilters.search && { search: contactFilters.search }),
+      }).toString();
+      const res = await apiFetch(`/campaigns/${campaignId}/contacts?${qs}`);
+      setContacts(res.contacts || []);
+      setContactPagination(res.pagination || {});
+    } catch {
+      setContacts(DEMO_CONTACTS);
+    }
+  }, [campaignId, contactFilters]);
+
+  const fetchLogs = useCallback(async () => {
+    if (!campaignId) return;
+    try {
+      const qs = new URLSearchParams({ limit: 100, ...(logLevel && { level: logLevel }) }).toString();
+      const res = await apiFetch(`/campaigns/${campaignId}/logs?${qs}`);
+      setLogs(res.logs || []);
+    } catch {
+      setLogs(DEMO_LOGS);
+    }
+  }, [campaignId, logLevel]);
+
+  useEffect(() => {
+    setLoading(true);
+    fetchCampaign().finally(() => setLoading(false));
+  }, [fetchCampaign]);
+
+  useEffect(() => {
+    if (tab === 'contacts') fetchContacts();
+    if (tab === 'logs') fetchLogs();
+  }, [tab, fetchContacts, fetchLogs]);
+
+  // Auto-refresh toutes les 15s si running
+  useEffect(() => {
+    if (campaign?.status !== 'running') return;
+    const interval = setInterval(fetchCampaign, 15000);
+    return () => clearInterval(interval);
+  }, [campaign?.status, fetchCampaign]);
+
+  const handleAction = async (action) => {
+    setActionLoading(action);
+    try {
+      await apiFetch(`/campaigns/${campaignId}/${action}`, { method: 'POST' });
+      showToast(
+        action === 'launch' ? '🚀 Campagne lancée !' :
+        action === 'pause' ? '⏸️ Campagne mise en pause' :
+        '❌ Campagne annulée'
+      );
+      fetchCampaign();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleImport = async () => {
+    if (!importFile) return;
+    setImportLoading(true);
+    setImportResult(null);
+    try {
+      const token = localStorage.getItem('token');
+      const formData = new FormData();
+      formData.append('file', importFile);
+      const res = await fetch(`${API_BASE}/campaigns/${campaignId}/contacts/import`, {
+        method: 'POST',
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: formData,
+      });
+      const data = await res.json();
+      setImportResult(data);
+      showToast(`${data.imported} contacts importés !`);
+      fetchCampaign();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setImportLoading(false);
+    }
+  };
+
+  if (loading) return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#f8faf9' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+        <div style={{ width: 40, height: 40, border: '4px solid #e5ebe8', borderTopColor: '#2d7a3e',
+          borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+        <div style={{ fontSize: 14, color: '#6b7c74' }}>Chargement de la campagne...</div>
+      </div>
+    </div>
+  );
+
+  const c = campaign || DEMO_CAMPAIGN;
+  const s = stats?.campaign || c;
+  const breakdown = stats?.contact_status_breakdown || {};
+  const dailyStats = stats?.daily_stats || [];
+
+  const TABS = [
+    { id: 'overview', label: 'Vue d\'ensemble', icon: '📊' },
+    { id: 'contacts', label: `Contacts (${(c.total_contacts || 0).toLocaleString('fr-FR')})`, icon: '👥' },
+    { id: 'analytics', label: 'Analytique', icon: '📈' },
+    { id: 'logs', label: 'Journaux', icon: '📋' },
+  ];
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f8faf9', fontFamily: "'Inter', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes slideDown { from { transform: translateY(-10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .tab-btn { padding: 10px 18px; border: none; background: none; cursor: pointer; font-size: 14px; font-weight: 500; color: #6b7c74; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+        .tab-btn:hover { color: #2d7a3e; }
+        .tab-btn.active { color: #2d7a3e; border-bottom-color: #2d7a3e; font-weight: 600; }
+        .contact-row:hover { background: #fafcfb; }
+      `}</style>
+
+      {toast && (
+        <div style={{
+          position: 'fixed', top: 24, right: 24, zIndex: 9999, animation: 'slideDown 0.3s ease',
+          padding: '12px 20px', borderRadius: 12, boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
+          background: toast.type === 'error' ? '#c62828' : '#2d7a3e', color: 'white', fontSize: 14, fontWeight: 500
+        }}>
+          {toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ background: 'white', borderBottom: '1px solid #e5ebe8', padding: '0 32px', position: 'sticky', top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 1300, margin: '0 auto' }}>
+          {/* Top bar */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 64, gap: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+              <button onClick={() => router.push('/campaigns')} style={{
+                width: 36, height: 36, borderRadius: 10, border: '1px solid #e5ebe8', background: 'white',
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 16, color: '#6b7c74'
+              }}>←</button>
+
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <h1 style={{ fontSize: 18, fontWeight: 700, color: '#1a1f1d', margin: 0 }}>{c.name}</h1>
+                  {/* Status badge */}
+                  {(() => {
+                    const cfg = STATUS_CONFIG[c.status] || STATUS_CONFIG.draft;
+                    return (
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6,
+                        padding: '3px 10px', borderRadius: 20, background: cfg.bg, color: cfg.color,
+                        fontSize: 12, fontWeight: 600 }}>
+                        {c.status === 'running' && (
+                          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#4caf50',
+                            animation: 'pulse 1.5s infinite', flexShrink: 0 }} />
+                        )}
+                        {cfg.label}
+                      </span>
+                    );
+                  })()}
+                </div>
+                <div style={{ fontSize: 12, color: '#9eada5' }}>
+                  {c.template_name} · {c.phone_number} · {c.campaign_type}
+                </div>
+              </div>
+            </div>
+
+            {/* Action buttons */}
+            <div style={{ display: 'flex', gap: 8 }}>
+              {c.status === 'draft' && (
+                <button onClick={() => handleAction('launch')} disabled={actionLoading === 'launch'}
+                  style={{ padding: '8px 18px', borderRadius: 10, border: 'none',
+                    background: 'linear-gradient(135deg, #2d7a3e, #3a9950)', color: 'white',
+                    cursor: 'pointer', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  🚀 Lancer
+                </button>
+              )}
+              {c.status === 'running' && (
+                <button onClick={() => handleAction('pause')} disabled={actionLoading === 'pause'}
+                  style={{ padding: '8px 18px', borderRadius: 10, border: 'none',
+                    background: '#f57c00', color: 'white', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                  ⏸ Pause
+                </button>
+              )}
+              {c.status === 'paused' && (
+                <button onClick={() => handleAction('launch')} disabled={actionLoading === 'launch'}
+                  style={{ padding: '8px 18px', borderRadius: 10, border: 'none',
+                    background: 'linear-gradient(135deg, #2d7a3e, #3a9950)', color: 'white',
+                    cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                  ▶ Reprendre
+                </button>
+              )}
+              {!['completed','cancelled'].includes(c.status) && (
+                <button onClick={() => { if (confirm('Annuler cette campagne ?')) handleAction('cancel'); }}
+                  style={{ padding: '8px 14px', borderRadius: 10, border: '1px solid #e5ebe8',
+                    background: 'white', color: '#c62828', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                  ✕ Annuler
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Tabs */}
+          <div style={{ display: 'flex', gap: 0, borderTop: '1px solid #f0f7f3' }}>
+            {TABS.map(t => (
+              <button key={t.id} className={`tab-btn ${tab === t.id ? 'active' : ''}`}
+                onClick={() => setTab(t.id)}>
+                {t.icon} {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1300, margin: '0 auto', padding: '32px' }}>
+
+        {/* ========== OVERVIEW ========== */}
+        {tab === 'overview' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+
+            {/* KPIs row */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
+              <MetricCard label="Total contacts" value={s.total_contacts || 0} icon="👥" color="#1976d2"
+                sub={`Quota utilisé: ${s.total_contacts || 0}`} />
+              <MetricCard label="Messages envoyés" value={s.sent_count || 0} icon="📤" color="#0288d1"
+                sub={`${s.total_contacts > 0 ? (((s.sent_count||0) / s.total_contacts) * 100).toFixed(1) : 0}% du total`} />
+              <MetricCard label="Livrés" value={s.delivered_count || 0} icon="✓✓" color="#2d7a3e"
+                sub={`Taux: ${s.delivery_rate || 0}%`} />
+              <MetricCard label="Lus" value={s.read_count || 0} icon="👁️" color="#8bc34a"
+                sub={`Taux: ${s.read_rate || 0}%`} />
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+              {/* Donut */}
+              <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '24px' }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 20 }}>
+                  📊 Répartition des contacts
+                </div>
+                <DonutChart data={breakdown} />
+              </div>
+
+              {/* Progress rings + info */}
+              <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '24px' }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 20 }}>
+                  📈 Taux de performance
+                </div>
+                <div style={{ display: 'flex', gap: 32, justifyContent: 'center', marginBottom: 24 }}>
+                  <ProgressRing value={s.delivered_count || 0} max={s.sent_count || 1}
+                    color="#2d7a3e" size={100} label="Livraison" sublabel={`${s.delivered_count || 0} / ${s.sent_count || 0}`} />
+                  <ProgressRing value={s.read_count || 0} max={s.delivered_count || 1}
+                    color="#8bc34a" size={100} label="Lecture" sublabel={`${s.read_count || 0} / ${s.delivered_count || 0}`} />
+                  <ProgressRing value={s.replied_count || 0} max={s.sent_count || 1}
+                    color="#1976d2" size={100} label="Réponses" sublabel={`${s.replied_count || 0} / ${s.sent_count || 0}`} />
+                </div>
+
+                <div style={{ borderTop: '1px solid #f0f7f3', paddingTop: 16,
+                  display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  {[
+                    { label: 'Échecs', value: s.failed_count || 0, color: '#c62828' },
+                    { label: 'Désabonnements', value: s.optout_count || 0, color: '#f57c00' },
+                    { label: 'Coût estimé', value: `$${(parseFloat(s.estimated_cost) || 0).toFixed(2)}`, color: '#6b7c74' },
+                    { label: 'Coût réel', value: `$${(parseFloat(s.actual_cost) || 0).toFixed(2)}`, color: '#2d7a3e' },
+                  ].map(item => (
+                    <div key={item.label} style={{ display: 'flex', justifyContent: 'space-between',
+                      padding: '8px 12px', background: '#f8faf9', borderRadius: 8 }}>
+                      <span style={{ fontSize: 12, color: '#6b7c74' }}>{item.label}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: item.color }}>{item.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Info campagne */}
+            <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '24px' }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 16 }}>ℹ️ Détails de la campagne</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+                {[
+                  { label: 'Mode d\'envoi', value: c.send_mode },
+                  { label: 'Taille des lots', value: c.batch_size ? `${c.batch_size} messages` : '—' },
+                  { label: 'Vitesse', value: `${c.rate_per_minute || 30} msg/min` },
+                  { label: 'Limite/jour', value: `${c.daily_limit || 1000} messages` },
+                  { label: 'Priorité', value: `${c.priority || 5}/10` },
+                  { label: 'Catégorie', value: c.category || 'Sans catégorie' },
+                  { label: 'Créée le', value: c.created_at ? new Date(c.created_at).toLocaleString('fr-FR') : '—' },
+                  { label: 'Lancée le', value: c.started_at ? new Date(c.started_at).toLocaleString('fr-FR') : '—' },
+                  { label: 'Terminée le', value: c.completed_at ? new Date(c.completed_at).toLocaleString('fr-FR') : '—' },
+                ].map(item => (
+                  <div key={item.label} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <div style={{ fontSize: 11, color: '#9eada5', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>{item.label}</div>
+                    <div style={{ fontSize: 14, color: '#1a1f1d', fontWeight: 500 }}>{item.value || '—'}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========== CONTACTS ========== */}
+        {tab === 'contacts' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {/* Toolbar */}
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                placeholder="🔍 Rechercher un contact..."
+                value={contactFilters.search}
+                onChange={e => setContactFilters(f => ({ ...f, search: e.target.value, page: 1 }))}
+                style={{ padding: '8px 14px', borderRadius: 10, border: '1px solid #e5ebe8',
+                  fontSize: 13, color: '#1a1f1d', background: 'white', width: 240, outline: 'none' }}
+              />
+              <select value={contactFilters.status}
+                onChange={e => setContactFilters(f => ({ ...f, status: e.target.value, page: 1 }))}
+                style={{ padding: '8px 12px', borderRadius: 10, border: '1px solid #e5ebe8',
+                  fontSize: 13, color: '#1a1f1d', background: 'white', outline: 'none' }}>
+                <option value="">Tous les statuts</option>
+                {CONTACT_STATUS_ORDER.map(s => (
+                  <option key={s} value={s}>{STATUS_CONFIG[s]?.label || s}</option>
+                ))}
+              </select>
+
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                <button onClick={() => setShowImport(true)} style={{
+                  padding: '8px 14px', borderRadius: 10, border: '1px solid #2d7a3e',
+                  background: 'white', color: '#2d7a3e', cursor: 'pointer', fontSize: 13, fontWeight: 600
+                }}>📂 Importer CSV/Excel</button>
+              </div>
+            </div>
+
+            {/* Import modal */}
+            {showImport && (
+              <div style={{ background: 'white', borderRadius: 16, border: '2px solid #2d7a3e', padding: '24px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: '#1a1f1d' }}>📂 Importer des contacts</div>
+                  <button onClick={() => { setShowImport(false); setImportFile(null); setImportResult(null); }}
+                    style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 18, color: '#9eada5' }}>×</button>
+                </div>
+                <div style={{ fontSize: 13, color: '#6b7c74', marginBottom: 12 }}>
+                  Colonne <code>phone_number</code> obligatoire. Colonnes optionnelles : <code>name</code>, <code>email</code>, et toutes vos variables.
+                </div>
+                <input type="file" accept=".csv,.xlsx,.xls"
+                  onChange={e => setImportFile(e.target.files[0])}
+                  style={{ marginBottom: 12 }} />
+                {importFile && (
+                  <div style={{ fontSize: 13, color: '#2d7a3e', marginBottom: 12 }}>
+                    📄 {importFile.name} ({(importFile.size / 1024).toFixed(1)} Ko)
+                  </div>
+                )}
+                {importResult && (
+                  <div style={{ background: '#f0f7f3', borderRadius: 10, padding: '12px 16px', marginBottom: 12, fontSize: 13 }}>
+                    ✅ {importResult.imported} importés · {importResult.invalid || 0} invalides · {importResult.blacklisted || 0} blacklistés
+                  </div>
+                )}
+                <button onClick={handleImport} disabled={!importFile || importLoading}
+                  style={{ padding: '8px 20px', background: '#2d7a3e', color: 'white', border: 'none',
+                    borderRadius: 10, cursor: importFile ? 'pointer' : 'not-allowed', fontSize: 13, fontWeight: 600,
+                    opacity: importLoading ? 0.7 : 1 }}>
+                  {importLoading ? 'Importation...' : 'Importer'}
+                </button>
+              </div>
+            )}
+
+            {/* Table contacts */}
+            <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', overflow: 'hidden' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ background: '#f8faf9', borderBottom: '1px solid #e5ebe8' }}>
+                    {['Téléphone', 'Nom', 'Statut', 'Envoyé', 'Livré', 'Lu'].map(h => (
+                      <th key={h} style={{ padding: '12px 16px', textAlign: 'left',
+                        fontSize: 11, fontWeight: 600, color: '#6b7c74', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {contacts.length === 0 ? (
+                    <tr><td colSpan={6} style={{ padding: 40, textAlign: 'center', color: '#9eada5', fontSize: 14 }}>
+                      Aucun contact trouvé
+                    </td></tr>
+                  ) : contacts.map(contact => (
+                    <tr key={contact.id} className="contact-row" style={{ borderBottom: '1px solid #f8faf9' }}>
+                      <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontSize: 13, color: '#1a1f1d' }}>
+                        {contact.phone_number}
+                      </td>
+                      <td style={{ padding: '12px 16px', fontSize: 13, color: '#4a5852' }}>
+                        {contact.name || <span style={{ color: '#9eada5' }}>—</span>}
+                      </td>
+                      <td style={{ padding: '12px 16px' }}>
+                        <ContactStatusBadge status={contact.status} />
+                      </td>
+                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#6b7c74' }}>
+                        {contact.sent_at ? new Date(contact.sent_at).toLocaleTimeString('fr-FR') : '—'}
+                      </td>
+                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#6b7c74' }}>
+                        {contact.delivered_at ? new Date(contact.delivered_at).toLocaleTimeString('fr-FR') : '—'}
+                      </td>
+                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#6b7c74' }}>
+                        {contact.read_at ? new Date(contact.read_at).toLocaleTimeString('fr-FR') : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              {/* Pagination contacts */}
+              {contactPagination.totalPages > 1 && (
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 8, padding: '16px',
+                  borderTop: '1px solid #f0f7f3' }}>
+                  <button onClick={() => setContactFilters(f => ({ ...f, page: f.page - 1 }))}
+                    disabled={contactFilters.page <= 1}
+                    style={{ padding: '6px 12px', borderRadius: 8, border: '1px solid #e5ebe8',
+                      background: 'white', cursor: 'pointer', fontSize: 12, opacity: contactFilters.page <= 1 ? 0.5 : 1 }}>
+                    ← Précédent
+                  </button>
+                  <span style={{ padding: '6px 12px', fontSize: 12, color: '#6b7c74' }}>
+                    {contactFilters.page} / {contactPagination.totalPages}
+                  </span>
+                  <button onClick={() => setContactFilters(f => ({ ...f, page: f.page + 1 }))}
+                    disabled={contactFilters.page >= contactPagination.totalPages}
+                    style={{ padding: '6px 12px', borderRadius: 8, border: '1px solid #e5ebe8',
+                      background: 'white', cursor: 'pointer', fontSize: 12,
+                      opacity: contactFilters.page >= contactPagination.totalPages ? 0.5 : 1 }}>
+                    Suivant →
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ========== ANALYTICS ========== */}
+        {tab === 'analytics' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+            <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '28px' }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 24 }}>
+                📈 Évolution sur 7 jours
+              </div>
+              <BarChart data={dailyStats} keys={['sent', 'delivered', 'read', 'failed']} />
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+              {/* Funnel */}
+              <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '28px' }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 20 }}>🔽 Entonnoir de conversion</div>
+                {[
+                  { label: 'Contacts ciblés', value: s.total_contacts || 0, max: s.total_contacts || 1, color: '#1976d2' },
+                  { label: 'Messages envoyés', value: s.sent_count || 0, max: s.total_contacts || 1, color: '#0288d1' },
+                  { label: 'Livrés', value: s.delivered_count || 0, max: s.total_contacts || 1, color: '#2d7a3e' },
+                  { label: 'Lus', value: s.read_count || 0, max: s.total_contacts || 1, color: '#8bc34a' },
+                  { label: 'Réponses', value: s.replied_count || 0, max: s.total_contacts || 1, color: '#f57c00' },
+                ].map((item, i) => (
+                  <div key={item.label} style={{ marginBottom: 16 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 6 }}>
+                      <span style={{ color: '#6b7c74', fontWeight: 500 }}>{item.label}</span>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <span style={{ fontWeight: 700, color: '#1a1f1d' }}>{item.value.toLocaleString('fr-FR')}</span>
+                        <span style={{ color: item.color, fontWeight: 600, fontSize: 12 }}>
+                          ({item.max > 0 ? ((item.value / item.max) * 100).toFixed(1) : 0}%)
+                        </span>
+                      </div>
+                    </div>
+                    <div style={{ height: 8, background: '#f0f7f3', borderRadius: 99, overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%', background: item.color, borderRadius: 99, transition: 'width 0.8s ease',
+                        width: `${item.max > 0 ? (item.value / item.max) * 100 : 0}%`
+                      }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Métriques clés */}
+              <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '28px' }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d', marginBottom: 20 }}>💰 Métriques économiques</div>
+                {[
+                  { label: 'Coût par message envoyé', value: s.sent_count > 0 ? `$${((parseFloat(s.actual_cost) || 0) / s.sent_count).toFixed(4)}` : '—', icon: '💵' },
+                  { label: 'Coût par livraison', value: s.delivered_count > 0 ? `$${((parseFloat(s.actual_cost) || 0) / s.delivered_count).toFixed(4)}` : '—', icon: '📦' },
+                  { label: 'Coût par lecture', value: s.read_count > 0 ? `$${((parseFloat(s.actual_cost) || 0) / s.read_count).toFixed(4)}` : '—', icon: '👁️' },
+                  { label: 'Coût total (USD)', value: `$${(parseFloat(s.actual_cost) || 0).toFixed(2)}`, icon: '💳' },
+                  { label: 'Coût total (FCFA)', value: `${Math.round((s.actual_cost || 0) * 620).toLocaleString('fr-FR')} FCFA`, icon: '🏦' },
+                  { label: 'Économies (estimé vs réel)', value: `$${Math.max(0, (s.estimated_cost || 0) - (s.actual_cost || 0)).toFixed(2)}`, icon: '✅' },
+                ].map(item => (
+                  <div key={item.label} style={{ display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center', padding: '12px 0', borderBottom: '1px solid #f8faf9' }}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <span>{item.icon}</span>
+                      <span style={{ fontSize: 13, color: '#6b7c74' }}>{item.label}</span>
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: '#1a1f1d' }}>{item.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========== LOGS ========== */}
+        {tab === 'logs' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontSize: 13, color: '#6b7c74', fontWeight: 500 }}>Niveau :</span>
+              {['', 'info', 'warn', 'error', 'debug'].map(l => (
+                <button key={l} onClick={() => { setLogLevel(l); }}
+                  style={{ padding: '5px 12px', borderRadius: 20, fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                    border: '1px solid #e5ebe8', transition: 'all 0.15s',
+                    background: logLevel === l ? '#2d7a3e' : 'white',
+                    color: logLevel === l ? 'white' : '#6b7c74' }}>
+                  {l === '' ? 'Tous' : l.charAt(0).toUpperCase() + l.slice(1)}
+                </button>
+              ))}
+              <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9eada5' }}>
+                {logs.length} entrée(s)
+              </span>
+            </div>
+
+            <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', padding: '24px',
+              maxHeight: 600, overflowY: 'auto' }}>
+              {logs.length === 0 ? (
+                <div style={{ textAlign: 'center', color: '#9eada5', padding: 40, fontSize: 14 }}>Aucun journal trouvé</div>
+              ) : logs.map(log => <LogEntry key={log.id} log={log} />)}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

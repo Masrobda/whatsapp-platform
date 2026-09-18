@@ -1,0 +1,314 @@
+// app/privacy/page.tsx
+'use client';
+import Link from 'next/link';
+
+export default function PrivacyPage() {
+  const lastUpdate = "24 Février 2026";
+  return (
+    <main className="min-h-screen bg-gray-50 py-12">
+      <div className="container mx-auto px-4">
+        <div className="max-w-4xl mx-auto bg-white rounded-lg shadow-lg p-8 md:p-12">
+          {/* En-tête */}
+          <div className="mb-8">
+            <h1 className="text-3xl md:text-4xl font-bold text-gray-900 mb-4">
+              Politique de Confidentialité
+            </h1>
+            <p className="text-gray-600">
+              Dernière mise à jour : {lastUpdate}
+            </p>
+            <div className="w-20 h-1 bg-blue-600 mt-4"></div>
+          </div>
+
+          {/* Introduction */}
+          <div className="prose prose-lg max-w-none">
+            <div className="bg-blue-50 border-l-4 border-blue-600 p-4 mb-8">
+              <p className="text-blue-800 font-medium">
+                NEXT LTD s&apos;engage à protéger votre vie privée et vos données personnelles.
+                Cette politique détaille comment nous collectons, utilisons et protégeons vos
+                informations dans le cadre de nos services, y compris notre solution d&apos;envoi
+                de messages WhatsApp.
+              </p>
+            </div>
+
+            {/* Section 1 - Identité du responsable */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                1. Qui sommes-nous ?
+              </h2>
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <p className="mb-2"><strong>Entreprise :</strong> NEXT LTD</p>
+                <p className="mb-2"><strong>Forme juridique :</strong> Société à Responsabilité Limitée</p>
+                <p className="mb-2"><strong>Siège social :</strong> Douala, Cameroun</p>
+                <p className="mb-2"><strong>Adresse :</strong> Face Texaco Omnisport, BP 1538 Douala Cameroun</p>
+                <p className="mb-2"><strong>RCCM :</strong> CM-DLA-02-2026-B12-00012</p>
+                <p className="mb-2"><strong>NIU :</strong> M012618314899B</p>
+                <p className="mb-2"><strong>Email :</strong> team@numericexport.com</p>
+                <p><strong>Téléphone :</strong> (+237) 696 57 81 07 / 651 01 90 69</p>
+              </div>
+            </section>
+
+            {/* Section 2 - Conformité WhatsApp */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                2. Conformité avec les Politiques WhatsApp
+              </h2>
+              <p className="mb-3">
+                Dans le cadre de l&apos;utilisation de notre API d&apos;envoi de messages WhatsApp,
+                nous nous engageons à respecter strictement :
+              </p>
+              <ul className="list-disc pl-6 mb-4 space-y-2">
+                <li>Les <strong>Politiques Commerciales WhatsApp</strong> (WhatsApp Commerce Policy)</li>
+                <li>Les <strong>Conditions d&apos;Utilisation de l&apos;API WhatsApp Business</strong></li>
+                <li>Les <strong>Politiques de Qualité WhatsApp</strong> concernant les limites de messages</li>
+                <li>Le <strong>Règlement Général sur la Protection des Données (RGPD)</strong></li>
+                <li>La <strong>Loi Camerounaise n°2010/013 sur les communications électroniques</strong></li>
+              </ul>
+              <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                <p className="text-yellow-800 font-medium">
+                  ⚠️ Nous obtenons un consentement explicite avant d&apos;envoyer tout message WhatsApp
+                  commercial à vos contacts. Chaque message inclut une option de désabonnement claire.
+                </p>
+              </div>
+            </section>
+
+            {/* Section 3 - Données collectées */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                3. Données que nous collectons
+              </h2>
+              <h3 className="text-xl font-medium text-gray-800 mb-3">3.1 Données des utilisateurs de l&apos;application</h3>
+              <ul className="list-disc pl-6 mb-4">
+                <li>Nom et prénom</li>
+                <li>Adresse email professionnelle</li>
+                <li>Numéro de téléphone</li>
+                <li>Fonction dans l&apos;entreprise</li>
+                <li>Identifiants de connexion (hashés)</li>
+                <li>Logs d&apos;activité et d&apos;authentification</li>
+              </ul>
+              <h3 className="text-xl font-medium text-gray-800 mb-3">3.2 Données des destinataires WhatsApp</h3>
+              <ul className="list-disc pl-6 mb-4">
+                <li>Numéros de téléphone des destinataires</li>
+                <li>Statut de consentement (opt-in/opt-out)</li>
+                <li>Historique des messages envoyés (métadonnées uniquement)</li>
+                <li>Statut de livraison des messages</li>
+              </ul>
+              <h3 className="text-xl font-medium text-gray-800 mb-3">3.3 Données techniques</h3>
+              <ul className="list-disc pl-6">
+                <li>Adresse IP</li>
+                <li>Type de navigateur et appareil</li>
+                <li>Cookies et technologies similaires</li>
+                <li>Journaux de connexion</li>
+              </ul>
+            </section>
+
+            {/* Section 4 - Utilisation des données */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                4. Comment utilisons-nous vos données ?
+              </h2>
+              <div className="overflow-x-auto">
+                <table className="min-w-full border border-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="border p-3 text-left">Finalité</th>
+                      <th className="border p-3 text-left">Base légale</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td className="border p-3">Authentification et gestion de compte</td>
+                      <td className="border p-3">Exécution du contrat</td>
+                    </tr>
+                    <tr>
+                      <td className="border p-3">Envoi de messages WhatsApp</td>
+                      <td className="border p-3">Consentement explicite</td>
+                    </tr>
+                    <tr>
+                      <td className="border p-3">Facturation et support client</td>
+                      <td className="border p-3">Obligation légale</td>
+                    </tr>
+                    <tr>
+                      <td className="border p-3">Amélioration des services</td>
+                      <td className="border p-3">Intérêt légitime</td>
+                    </tr>
+                    <tr>
+                      <td className="border p-3">Conformité WhatsApp (limites de qualité)</td>
+                      <td className="border p-3">Respect des politiques plateforme</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            {/* Section 5 - Gestion des consentements WhatsApp */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                5. Gestion des consentements pour WhatsApp
+              </h2>
+              <p className="mb-3">
+                Conformément aux exigences de WhatsApp, nous maintenons un registre détaillé des consentements :
+              </p>
+              <ul className="list-disc pl-6 mb-4">
+                <li><strong>Preuve de consentement :</strong> Date, heure, IP et méthode d&apos;obtention du consentement</li>
+                <li><strong>Portée du consentement :</strong> Types de messages autorisés (transactionnels, marketing, support)</li>
+                <li><strong>Durée :</strong> Le consentement est valable jusqu&apos;à révocation</li>
+                <li><strong>Désabonnement :</strong> Chaque message inclut &quot;STOP pour vous désabonner&quot;</li>
+                <li><strong>Révocation :</strong> Traitement des désabonnements sous 24h maximum</li>
+              </ul>
+              <p className="text-sm text-gray-600 italic">
+                Les numéros ayant fait l&apos;objet d&apos;un désabonnement sont bloqués définitivement
+                dans notre système pour garantir le respect des choix des utilisateurs.
+              </p>
+            </section>
+
+            {/* Section 6 - Sécurité des données */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                6. Mesures de sécurité
+              </h2>
+              <p className="mb-3">Nous implémentons des mesures de sécurité de niveau entreprise :</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div className="border p-4 rounded-lg">
+                  <h4 className="font-bold text-blue-700 mb-2">🔐 Chiffrement</h4>
+                  <p>Chiffrement TLS 1.3 pour toutes les données en transit, chiffrement AES-256 au repos</p>
+                </div>
+                <div className="border p-4 rounded-lg">
+                  <h4 className="font-bold text-blue-700 mb-2">🔑 Authentification</h4>
+                  <p>MFA obligatoire, politiques de mots de passe forts, sessions sécurisées</p>
+                </div>
+                <div className="border p-4 rounded-lg">
+                  <h4 className="font-bold text-blue-700 mb-2">📋 Contrôle d&apos;accès</h4>
+                  <p>Principe du moindre privilège, audits d&apos;accès réguliers</p>
+                </div>
+                <div className="border p-4 rounded-lg">
+                  <h4 className="font-bold text-blue-700 mb-2">🛡️ Monitoring</h4>
+                  <p>Détection d&apos;intrusions 24/7, logs détaillés, alertes automatiques</p>
+                </div>
+              </div>
+            </section>
+
+            {/* Section 7 - Transferts internationaux */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                7. Transferts internationaux de données
+              </h2>
+              <p className="mb-3">
+                Dans le cadre de l&apos;utilisation de l&apos;API WhatsApp, vos données peuvent être
+                transférées vers les serveurs de Meta Platforms, Inc. situés aux États-Unis.
+                Ces transferts sont encadrés par :
+              </p>
+              <ul className="list-disc pl-6">
+                <li>Les clauses contractuelles types de la Commission Européenne</li>
+                <li>L&apos;adhésion de Meta au cadre de protection des données UE-États-Unis</li>
+                <li>Des garanties appropriées pour la protection des données</li>
+              </ul>
+            </section>
+
+            {/* Section 8 - Durée de conservation */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                8. Durée de conservation des données
+              </h2>
+              <div className="space-y-2">
+                <p><strong>Données de compte :</strong> Pendant toute la durée du contrat + 3 ans</p>
+                <p><strong>Journaux de connexion :</strong> 1 an</p>
+                <p><strong>Messages WhatsApp :</strong> Métadonnées conservées 3 mois</p>
+                <p><strong>Preuves de consentement :</strong> 5 ans à compter de la dernière interaction</p>
+                <p><strong>Données de désabonnement :</strong> Conservation permanente (liste rouge)</p>
+              </div>
+            </section>
+
+            {/* Section 9 - Droits des utilisateurs */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                9. Vos droits
+              </h2>
+              <p className="mb-3">Conformément à la réglementation camerounaise et au RGPD, vous disposez des droits suivants :</p>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">📝</span>
+                  <span className="font-medium">Droit d&apos;accès</span>
+                </div>
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">✏️</span>
+                  <span className="font-medium">Droit de rectification</span>
+                </div>
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">🗑️</span>
+                  <span className="font-medium">Droit à l&apos;effacement</span>
+                </div>
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">⏸️</span>
+                  <span className="font-medium">Droit à la limitation</span>
+                </div>
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">📦</span>
+                  <span className="font-medium">Droit à la portabilité</span>
+                </div>
+                <div className="border rounded-lg p-3 text-center">
+                  <span className="text-2xl mb-2 block">❌</span>
+                  <span className="font-medium">Droit d&apos;opposition</span>
+                </div>
+              </div>
+              <p>
+                Pour exercer vos droits, contactez-nous à :{' '}
+                <a href="mailto:team@numericexport.com" className="text-blue-600 hover:underline">team@numericexport.com</a>
+              </p>
+            </section>
+
+            {/* Section 10 - Cookies */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                10. Politique des cookies
+              </h2>
+              <p className="mb-3">Notre site utilise les catégories de cookies suivantes :</p>
+              <ul className="list-disc pl-6">
+                <li><strong>Cookies essentiels :</strong> Authentification, sécurité (obligatoires)</li>
+                <li><strong>Cookies fonctionnels :</strong> Préférences utilisateur (optionnels)</li>
+                <li><strong>Cookies analytiques :</strong> Amélioration des performances (optionnels)</li>
+              </ul>
+            </section>
+
+            {/* Section 11 - Réclamation */}
+            <section className="mb-8">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                11. Réclamations
+              </h2>
+              <p>
+                Si vous estimez que vos données n&apos;ont pas été traitées conformément à cette politique,
+                vous avez le droit d&apos;introduire une réclamation auprès de l&apos;autorité de contrôle camerounaise :
+              </p>
+              <p className="mt-2 p-3 bg-gray-50 rounded">
+                <strong>Agence Nationale des Technologies de l&apos;Information et de la Communication (ANTIC)</strong><br />
+                Email : contact@antic.cm<br />
+                Site web : www.antic.cm
+              </p>
+            </section>
+          </div>
+
+          {/* Pied de page avec retour */}
+          <div className="mt-12 pt-6 border-t border-gray-200 flex flex-wrap justify-between items-center gap-4">
+            <Link href="/" className="text-blue-600 hover:text-blue-800 font-medium inline-flex items-center">
+              ← Retour à l&apos;accueil
+            </Link>
+            <div className="flex gap-4">
+              <Link href="/terms" className="text-gray-600 hover:text-gray-800 text-sm">
+                Conditions d&apos;Utilisation
+              </Link>
+              <span className="text-gray-400">|</span>
+              <button
+                onClick={() => window.print()}
+                className="text-gray-600 hover:text-gray-800 text-sm flex items-center gap-1"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
+                </svg>
+                Version PDF
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}

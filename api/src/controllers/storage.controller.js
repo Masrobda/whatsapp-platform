@@ -1,0 +1,1529 @@
+// src/controllers/storage.controller.js
+const { query, transaction } = require('../config/database');
+const logger = require('../utils/logger');
+const fs = require('fs-extra');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const { pipeline } = require('stream/promises');
+const invoiceService = require('../services/invoices.service');
+const ffmpeg = require('fluent-ffmpeg');  // ← AJOUT
+const { promisify } = require('util');
+
+const STORAGE_PATH = process.env.STORAGE_PATH || '/var/www/storage/clients';
+
+// ==================== HELPERS ====================
+
+async function getFolderSize(folderPath) {
+    try {
+        const files = await fs.readdir(folderPath);
+        let totalSize = 0;
+        for (const file of files) {
+            const stats = await fs.stat(path.join(folderPath, file));
+            totalSize += stats.size;
+        }
+        return totalSize;
+    } catch (e) {
+        return 0;
+    }
+}
+
+async function getSpaceStatus(spaceId) {
+    const res = await query(
+        `SELECT s.*, c.company_name, c.email, o.invoice_number, o.amount_fcfa 
+         FROM storage_spaces s
+         LEFT JOIN clients c ON s.client_id = c.id
+         LEFT JOIN storage_orders o ON s.order_id = o.id
+         WHERE s.id = $1`,
+        [spaceId]
+    );
+
+    if (res.rowCount === 0) return { exists: false };
+
+    const space = res.rows[0];
+    const folderPath = path.join(STORAGE_PATH, spaceId);
+    const currentSize = await getFolderSize(folderPath).catch(() => 0);
+    
+    const now = new Date();
+    const isExpired = space.expires_at ? new Date(space.expires_at) < now : false;
+    const isInGracePeriod = space.deleted_at ? 
+        (new Date(space.deleted_at) > new Date(now - 7 * 24 * 60 * 60 * 1000)) : false;
+
+    return {
+        exists: true,
+        space,
+        isActive: space.is_active && !isExpired && !space.is_blocked,
+        isExpired,
+        isBlocked: space.is_blocked,
+        isInGracePeriod,
+        expiresAt: space.expires_at,
+        deletedAt: space.deleted_at,
+        limit: parseInt(space.size_limit_bytes),
+        used: currentSize,
+        hasQuota: currentSize < parseInt(space.size_limit_bytes),
+        usagePercentage: (currentSize / parseInt(space.size_limit_bytes)) * 100,
+        clientName: space.company_name,
+        clientEmail: space.email
+    };
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ==================== NOUVEAUX HELPERS VIDEO ====================
+
+/**
+ * Vérifie si le fichier est une vidéo (par extension ou MIME)
+ */
+function isVideoFile(mimeType, filename) {
+    const videoMimes = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm'];
+    const videoExtensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.3gp'];
+    if (mimeType && videoMimes.includes(mimeType)) return true;
+    const ext = path.extname(filename).toLowerCase();
+    return videoExtensions.includes(ext);
+}
+
+/**
+ * Convertit une vidéo pour être compatible WhatsApp (H.264/AAC, MP4, dimension max 1280x720, bitrate réduit)
+ * @param {string} inputPath - Chemin source
+ * @param {string} outputPath - Chemin de destination (doit finir par .mp4)
+ * @returns {Promise<string>} - outputPath
+ */
+async function convertVideoToWhatsAppCompatible(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions([
+                '-c:v libx264',
+                '-preset fast',
+                '-crf 23',               // qualité (23 = bon compromis, 18 = presque sans perte)
+                '-maxrate 2.5M',         // bitrate max augmenté pour meilleure qualité
+                '-bufsize 5M',
+                '-c:a aac',
+                '-b:a 128k',
+                '-movflags +faststart',
+                '-pix_fmt yuv420p'
+                // Supprimé le filtre scale/pad → on garde la résolution d'origine
+            ])
+            .on('end', () => {
+                logger.info(`✅ Vidéo convertie avec succès : ${outputPath}`);
+                resolve(outputPath);
+            })
+            .on('error', (err) => {
+                logger.error(`❌ Erreur conversion vidéo : ${err.message}`);
+                reject(err);
+            })
+            .save(outputPath);
+    });
+}
+
+// ==================== CLIENT ROUTES ====================
+
+async function uploadFileHandler(req, reply) {
+    try {
+        const { spaceId } = req.params;
+        const status = await getSpaceStatus(spaceId);
+
+        if (!status.exists) return reply.status(404).send({ success: false, message: "Espace de stockage introuvable" });
+        if (status.isExpired) return reply.status(403).send({ success: false, message: "Abonnement expiré.", code: "EXPIRED" });
+        if (status.isBlocked) return reply.status(403).send({ success: false, message: "Espace bloqué.", code: "BLOCKED" });
+        if (!status.isActive) return reply.status(403).send({ success: false, message: "Espace désactivé.", code: "INACTIVE" });
+        if (!status.hasQuota) return reply.status(403).send({ success: false, message: "Espace disque saturé.", code: "FULL", used: formatBytes(status.used), limit: formatBytes(status.limit) });
+
+        const data = await req.file();
+        if (!data) return reply.status(400).send({ success: false, message: "Aucun fichier reçu" });
+
+        const maxFileSize = 500 * 1024 * 1024;
+        if (data.file.bytes > maxFileSize) return reply.status(400).send({ success: false, message: "Fichier trop volumineux (max 500 Mo)" });
+
+        const clientFolder = path.join(STORAGE_PATH, spaceId);
+        await fs.ensureDir(clientFolder);
+
+        const timestamp = Date.now();
+        const uniqueId = uuidv4().substring(0, 8);
+        const extension = path.extname(data.filename);
+        const baseName = path.basename(data.filename, extension).replace(/[^a-zA-Z0-9]/g, '_');
+        let storedFilename = `${timestamp}-${uniqueId}-${baseName}${extension}`;
+        let targetPath = path.join(clientFolder, storedFilename);
+        let finalMimeType = data.mimetype || 'application/octet-stream';
+        let finalSize;
+
+        const tempPath = targetPath + '.tmp';
+        await pipeline(data.file, fs.createWriteStream(tempPath));
+
+        const isVideo = isVideoFile(data.mimetype, data.filename);
+        if (isVideo) {
+            logger.info(`🎬 Vidéo détectée, conversion : ${data.filename}`);
+            const mp4Filename = `${timestamp}-${uniqueId}-${baseName}.mp4`;
+            const mp4Path = path.join(clientFolder, mp4Filename);
+            try {
+                await convertVideoToWhatsAppCompatible(tempPath, mp4Path);
+                await fs.remove(tempPath);
+                storedFilename = mp4Filename;
+                targetPath = mp4Path;
+                finalMimeType = 'video/mp4';
+                const stats = await fs.stat(targetPath);
+                finalSize = stats.size;
+                logger.info(`✅ Vidéo convertie : ${formatBytes(finalSize)} (original ${formatBytes(data.file.bytes)})`);
+            } catch (convErr) {
+                logger.error(`Échec conversion, conservation originale : ${convErr.message}`);
+                await fs.move(tempPath, targetPath, { overwrite: true });
+                const stats = await fs.stat(targetPath);
+                finalSize = stats.size;
+            }
+        } else {
+            // Fichier non-vidéo : déplacer et obtenir la taille
+            await fs.move(tempPath, targetPath, { overwrite: true });
+            const stats = await fs.stat(targetPath);
+            finalSize = stats.size;
+        }
+
+        const insertResult = await query(
+            `INSERT INTO storage_files
+             (space_id, filename, original_filename, file_path, file_size, mime_type, uploaded_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id`,
+            [spaceId, storedFilename, data.filename, targetPath, finalSize, finalMimeType, req.user.id]
+        );
+        const fileId = insertResult.rows[0].id;
+
+        const publicToken = uuidv4().replace(/-/g, '');
+        const baseUrl = process.env.APP_URL || process.env.STORAGE_DOMAIN || 'https://numericexport.cloud';
+        const safeFilename = encodeURIComponent(data.filename || 'document');
+        const publicUrl = `${baseUrl}/api/v1/storage/s/${publicToken}/${safeFilename}`;
+
+        await query(
+            `UPDATE storage_files SET public_token = $1, public_url = $2 WHERE id = $3`,
+            [publicToken, publicUrl, fileId]
+        );
+
+        await query(
+            `UPDATE storage_spaces
+             SET current_usage_bytes = current_usage_bytes + $1,
+                 last_activity = now(),
+                 updated_at = now()
+             WHERE id = $2`,
+            [finalSize, spaceId]
+        );
+
+        logger.info(`Fichier uploadé: ${storedFilename} (${formatBytes(finalSize)}) pour espace ${spaceId}`);
+
+        return reply.send({
+            success: true,
+            message: "Fichier sauvegardé avec succès",
+            filename: storedFilename,
+            originalName: data.filename,
+            size: finalSize,
+            sizeFormatted: formatBytes(finalSize),
+            publicUrl: publicUrl,
+            converted: isVideo && finalMimeType === 'video/mp4'
+        });
+
+    } catch (err) {
+        logger.error('Erreur upload:', err);
+        return reply.status(500).send({ success: false, message: "Erreur serveur lors de l'upload" });
+    }
+}
+
+async function downloadFileHandler(req, reply) {
+    try {
+        const { spaceId, filename } = req.params;
+        
+        // Vérifier accès
+        const status = await getSpaceStatus(spaceId);
+        if (!status.exists) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Espace introuvable" 
+            });
+        }
+        
+        if (!status.isActive && !status.isInGracePeriod) {
+            return reply.status(403).send({ 
+                success: false, 
+                message: "Accès non autorisé" 
+            });
+        }
+
+/*        const filePath = path.join(STORAGE_PATH, spaceId, filename);
+        
+        if (!await fs.pathExists(filePath)) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Fichier non trouvé" 
+            });
+        }
+
+        // Mettre à jour les statistiques de téléchargement
+        await query(
+            `UPDATE storage_files 
+             SET download_count = download_count + 1, 
+                 last_downloaded = now() 
+             WHERE space_id = $1 AND filename = $2`,
+            [spaceId, filename]
+        );
+
+        // Envoyer le fichier
+        return reply.sendFile(filename, path.join(STORAGE_PATH, spaceId));
+        
+    } catch (err) {
+        logger.error('Erreur download:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors du téléchargement" 
+        });
+    }
+}*/
+
+const filePath = path.join(STORAGE_PATH, spaceId, filename);
+
+        if (!await fs.pathExists(filePath)) {
+            return reply.status(404).send({
+                success: false,
+                message: "Fichier non trouvé"
+            });
+        }
+
+        // Mise à jour des statistiques
+        await query(
+            `UPDATE storage_files
+             SET download_count = download_count + 1,
+                 last_downloaded = now()
+             WHERE space_id = $1 AND filename = $2`,
+            [spaceId, filename]
+        );
+
+        // Récupérer le MIME depuis la base (ou fallback)
+        const fileRes = await query(
+            `SELECT mime_type, original_filename FROM storage_files
+             WHERE space_id = $1 AND filename = $2 AND is_deleted = false`,
+            [spaceId, filename]
+        );
+        const mimeType = fileRes.rowCount > 0 ? fileRes.rows[0].mime_type : 'application/octet-stream';
+        const originalName = fileRes.rowCount > 0 ? fileRes.rows[0].original_filename : filename;
+
+        // Headers
+        reply.header('Content-Type', mimeType);
+        reply.header('Content-Disposition', `inline; filename="${encodeURIComponent(originalName)}"`);
+        reply.header('Cache-Control', 'public, max-age=86400');
+
+        // Envoyer le fichier en stream
+        const stream = fs.createReadStream(filePath);
+        return reply.send(stream);
+
+    } catch (err) {
+        logger.error('Erreur download:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors du téléchargement"
+        });
+    }
+}
+
+async function deleteFileHandler(req, reply) {
+    try {
+        const { spaceId, filename } = req.params;
+        
+        const status = await getSpaceStatus(spaceId);
+        if (!status.exists) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Espace introuvable" 
+            });
+        }
+        
+        if (!status.isActive) {
+            return reply.status(403).send({ 
+                success: false, 
+                message: "Action non autorisée sur cet espace" 
+            });
+        }
+
+        const filePath = path.join(STORAGE_PATH, spaceId, filename);
+        
+        if (!await fs.pathExists(filePath)) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Fichier introuvable" 
+            });
+        }
+
+        // Obtenir taille avant suppression
+        const stats = await fs.stat(filePath);
+        
+        // Supprimer le fichier
+        await fs.remove(filePath);
+        
+        // Mettre à jour la base de données
+        await query(
+            `UPDATE storage_files 
+             SET is_deleted = true, deleted_at = now() 
+             WHERE space_id = $1 AND filename = $2`,
+            [spaceId, filename]
+        );
+
+        // Réduire l'utilisation
+        await query(
+            `UPDATE storage_spaces 
+             SET current_usage_bytes = current_usage_bytes - $1,
+                 updated_at = now()
+             WHERE id = $2`,
+            [stats.size, spaceId]
+        );
+
+        logger.info(`Fichier supprimé: ${filename} de l'espace ${spaceId}`);
+
+        return reply.send({ 
+            success: true, 
+            message: "Fichier supprimé avec succès" 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur suppression:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors de la suppression" 
+        });
+    }
+}
+
+async function getClientDefaultStorageHandler(req, reply) {
+    try {
+        console.log('========== getClientDefaultStorageHandler CALLED ==========');
+        console.log('User from token:', req.user);
+        
+        const clientId = req.user?.id;
+        console.log('Client ID:', clientId);
+        console.log('HEADERS reçus dans getClientDefaultStorageHandler :', req.headers);
+console.log('req.user :', req.user);
+        
+        if (!clientId) {
+            console.log('❌ Pas de client ID dans le token');
+            return reply.status(401).send({
+                success: false,
+                message: "Non authentifié"
+            });
+        }
+        
+        // Récupérer l'espace de stockage actif du client
+        // IMPORTANT: Filtrer sur is_active = true ET deleted_at IS NULL
+        const result = await query(
+            `SELECT s.*, o.offer_id, o.period_months
+             FROM storage_spaces s
+             LEFT JOIN storage_orders o ON s.order_id = o.id
+             WHERE s.client_id = $1 
+               AND s.deleted_at IS NULL
+               AND s.is_active = true
+             ORDER BY s.created_at DESC
+             LIMIT 1`,
+            [clientId]
+        );
+
+        console.log('Résultat requête:', result.rowCount, 'lignes');
+
+        if (result.rowCount === 0) {
+            console.log('❌ Aucun espace actif trouvé pour le client:', clientId);
+            
+            // Option: retourner quand même le dernier espace même s'il est inactif
+            const lastSpace = await query(
+                `SELECT s.*, o.offer_id, o.period_months
+                 FROM storage_spaces s
+                 LEFT JOIN storage_orders o ON s.order_id = o.id
+                 WHERE s.client_id = $1 AND s.deleted_at IS NULL
+                 ORDER BY s.created_at DESC
+                 LIMIT 1`,
+                [clientId]
+            );
+            
+            if (lastSpace.rowCount > 0) {
+                const space = lastSpace.rows[0];
+                console.log('⚠️ Espace trouvé mais inactif:', space.id, 'is_active:', space.is_active);
+                
+                // Retourner l'espace avec un statut inactif
+                const folderPath = path.join(STORAGE_PATH, space.id);
+                const currentSize = await getFolderSize(folderPath).catch(() => 0);
+                const totalBytes = parseInt(space.size_limit_bytes);
+                const usagePercentage = totalBytes > 0 ? (currentSize / totalBytes) * 100 : 0;
+                const now = new Date();
+                const isExpired = space.expires_at ? new Date(space.expires_at) < now : false;
+                
+                return reply.send({
+                    success: true,
+                    id: space.id,
+                    client_id: space.client_id,
+                    size_limit_bytes: totalBytes,
+                    size_limit_formatted: formatBytes(totalBytes),
+                    current_usage_bytes: currentSize,
+                    current_usage_formatted: formatBytes(currentSize),
+                    usage_percentage: usagePercentage,
+                    is_active: space.is_active && !isExpired && !space.is_blocked,
+                    is_expired: isExpired,
+                    is_blocked: space.is_blocked,
+                    expires_at: space.expires_at,
+                    created_at: space.created_at,
+                    offer_id: space.offer_id,
+                    period_months: space.period_months
+                });
+            }
+            
+            return reply.status(404).send({
+                success: false,
+                message: "Aucun espace de stockage trouvé pour ce client"
+            });
+        }
+
+        const space = result.rows[0];
+        console.log('✅ Espace actif trouvé:', space.id);
+        
+        // Calculer l'utilisation
+        const folderPath = path.join(STORAGE_PATH, space.id);
+        const currentSize = await getFolderSize(folderPath).catch(() => 0);
+        const totalBytes = parseInt(space.size_limit_bytes);
+        const usagePercentage = totalBytes > 0 ? (currentSize / totalBytes) * 100 : 0;
+        const now = new Date();
+        const isExpired = space.expires_at ? new Date(space.expires_at) < now : false;
+        
+        const response = {
+            success: true,
+            id: space.id,
+            client_id: space.client_id,
+            size_limit_bytes: totalBytes,
+            size_limit_formatted: formatBytes(totalBytes),
+            current_usage_bytes: currentSize,
+            current_usage_formatted: formatBytes(currentSize),
+            usage_percentage: usagePercentage,
+            is_active: space.is_active && !isExpired && !space.is_blocked,
+            is_expired: isExpired,
+            is_blocked: space.is_blocked,
+            expires_at: space.expires_at,
+            created_at: space.created_at,
+            offer_id: space.offer_id,
+            period_months: space.period_months
+        };
+        
+        console.log('✅ Réponse préparée avec succès');
+        return reply.send(response);
+        
+    } catch (err) {
+        console.error('❌ ERREUR dans getClientDefaultStorageHandler:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors de la récupération de l'espace de stockage"
+        });
+    }
+}
+
+async function getStorageDetailHandler(req, reply) {
+    try {
+        const { spaceId } = req.params;
+        const status = await getSpaceStatus(spaceId);
+        
+        if (!status.exists) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Espace introuvable" 
+            });
+        }
+
+        // Lister les fichiers
+        const folderPath = path.join(STORAGE_PATH, spaceId);
+        let files = [];
+        
+        if (await fs.pathExists(folderPath)) {
+            const fileNames = await fs.readdir(folderPath);
+            
+            // Récupérer les infos depuis la base de données
+            const dbFiles = await query(
+                `SELECT *, public_token FROM storage_files 
+                 WHERE space_id = $1 AND is_deleted = false 
+                 ORDER BY uploaded_at DESC`,
+                [spaceId]
+            );
+
+            files = await Promise.all(fileNames.map(async (name) => {
+    const filePath = path.join(folderPath, name);
+    try {
+        const stats = await fs.stat(filePath);
+        const dbFile = dbFiles.rows.find(f => f.filename === name);
+        
+        const baseUrl = process.env.APP_URL || process.env.STORAGE_DOMAIN || 'https://numericexport.cloud';
+        const publicUrl = dbFile?.public_token 
+            ? `${baseUrl}/s/${dbFile.public_token}/${encodeURIComponent(dbFile.original_filename || name)}`
+            : null;
+
+        return {
+            name,
+            size: stats.size,
+            sizeFormatted: formatBytes(stats.size),
+            modified: stats.mtime,
+            created: stats.birthtime,
+            uploadedAt: dbFile?.uploaded_at,
+            downloadCount: dbFile?.download_count || 0,
+            mimeType: dbFile?.mime_type,
+            publicToken: dbFile?.public_token,
+            publicUrl: dbFile?.public_url || null
+        };
+    } catch (e) {
+        return null;
+    }
+}));
+            
+            files = files.filter(f => f !== null);
+        }
+
+        return reply.send({
+            success: true,
+            space: {
+                id: spaceId,
+                clientName: status.clientName,
+                clientEmail: status.clientEmail,
+                isActive: status.isActive,
+                isExpired: status.isExpired,
+                isBlocked: status.isBlocked,
+                expiresAt: status.expiresAt,
+                limit: status.limit,
+                limitFormatted: formatBytes(status.limit),
+                used: status.used,
+                usedFormatted: formatBytes(status.used),
+                usagePercentage: status.usagePercentage,
+                free: status.limit - status.used,
+                freeFormatted: formatBytes(status.limit - status.used)
+            },
+            files,
+            fileCount: files.length
+        });
+        
+    } catch (err) {
+        logger.error('Erreur détails espace:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur serveur" 
+        });
+    }
+}
+
+// ==================== ADMIN ROUTES ====================
+
+async function getAllStorageSpacesHandler(req, reply) {
+    try {
+        const res = await query(
+            `SELECT s.*, c.company_name, c.email as client_email, 
+                    o.order_number, o.invoice_number, o.amount_fcfa
+             FROM storage_spaces s
+             LEFT JOIN clients c ON s.client_id = c.id
+             LEFT JOIN storage_orders o ON s.order_id = o.id
+             WHERE s.deleted_at IS NULL
+             ORDER BY s.created_at DESC`
+        );
+
+        // Ajouter l'utilisation actuelle pour chaque espace
+        const spaces = await Promise.all(res.rows.map(async (space) => {
+            const folderPath = path.join(STORAGE_PATH, space.id);
+            const currentUsage = await getFolderSize(folderPath);
+            
+            return {
+                ...space,
+                current_usage_bytes: currentUsage,
+                usage_percentage: (currentUsage / space.size_limit_bytes) * 100,
+                is_expired: space.expires_at ? new Date(space.expires_at) < new Date() : false
+            };
+        }));
+
+        return reply.send({ 
+            success: true, 
+            spaces 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur liste espaces:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors du chargement" 
+        });
+    }
+}
+
+async function updateStorageSizeHandler(req, reply) {
+    const { spaceId } = req.params;
+    const { size_gb } = req.body;
+    
+    if (!size_gb || size_gb < 1) {
+        return reply.status(400).send({ 
+            success: false, 
+            message: "Taille invalide" 
+        });
+    }
+
+    try {
+        const bytes = parseInt(size_gb) * 1024 * 1024 * 1024;
+        
+        await query(
+            `UPDATE storage_spaces 
+             SET size_limit_bytes = $1, 
+                 updated_at = now() 
+             WHERE id = $2`,
+            [bytes, spaceId]
+        );
+
+        logger.info(`Quota modifié pour ${spaceId}: ${size_gb} Go`);
+
+        return reply.send({ 
+            success: true, 
+            message: "Quota mis à jour avec succès" 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur update size:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors de la mise à jour" 
+        });
+    }
+}
+
+async function updateExpirationHandler(req, reply) {
+    const { spaceId } = req.params;
+    const { expires_at } = req.body;
+    
+    try {
+        await query(
+            `UPDATE storage_spaces 
+             SET expires_at = $1, 
+                 updated_at = now() 
+             WHERE id = $2`,
+            [expires_at, spaceId]
+        );
+
+        return reply.send({ 
+            success: true, 
+            message: "Date d'expiration mise à jour" 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur update expiration:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors de la mise à jour" 
+        });
+    }
+}
+
+async function renewStorageSpaceHandler(req, reply) {
+    const { spaceId } = req.params;
+    const { months = 12, auto_generate_invoice = true } = req.body;
+    const adminId = req.user.id;
+
+    try {
+        const check = await query(
+            'SELECT expires_at, client_id, size_limit_bytes FROM storage_spaces WHERE id = $1',
+            [spaceId]
+        );
+
+        if (check.rowCount === 0) {
+            return reply.status(404).send({
+                success: false,
+                message: "Espace introuvable"
+            });
+        }
+
+        const current = check.rows[0].expires_at;
+        const clientId = check.rows[0].client_id;
+
+        // Date de début (aujourd'hui ou date d'expiration si future)
+        const start = (current && new Date(current) > new Date()) ? new Date(current) : new Date();
+        const newDate = new Date(start);
+        newDate.setMonth(newDate.getMonth() + parseInt(months));
+
+        // Désactiver la suppression programmée si elle existait
+        await query(
+            `UPDATE storage_spaces
+             SET expires_at = $1,
+                 is_active = true,
+                 is_blocked = false,
+                 deleted_at = NULL,
+                 updated_at = now()
+             WHERE id = $2`,
+            [newDate, spaceId]
+        );
+
+        // Générer une facture si demandé
+        let invoice = null;
+        if (auto_generate_invoice && clientId) {
+            // Récupérer l'offre associée ou calculer le prix
+            const orderRes = await query(
+                'SELECT * FROM storage_orders WHERE space_id = $1 ORDER BY created_at DESC LIMIT 1',
+                [spaceId]
+            );
+
+            let amount = 0;
+            let offerId = null;
+
+            if (orderRes.rowCount > 0) {
+                amount = orderRes.rows[0].amount_fcfa;
+                offerId = orderRes.rows[0].offer_id;
+            } else {
+                // Prix par défaut (50 Go = 15000 FCFA/mois)
+                amount = Math.round(check.rows[0].size_limit_bytes / (1024 * 1024 * 1024)) * 3000 * months;
+            }
+
+            // Vérifier s'il existe déjà une commande pour cet espace
+            if (orderRes.rowCount > 0) {
+                // Mettre à jour la commande existante
+                const orderNumber = `REN-${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(Math.floor(Math.random() * 10000)).padStart(4, '0')}`;
+                
+                const invoiceHtml = await invoiceService.generateInvoice({
+                    orderNumber,
+                    clientId,
+                    amount,
+                    months,
+                    date: new Date(),
+                    type: 'renewal',
+                    spaceId
+                });
+
+                await query(
+                    `UPDATE storage_orders
+                     SET amount_fcfa = $1,
+                         period_months = $2,
+                         status = 'paid',
+                         validation_date = $3,
+                         validated_by = $4,
+                         invoice_html = $5,
+                         invoice_number = $6,
+                         updated_at = now()
+                     WHERE space_id = $7`,
+                    [
+                        amount, months, new Date(), adminId, 
+                        invoiceHtml, orderNumber, spaceId
+                    ]
+                );
+
+                invoice = {
+                    orderNumber,
+                    amount,
+                    invoiceHtml
+                };
+            } else {
+                // Créer une nouvelle commande uniquement s'il n'y en a pas
+                const orderId = uuidv4();
+                const orderNumber = `REN-${new Date().getFullYear()}${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(Math.floor(Math.random() * 10000)).padStart(4, '0')}`;
+
+                const invoiceHtml = await invoiceService.generateInvoice({
+                    orderNumber,
+                    clientId,
+                    amount,
+                    months,
+                    date: new Date(),
+                    type: 'renewal',
+                    spaceId
+                });
+
+                await query(
+                    `INSERT INTO storage_orders
+                     (id, client_id, offer_id, space_id, order_number, amount_fcfa,
+                      period_months, status, validation_date, validated_by, invoice_html, invoice_number)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $5)`,
+                    [
+                        orderId, clientId, offerId, spaceId, orderNumber, amount,
+                        months, 'paid', new Date(), adminId, invoiceHtml
+                    ]
+                );
+
+                invoice = {
+                    orderNumber,
+                    amount,
+                    invoiceHtml
+                };
+            }
+        }
+
+        logger.info(`Espace renouvelé: ${spaceId} (+${months} mois) jusqu'au ${newDate.toISOString()}`);
+
+        return reply.send({
+            success: true,
+            message: `Abonnement renouvelé jusqu'au ${newDate.toLocaleDateString('fr-FR')}`,
+            newExpiryDate: newDate,
+            invoice
+        });
+
+    } catch (err) {
+        logger.error('Erreur renouvellement:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors du renouvellement"
+        });
+    }
+}
+
+async function reassignStorageSpaceHandler(req, reply) {
+    const { spaceId } = req.params;
+    const { clientId } = req.body;
+
+    try {
+        const result = await query(
+            'UPDATE storage_spaces SET client_id = $1, updated_at = now() WHERE id = $2',
+            [clientId || null, spaceId]
+        );
+        
+        if (result.rowCount === 0) {
+            return reply.status(404).send({ 
+                success: false, 
+                message: "Espace introuvable" 
+            });
+        }
+
+        logger.info(`Espace réassigné: ${spaceId} -> client ${clientId || 'aucun'}`);
+
+        return reply.send({ 
+            success: true, 
+            message: clientId ? "Espace réassigné avec succès" : "Espace libéré avec succès" 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur reassign:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors de la réassignation" 
+        });
+    }
+}
+
+async function blockStorageSpaceHandler(req, reply) {
+    const { spaceId } = req.params;
+    const { reason } = req.body;
+
+    try {
+        if (!spaceId) {
+            return reply.status(400).send({
+                success: false,
+                message: "ID de l'espace requis"
+            });
+        }
+
+        // Vérifier l'existence
+        const spaceCheck = await query(
+            'SELECT id, is_blocked, deleted_at FROM storage_spaces WHERE id = $1',
+            [spaceId]
+        );
+
+        if (spaceCheck.rowCount === 0) {
+            return reply.status(404).send({
+                success: false,
+                message: "Espace introuvable"
+            });
+        }
+
+        const space = spaceCheck.rows[0];
+
+        // Vérifications
+        if (space.deleted_at) {
+            return reply.status(400).send({
+                success: false,
+                message: "Impossible de bloquer un espace supprimé"
+            });
+        }
+
+        if (space.is_blocked) {
+            return reply.status(400).send({
+                success: false,
+                message: "L'espace est déjà bloqué"
+            });
+        }
+
+        // Bloquer l'espace
+        const updateResult = await query(
+            `UPDATE storage_spaces
+             SET is_blocked = true,
+                 is_active = false,
+                 blocked_reason = $1,
+                 updated_at = now()
+             WHERE id = $2
+             RETURNING id`,
+            [reason || 'Bloqué par administrateur', spaceId]
+        );
+
+        if (updateResult.rowCount === 0) {
+            return reply.status(500).send({
+                success: false,
+                message: "Échec du blocage de l'espace"
+            });
+        }
+
+        // Journaliser
+        try {
+            await query(
+                `INSERT INTO system_logs (event_type, description, user_id, metadata)
+                 VALUES ($1, $2, $3, $4)`,
+                [
+                    'storage_space_blocked',
+                    `Espace ${spaceId} bloqué`,
+                    req.user.id,
+                    JSON.stringify({ space_id: spaceId, reason: reason || 'Non spécifié' })
+                ]
+            );
+        } catch (logErr) {
+            logger.warn('Erreur journalisation blocage:', logErr.message);
+        }
+
+        logger.info(`Espace bloqué: ${spaceId} par admin ${req.user.id}`);
+
+        return reply.send({
+            success: true,
+            message: "Espace bloqué avec succès"
+        });
+
+    } catch (err) {
+        logger.error('Erreur blocage:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors du blocage: " + err.message
+        });
+    }
+}
+
+async function activateStorageSpaceHandler(req, reply) {
+    const { spaceId } = req.params;
+
+    try {
+        if (!spaceId) {
+            return reply.status(400).send({
+                success: false,
+                message: "ID de l'espace requis"
+            });
+        }
+
+        // Vérifier que l'espace existe
+        const spaceCheck = await query(
+            'SELECT id, is_blocked, is_active, deleted_at FROM storage_spaces WHERE id = $1',
+            [spaceId]
+        );
+
+        if (spaceCheck.rowCount === 0) {
+            return reply.status(404).send({
+                success: false,
+                message: "Espace introuvable"
+            });
+        }
+
+        const space = spaceCheck.rows[0];
+
+        if (space.deleted_at) {
+            return reply.status(400).send({
+                success: false,
+                message: "Impossible d'activer un espace supprimé"
+            });
+        }
+
+        // Activer l'espace
+        await query(
+            `UPDATE storage_spaces
+             SET is_blocked = false,
+                 is_active = true,
+                 blocked_reason = NULL,
+                 updated_at = now()
+             WHERE id = $1`,
+            [spaceId]
+        );
+
+        logger.info(`Espace activé: ${spaceId}`);
+
+        return reply.send({
+            success: true,
+            message: "Espace activé avec succès"
+        });
+
+    } catch (err) {
+        logger.error('Erreur activation:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors de l'activation"
+        });
+    }
+}
+
+
+async function getSpaceFilesHandler(req, reply) {
+    const { spaceId } = req.params;
+
+    try {
+        const files = await query(
+            `SELECT * FROM storage_files 
+             WHERE space_id = $1 AND is_deleted = false 
+             ORDER BY uploaded_at DESC`,
+            [spaceId]
+        );
+
+        return reply.send({ 
+            success: true, 
+            files: files.rows 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur get files:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors du chargement" 
+        });
+    }
+}
+
+async function getClientsListHandler(req, reply) {
+    try {
+        const clients = await query(
+            `SELECT id, company_name, email, phone, created_at 
+             FROM clients 
+             ORDER BY company_name`
+        );
+
+        return reply.send({ 
+            success: true, 
+            clients: clients.rows 
+        });
+        
+    } catch (err) {
+        logger.error('Erreur clients list:', err);
+        return reply.status(500).send({ 
+            success: false, 
+            message: "Erreur lors du chargement" 
+        });
+    }
+}
+
+// ==================== NOUVEAUX HANDLERS POUR ADMIN.ROUTES.JS ====================
+
+/**
+ * Créer un espace de stockage manuellement (admin)
+ */
+async function createStorageSpaceHandler(req, reply) {
+    try {
+        const { client_id, size_gb, expires_at, offer_id } = req.body;
+        const adminId = req.user.id;
+
+        if (!client_id || !size_gb) {
+            return reply.code(400).send({
+                success: false,
+                message: "client_id et size_gb sont requis"
+            });
+        }
+
+        // Vérifier que le client existe
+        const clientCheck = await query('SELECT id FROM clients WHERE id = $1', [client_id]);
+        if (clientCheck.rows.length === 0) {
+            return reply.code(404).send({
+                success: false,
+                message: "Client non trouvé"
+            });
+        }
+
+        const spaceId = uuidv4();
+        const sizeBytes = size_gb * 1024 * 1024 * 1024;
+        const expiryDate = expires_at ? new Date(expires_at) : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+
+        await query(
+            `INSERT INTO storage_spaces
+             (id, client_id, size_limit_bytes, expires_at, created_by, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [spaceId, client_id, sizeBytes, expiryDate, adminId, true]
+        );
+
+        // Créer le dossier physique
+        const spaceFolder = path.join(STORAGE_PATH, spaceId);
+        await fs.ensureDir(spaceFolder);
+
+        logger.info(`Espace créé manuellement: ${spaceId} pour client ${client_id}`);
+
+        return reply.send({
+            success: true,
+            message: "Espace de stockage créé avec succès",
+            space_id: spaceId
+        });
+
+    } catch (err) {
+        logger.error('Erreur création espace:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur serveur lors de la création'
+        });
+    }
+}
+
+/**
+ * Supprimer un espace de stockage (soft delete)
+ */
+async function deleteStorageSpaceHandler(req, reply) {
+    try {
+        const { spaceId } = req.params;
+
+        if (!spaceId) {
+            return reply.code(400).send({
+                success: false,
+                message: "ID de l'espace requis"
+            });
+        }
+
+        // Vérifier que l'espace existe
+        const spaceRes = await query('SELECT id FROM storage_spaces WHERE id = $1', [spaceId]);
+        if (spaceRes.rows.length === 0) {
+            return reply.code(404).send({
+                success: false,
+                message: "Espace non trouvé"
+            });
+        }
+
+        // Soft delete
+        await query(
+            `UPDATE storage_spaces
+             SET is_active = false,
+                 deleted_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [spaceId]
+        );
+
+        logger.info(`Espace supprimé: ${spaceId}`);
+
+        return reply.send({
+            success: true,
+            message: "Espace supprimé avec succès"
+        });
+
+    } catch (err) {
+        logger.error('Erreur suppression:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur lors de la suppression'
+        });
+    }
+}
+
+
+/**
+ * Récupérer toutes les offres de stockage
+ */
+async function getAllOffersHandler(req, reply) {
+    try {
+        const offers = await query(
+            'SELECT * FROM storage_offers ORDER BY storage_gb ASC'
+        );
+
+        return reply.send({
+            success: true,
+            offers: offers.rows
+        });
+
+    } catch (err) {
+        logger.error('Erreur récupération offres:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur serveur'
+        });
+    }
+}
+
+/**
+ * Créer une nouvelle offre
+ */
+async function createOfferHandler(req, reply) {
+    try {
+        const {
+            name, description, storage_gb, price_fcfa, price_year_fcfa,
+            discount_percentage, features, popular, max_file_size_mb,
+            concurrent_uploads, retention_days, is_active
+        } = req.body;
+
+        if (!name || !storage_gb || !price_fcfa) {
+            return reply.code(400).send({
+                success: false,
+                message: "name, storage_gb et price_fcfa requis"
+            });
+        }
+
+        const offerId = uuidv4();
+
+        await query(
+            `INSERT INTO storage_offers
+             (id, name, description, storage_gb, price_fcfa, price_year_fcfa,
+              discount_percentage, features, popular, max_file_size_mb,
+              concurrent_uploads, retention_days, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+            [
+                offerId, name, description, storage_gb, price_fcfa, price_year_fcfa || price_fcfa * 12,
+                discount_percentage || 0, JSON.stringify(features || []), popular || false,
+                max_file_size_mb || 500, concurrent_uploads || 3, retention_days || 7, is_active !== false
+            ]
+        );
+
+        return reply.send({
+            success: true,
+            message: "Offre créée avec succès",
+            offer_id: offerId
+        });
+
+    } catch (err) {
+        logger.error('Erreur création offre:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur serveur'
+        });
+    }
+}
+
+/**
+ * Mettre à jour une offre
+ */
+async function updateOfferHandler(req, reply) {
+    try {
+        const { offerId } = req.params;
+        const updates = req.body;
+
+        const setClauses = [];
+        const values = [];
+        let paramIndex = 1;
+
+        for (const [key, value] of Object.entries(updates)) {
+            if (value !== undefined) {
+                setClauses.push(`${key} = $${paramIndex}`);
+                values.push(key === 'features' ? JSON.stringify(value) : value);
+                paramIndex++;
+            }
+        }
+
+        if (setClauses.length === 0) {
+            return reply.code(400).send({
+                success: false,
+                message: "Aucune donnée à mettre à jour"
+            });
+        }
+
+        values.push(offerId);
+        await query(
+            `UPDATE storage_offers SET ${setClauses.join(', ')}, updated_at = NOW() WHERE id = $${paramIndex}`,
+            values
+        );
+
+        return reply.send({
+            success: true,
+            message: "Offre mise à jour avec succès"
+        });
+
+    } catch (err) {
+        logger.error('Erreur modification offre:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur serveur'
+        });
+    }
+}
+
+async function getPublicFileHandler(req, reply) {
+  try {
+    const { token } = req.params;
+    logger.info(`[PUBLIC SHORT] Token demandé : ${token}`);
+
+    const fileRes = await query(
+      `SELECT f.*, s.id as space_id
+       FROM storage_files f
+       JOIN storage_spaces s ON f.space_id = s.id
+       WHERE f.public_token = $1 AND f.is_deleted = false`,
+      [token]
+    );
+
+    if (fileRes.rowCount === 0) {
+      logger.warn(`[PUBLIC] Token invalide : ${token}`);
+      return reply.status(404).send({ success: false, message: "Fichier non trouvé" });
+    }
+
+    const file = fileRes.rows[0];
+    const filePath = path.join(STORAGE_PATH, file.space_id, file.filename);
+
+    if (!await fs.pathExists(filePath)) {
+      logger.error(`[PUBLIC] Fichier manquant sur disque : ${filePath}`);
+      return reply.status(404).send({ success: false, message: "Fichier non trouvé sur le serveur" });
+    }
+
+    // Incrémenter compteur
+    await query(`UPDATE storage_files SET public_downloads = public_downloads + 1 WHERE id = $1`, [file.id]);
+
+    const mimeType = file.mime_type || 'application/octet-stream';
+
+    reply.header('Content-Type', mimeType);
+    reply.header('Content-Disposition', `inline; filename="${encodeURIComponent(file.original_filename || file.filename)}"`);
+    reply.header('Cache-Control', 'public, max-age=86400');
+
+    return reply.send(fs.createReadStream(filePath));
+
+  } catch (err) {
+    logger.error('[PUBLIC] Erreur:', err);
+    return reply.status(500).send({ success: false, message: "Erreur serveur" });
+  }
+}
+
+
+/**
+ * Supprime tous les fichiers d'un espace de stockage (soft delete + suppression physique)
+ */
+async function deleteAllFilesHandler(req, reply) {
+    try {
+        const { spaceId } = req.params;
+        logger.info(`[deleteAllFilesHandler] Appelé pour spaceId: ${spaceId}`);
+        // Vérifier l'accès (même que pour un fichier individuel)
+        const status = await getSpaceStatus(spaceId);
+        if (!status.exists) {
+            return reply.status(404).send({
+                success: false,
+                message: "Espace introuvable"
+            });
+        }
+        if (!status.isActive && !status.isInGracePeriod) {
+            return reply.status(403).send({
+                success: false,
+                message: "Action non autorisée sur cet espace"
+            });
+        }
+
+        const folderPath = path.join(STORAGE_PATH, spaceId);
+        if (!await fs.pathExists(folderPath)) {
+            return reply.status(404).send({
+                success: false,
+                message: "Dossier de l'espace introuvable"
+            });
+        }
+
+        // Récupérer la liste des fichiers (pour mettre à jour la base)
+        const files = await query(
+            `SELECT filename, file_size FROM storage_files
+             WHERE space_id = $1 AND is_deleted = false`,
+            [spaceId]
+        );
+
+        if (files.rowCount === 0) {
+            return reply.send({
+                success: true,
+                message: "Aucun fichier à supprimer",
+                deletedCount: 0
+            });
+        }
+
+        // Calculer la taille totale à libérer
+        const totalSize = files.rows.reduce((sum, f) => sum + parseInt(f.file_size), 0);
+
+        // Supprimer physiquement tous les fichiers du dossier
+        const fileNames = files.rows.map(f => f.filename);
+        for (const name of fileNames) {
+            const filePath = path.join(folderPath, name);
+            if (await fs.pathExists(filePath)) {
+                await fs.remove(filePath);
+            }
+        }
+
+        // Mettre à jour la base (soft delete)
+        await query(
+            `UPDATE storage_files
+             SET is_deleted = true, deleted_at = now()
+             WHERE space_id = $1 AND is_deleted = false`,
+            [spaceId]
+        );
+
+        // Réduire l'utilisation de l'espace
+        await query(
+            `UPDATE storage_spaces
+             SET current_usage_bytes = current_usage_bytes - $1,
+                 updated_at = now()
+             WHERE id = $2`,
+            [totalSize, spaceId]
+        );
+
+        logger.info(`Tous les fichiers supprimés de l'espace ${spaceId} (${files.rowCount} fichiers, ${totalSize} octets)`);
+
+        return reply.send({
+            success: true,
+            message: `Tous les fichiers ont été supprimés (${files.rowCount} fichiers)`,
+            deletedCount: files.rowCount,
+            freedSpace: totalSize,
+            freedSpaceFormatted: formatBytes(totalSize)
+        });
+
+    } catch (err) {
+        logger.error('Erreur suppression massive:', err);
+        return reply.status(500).send({
+            success: false,
+            message: "Erreur lors de la suppression des fichiers"
+        });
+    }
+}
+
+
+/**
+ * Supprimer une offre
+ */
+async function deleteOfferHandler(req, reply) {
+    try {
+        const { offerId } = req.params;
+
+        // Vérifier si l'offre est utilisée
+        const usageCheck = await query(
+            'SELECT COUNT(*) FROM storage_orders WHERE offer_id = $1',
+            [offerId]
+        );
+
+        if (parseInt(usageCheck.rows[0].count) > 0) {
+            // Soft delete
+            await query(
+                'UPDATE storage_offers SET is_active = false, updated_at = NOW() WHERE id = $1',
+                [offerId]
+            );
+            return reply.send({
+                success: true,
+                message: "Offre désactivée (elle était utilisée dans des commandes)"
+            });
+        } else {
+            // Hard delete
+            await query('DELETE FROM storage_offers WHERE id = $1', [offerId]);
+            return reply.send({
+                success: true,
+                message: "Offre supprimée définitivement"
+            });
+        }
+
+    } catch (err) {
+        logger.error('Erreur suppression offre:', err);
+        return reply.code(500).send({
+            success: false,
+            message: 'Erreur serveur'
+        });
+    }
+}
+
+// Mise à jour du module.exports pour inclure les nouveaux handlers
+module.exports = {
+    // Client routes
+    uploadFileHandler,
+    downloadFileHandler,
+    deleteFileHandler,
+    getStorageDetailHandler,
+    getClientDefaultStorageHandler,
+
+    // Admin routes (existants)
+    getAllStorageSpacesHandler,
+    updateStorageSizeHandler,
+    updateExpirationHandler,
+    renewStorageSpaceHandler,
+    reassignStorageSpaceHandler,
+    blockStorageSpaceHandler,
+    activateStorageSpaceHandler,
+    getSpaceFilesHandler,
+    getClientsListHandler,
+
+    // NOUVEAUX HANDLERS
+    createStorageSpaceHandler,
+    deleteStorageSpaceHandler,
+    getAllOffersHandler,
+    createOfferHandler,
+    updateOfferHandler,
+    deleteOfferHandler,
+    deleteAllFilesHandler, 
+   getPublicFileHandler
+};

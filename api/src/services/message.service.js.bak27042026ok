@@ -1,0 +1,720 @@
+// src/services/message.service.js
+const { query } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { validatePhoneNumber } = require('./whatsapp.service');
+const { addMessageToQueue } = require('./queue.service');
+const logger = require('../utils/logger');
+const watiService = require('./wati.service');
+
+// Configuration du cooldown (2 semaines)
+const COOLDOWN_DAYS = 14;
+const ENABLE_COOLDOWN = true;
+
+/**
+ * Vérifier si un destinataire peut recevoir un message (cooldown 2 semaines)
+ */
+async function canSendToRecipient(recipientPhone, clientId) {
+  if (!ENABLE_COOLDOWN) {
+    return { canSend: true };
+  }
+
+  try {
+    // Vérifier le dernier message envoyé à ce destinataire pour ce client
+    const result = await query(
+      `SELECT
+         MAX(created_at) as last_message_date,
+         COUNT(*) as message_count
+       FROM messages
+       WHERE recipient_phone = $1
+         AND client_id = $2
+         AND wa_status IN ('sent', 'delivered', 'read')
+       GROUP BY recipient_phone`,
+      [recipientPhone, clientId]
+    );
+
+    if (result.rows.length === 0) {
+      return { canSend: true, messageCount: 0 };
+    }
+
+    const lastMessageDate = new Date(result.rows[0].last_message_date);
+    const now = new Date();
+    const daysSinceLastMessage = (now - lastMessageDate) / (1000 * 60 * 60 * 24);
+
+    if (daysSinceLastMessage < COOLDOWN_DAYS) {
+      const remainingDays = Math.ceil(COOLDOWN_DAYS - daysSinceLastMessage);
+      return {
+        canSend: false,
+        remainingDays,
+        lastMessageDate,
+        reason: `Délai minimum de ${COOLDOWN_DAYS} jours requis. Encore ${remainingDays} jour(s) à attendre.`
+      };
+    }
+
+    return {
+      canSend: true,
+      messageCount: result.rows[0].message_count,
+      daysSinceLastMessage
+    };
+  } catch (error) {
+    logger.error('Erreur vérification cooldown:', error);
+    // En cas d'erreur, on autorise l'envoi pour ne pas bloquer
+    return { canSend: true, error: error.message };
+  }
+}
+
+/**
+ * Envoyer un message via WATI avec vérification du cooldown
+ */
+async function sendMessageViaWati(clientId, messageData) {
+  try {
+    const {
+      phoneNumber,
+      recipient_phone,
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type,
+      messageId,
+      invoice_data
+    } = messageData;
+
+    // 1. Vérifier le cooldown (2 semaines)
+    const cooldownCheck = await canSendToRecipient(recipient_phone, clientId);
+
+    if (!cooldownCheck.canSend) {
+      logger.warn('Message bloqué par cooldown:', {
+        recipient: recipient_phone,
+        reason: cooldownCheck.reason
+      });
+
+      // Mettre à jour le statut du message
+      await query(
+        `UPDATE messages
+         SET wa_status = 'failed',
+             wa_error_message = $1,
+             failed_at = NOW()
+         WHERE id = $2`,
+        [cooldownCheck.reason, messageId]
+      );
+
+      // Mettre à jour dans la table client
+      const clientTableName = `messages_client_${clientId.replace(/-/g, '_')}`;
+      await query(
+        `UPDATE ${clientTableName}
+         SET wa_status = 'failed',
+             wa_error_message = $1,
+             failed_at = NOW()
+         WHERE id = $2`,
+        [cooldownCheck.reason, messageId]
+      );
+
+      throw {
+        statusCode: 429,
+        code: 'COOLDOWN_ACTIVE',
+        message: cooldownCheck.reason,
+        remainingDays: cooldownCheck.remainingDays
+      };
+    }
+
+    let result;
+    let channelUsed = 'wati';
+
+    // 2. Envoyer selon le type de message
+    switch (message_type) {
+      case 'template':
+        // Cas spécial: facture avec PDF
+        if (invoice_data && invoice_data.pdfUrl) {
+          result = await watiService.sendInvoiceWithPDF(recipient_phone, invoice_data);
+        } else {
+          result = await watiService.sendTemplateMessage(
+            recipient_phone,
+            template_name,
+            template_params,
+            template_language
+          );
+        }
+        break;
+
+      case 'text':
+        result = await watiService.sendTextMessage(recipient_phone, message_content);
+        break;
+
+      case 'media':
+        result = await watiService.sendMediaMessage(
+          recipient_phone,
+          media_url,
+          media_type,
+          message_content
+        );
+        break;
+
+      default:
+        throw {
+          statusCode: 400,
+          code: 'INVALID_MESSAGE_TYPE',
+          message: `Type de message non supporté: ${message_type}`
+        };
+    }
+
+    if (!result.success) {
+      throw {
+        statusCode: 500,
+        code: 'WATI_SEND_ERROR',
+        message: 'Erreur lors de l\'envoi via WATI'
+      };
+    }
+
+    // 3. Mettre à jour le message avec l'ID WATI
+    await query(
+      `UPDATE messages
+       SET wa_message_id = $1,
+           wa_status = $2,
+           channel_used = $3,
+           sent_at = NOW()
+       WHERE id = $4`,
+      [result.messageId, result.status, channelUsed, messageId]
+    );
+
+    // Mettre à jour dans la table client
+    const clientTableName = `messages_client_${clientId.replace(/-/g, '_')}`;
+    await query(
+      `UPDATE ${clientTableName}
+       SET wa_message_id = $1,
+           wa_status = $2,
+           sent_at = NOW()
+       WHERE id = $3`,
+      [result.messageId, result.status, messageId]
+    );
+
+    // Incrémenter les stats
+    await incrementClientStats(messageData.numberId || phoneNumber, clientId);
+
+    logger.info('Message envoyé via WATI:', {
+      messageId,
+      watiMessageId: result.messageId,
+      status: result.status,
+      cooldownInfo: cooldownCheck.daysSinceLastMessage
+    });
+
+    return {
+      success: true,
+      messageId: result.messageId,
+      status: result.status,
+      channel: channelUsed,
+      cooldownInfo: {
+        canSend: true,
+        daysSinceLastMessage: cooldownCheck.daysSinceLastMessage
+      }
+    };
+
+  } catch (error) {
+  logger.error('Erreur envoi via WATI:', error);
+
+  // Mettre à jour le statut d'erreur si messageId existe
+  if (messageData.messageId) {
+    // 1. Mettre à jour la table globale
+    await query(
+      `UPDATE messages
+       SET wa_status = 'failed',
+           wa_error_message = $1,
+           failed_at = NOW()
+       WHERE id = $2`,
+      [error.message || 'Erreur lors de l\'envoi', messageData.messageId]
+    );
+    
+    // 2. Mettre à jour la table du client
+    const clientTableName = `messages_client_${clientId.replace(/-/g, '_')}`;
+    await query(
+      `UPDATE ${clientTableName}
+       SET wa_status = 'failed',
+           wa_error_message = $1,
+           failed_at = NOW()
+       WHERE id = $2`,
+      [error.message || 'Erreur lors de l\'envoi', messageData.messageId]
+    );
+  }
+
+  throw error;
+}
+}
+
+/**
+ * Envoyer un message → insère dans la table personnelle du client ET dans la table globale admin
+ */
+async function sendMessage(clientId, messageData) {
+  try {
+    const {
+      phoneNumber,           // numéro WhatsApp émetteur
+      recipient_phone,
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type = 'image',
+      invoice_data,         // Pour les factures avec PDF
+      ...rest
+    } = messageData;
+
+    if (!phoneNumber) {
+      throw { statusCode: 400, code: 'PHONE_NUMBER_REQUIRED', message: 'Numéro émetteur requis' };
+    }
+
+    const cleanRecipient = validatePhoneNumber(recipient_phone);
+
+    // Vérifications quota / compte actif
+    const clientResult = await query(
+      `SELECT quota_remaining, is_active, trial_expires_at
+       FROM clients WHERE id = $1`,
+      [clientId]
+    );
+
+    if (clientResult.rows.length === 0) {
+      throw { statusCode: 404, code: 'CLIENT_NOT_FOUND', message: 'Client non trouvé' };
+    }
+
+    const client = clientResult.rows[0];
+
+    if (!client.is_active) {
+      throw { statusCode: 403, code: 'ACCOUNT_DISABLED', message: 'Compte désactivé' };
+    }
+
+    const trialExpired = client.trial_expires_at && new Date() > new Date(client.trial_expires_at);
+    if (trialExpired && client.quota_remaining <= 0) {
+      throw { statusCode: 403, code: 'TRIAL_EXPIRED', message: 'Période d\'essai expirée. Passez une commande.' };
+    }
+
+    if (client.quota_remaining <= 0) {
+      throw { statusCode: 403, code: 'INSUFFICIENT_QUOTA', message: 'Quota insuffisant. Passez une commande.' };
+    }
+
+    const messageId = uuidv4();
+
+    // Nom de la table personnelle du client
+    const clientTableName = `messages_client_${clientId.replace(/-/g, '_')}`;
+
+    // Données communes pour les deux insertions
+    const insertParams = [
+      messageId,
+      clientId,
+      cleanRecipient,
+      message_type,
+      template_name || null,
+      template_language || 'fr',
+      template_params ? JSON.stringify(template_params) : null,
+      message_content || null,
+      media_url || null,
+      'queued'
+    ];
+
+    // 1. Insertion dans la table globale (admin - partitionnée par mois)
+    await query(
+      `INSERT INTO messages (
+        id, client_id, recipient_phone, message_type,
+        template_name, template_language, template_params,
+        message_content, media_url, wa_status,
+        queued_at, channel
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), 'whatsapp')`,
+      insertParams
+    );
+
+    // 2. Insertion dans la table du client
+    await query(
+      `INSERT INTO ${clientTableName} (
+        id, recipient_phone, message_type,
+        template_name, template_language, template_params,
+        message_content, media_url, wa_status,
+        queued_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+      insertParams.slice(0, 1).concat(insertParams.slice(2))
+    );
+
+    // Décrémenter quota
+    await query(
+      'UPDATE clients SET quota_remaining = quota_remaining - 1 WHERE id = $1',
+      [clientId]
+    );
+
+    // Vérifier si on doit envoyer directement via WATI ou passer par la queue
+    const useWatiDirect = process.env.USE_WATI_DIRECT === 'true';
+
+    if (useWatiDirect) {
+      // Envoi direct via WATI (sans queue)
+      try {
+        const watiResult = await sendMessageViaWati(clientId, {
+          phoneNumber,
+          recipient_phone: cleanRecipient,
+          message_type,
+          template_name,
+          template_language,
+          template_params,
+          message_content,
+          media_url,
+          media_type,
+          messageId,
+          invoice_data,
+          ...rest
+        });
+
+        return {
+          success: true,
+          message: 'Message envoyé via WATI',
+          data: {
+            message_id: messageId,
+            emitter: phoneNumber,
+            recipient: cleanRecipient,
+            status: watiResult.status,
+            wati_message_id: watiResult.messageId,
+            quota_remaining: client.quota_remaining - 1
+          }
+        };
+      } catch (watiError) {
+        // Si WATI échoue, on met dans la queue comme fallback
+        logger.error('WATI direct failed, adding to queue:', watiError);
+      }
+    }
+
+    // Ajouter à la file BullMQ (fallback ou mode normal)
+    const queueResult = await addMessageToQueue({
+      phoneNumber,
+      messageId,
+      client_id: clientId,
+      recipient_phone: cleanRecipient,
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type,
+      invoice_data,
+      ...rest
+    });
+
+    logger.info('Message ajouté aux deux tables et à la file', {
+      messageId,
+      clientId,
+      clientTable: clientTableName,
+      globalTable: 'messages',
+      recipient: cleanRecipient,
+      queue: queueResult.queueName
+    });
+
+    return {
+      success: true,
+      message: 'Message ajouté à la file d\'envoi',
+      data: {
+        message_id: messageId,
+        emitter: phoneNumber,
+        recipient: cleanRecipient,
+        status: 'queued',
+        quota_remaining: client.quota_remaining - 1
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur envoi message:', error);
+    if (error.statusCode) throw error;
+    throw { statusCode: 500, code: 'INTERNAL_ERROR', message: 'Erreur lors de l\'envoi' };
+  }
+}
+
+/**
+ * Récupérer les messages
+ * - Client : depuis SA table personnelle (très rapide)
+ * - Admin : depuis la table globale messages (vue complète)
+ */
+async function getClientMessages(clientId, filters = {}) {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      recipient_phone,
+      start_date,
+      end_date,
+      message_type
+    } = filters;
+
+    const offset = (page - 1) * limit;
+    let whereClause = '';
+    const params = [];
+    let paramIndex = 1;
+
+    // Choisir la table selon le contexte
+    let tableName;
+    if (clientId) {
+      tableName = `messages_client_${clientId.replace(/-/g, '_')}`;
+      whereClause = 'WHERE 1=1';
+    } else {
+      tableName = 'messages';
+      whereClause = 'WHERE 1=1';
+    }
+
+    if (status) {
+      whereClause += ` AND wa_status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    if (recipient_phone) {
+      whereClause += ` AND recipient_phone ILIKE $${paramIndex}`;
+      params.push(`%${recipient_phone}%`);
+      paramIndex++;
+    }
+    if (message_type) {
+      whereClause += ` AND message_type = $${paramIndex}`;
+      params.push(message_type);
+      paramIndex++;
+    }
+    if (start_date) {
+      whereClause += ` AND created_at >= $${paramIndex}`;
+      params.push(start_date);
+      paramIndex++;
+    }
+    if (end_date) {
+      whereClause += ` AND created_at <= $${paramIndex}`;
+      params.push(end_date);
+      paramIndex++;
+    }
+
+    // Compter le total
+    const countResult = await query(
+      `SELECT COUNT(*) FROM ${tableName} ${whereClause}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    // Récupérer les messages (limité + tri récent)
+    const messagesResult = await query(
+      `SELECT
+         id, recipient_phone, message_type, wa_status,
+         wa_message_id, wa_error_message, queued_at, sent_at,
+         delivered_at, read_at, failed_at, created_at
+       FROM ${tableName}
+       ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    );
+
+    return {
+      success: true,
+      messages: messagesResult.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    };
+  } catch (error) {
+    logger.error('Erreur récupération messages:', error);
+    throw error;
+  }
+}
+
+/**
+ * Récupérer un message spécifique
+ * - Client : uniquement dans sa table personnelle
+ * - Admin : dans la table globale
+ */
+async function getMessageById(messageId, clientId) {
+  try {
+    let tableName = clientId
+      ? `messages_client_${clientId.replace(/-/g, '_')}`
+      : 'messages';
+
+    let queryText = `SELECT * FROM ${tableName} WHERE id = $1`;
+    let params = [messageId];
+
+    const result = await query(queryText, params);
+    if (result.rows.length === 0) {
+      throw { statusCode: 404, code: 'MESSAGE_NOT_FOUND', message: 'Message non trouvé' };
+    }
+
+    return { success: true, message: result.rows[0] };
+  } catch (error) {
+    logger.error('Erreur récupération message:', error);
+    throw error;
+  }
+}
+
+/**
+ * Statistiques messages
+ * - Client : sur sa table personnelle
+ * - Admin : sur la table globale
+ */
+ async function getClientStats(clientId, period = '30days') {
+  try {
+    let dateFilter = '';
+    switch (period) {
+      case '7days': dateFilter = "AND created_at >= NOW() - INTERVAL '7 days'"; break;
+      case '30days': dateFilter = "AND created_at >= NOW() - INTERVAL '30 days'"; break;
+      case '90days': dateFilter = "AND created_at >= NOW() - INTERVAL '90 days'"; break;
+      case 'all': dateFilter = ''; break;
+      default: dateFilter = "AND created_at >= NOW() - INTERVAL '30 days'";
+    }
+
+    const tableName = clientId
+      ? `messages_client_${clientId.replace(/-/g, '_')}`
+      : 'messages';
+
+    const statsResult = await query(
+      `SELECT
+        COUNT(*) as total_messages,
+        COUNT(CASE WHEN wa_status = 'sent' THEN 1 END) as sent,
+        COUNT(CASE WHEN wa_status = 'delivered' THEN 1 END) as delivered,
+        COUNT(CASE WHEN wa_status = 'read' THEN 1 END) as read,
+        COUNT(CASE WHEN wa_status = 'failed' THEN 1 END) as failed,
+        COUNT(CASE WHEN wa_status = 'queued' THEN 1 END) as queued
+       FROM ${tableName}
+       WHERE 1=1 ${dateFilter}`,
+      []
+    );
+
+    // Statistiques journalières avec plus de détails
+    const dailyStatsResult = await query(
+      `SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as total,
+        COUNT(CASE WHEN wa_status = 'sent' THEN 1 END) as sent,
+        COUNT(CASE WHEN wa_status = 'delivered' THEN 1 END) as delivered,
+        COUNT(CASE WHEN wa_status = 'read' THEN 1 END) as read,
+        COUNT(CASE WHEN wa_status = 'failed' THEN 1 END) as failed,
+        COUNT(CASE WHEN wa_status = 'queued' THEN 1 END) as queued
+       FROM ${tableName}
+       WHERE created_at >= NOW() - INTERVAL '7 days'
+       GROUP BY DATE(created_at)
+       ORDER BY date ASC`,
+      []
+    );
+
+    return {
+      success: true,
+      stats: statsResult.rows[0] || {
+        total_messages: 0, sent: 0, delivered: 0, read: 0, failed: 0, queued: 0
+      },
+      daily_stats: dailyStatsResult.rows
+    };
+  } catch (error) {
+    logger.error('Erreur stats messages:', error);
+    throw error;
+  }
+}
+
+
+/**
+ * Incrémenter les statistiques client
+ */
+async function incrementClientStats(numberId, clientId) {
+  try {
+    const assignment = await query(
+      'SELECT id FROM whatsapp_number_assignments WHERE number_id = $1 AND client_id = $2',
+      [numberId, clientId]
+    );
+
+    if (assignment.rowCount === 0) return;
+
+    const assignmentId = assignment.rows[0].id;
+
+    await query(`
+      INSERT INTO whatsapp_number_client_stats
+      (assignment_id, messages_sent_24h, messages_sent_total, conversations_active, conversations_total, last_message_at, last_activity)
+      VALUES ($1, 1, 1, 1, 1, NOW(), NOW())
+      ON CONFLICT (assignment_id) DO UPDATE SET
+        messages_sent_24h = whatsapp_number_client_stats.messages_sent_24h + 1,
+        messages_sent_total = whatsapp_number_client_stats.messages_sent_total + 1,
+        conversations_active = whatsapp_number_client_stats.conversations_active + 1,
+        conversations_total = whatsapp_number_client_stats.conversations_total + 1,
+        last_message_at = NOW(),
+        last_activity = NOW()
+    `, [assignmentId]);
+
+  } catch (err) {
+    logger.error('Erreur mise à jour stats client:', err);
+  }
+}
+
+/**
+ * Exporter messages en CSV
+ * - Client : depuis sa table personnelle
+ * - Admin : depuis la table globale
+ */
+async function exportMessagesToCSV(clientId, filters = {}) {
+  try {
+    const { status, start_date, end_date } = filters;
+    const tableName = clientId
+      ? `messages_client_${clientId.replace(/-/g, '_')}`
+      : 'messages';
+
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+
+    if (status) {
+      whereClause += ` AND wa_status = $1`;
+      params.push(status);
+    }
+    if (start_date) {
+      whereClause += ` AND created_at >= $${params.length + 1}`;
+      params.push(start_date);
+    }
+    if (end_date) {
+      whereClause += ` AND created_at <= $${params.length + 1}`;
+      params.push(end_date);
+    }
+
+    const messagesResult = await query(
+      `SELECT
+         recipient_phone, message_type, wa_status, wa_message_id,
+         wa_error_message, created_at, sent_at, delivered_at, failed_at
+       FROM ${tableName} ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT 10000`,
+      params
+    );
+
+    const headers = ['Destinataire', 'Type', 'Statut', 'ID Message', 'Erreur', 'Date création', 'Date envoi', 'Date livraison', 'Date échec'];
+    const rows = messagesResult.rows.map(msg => [
+      msg.recipient_phone,
+      msg.message_type,
+      msg.wa_status,
+      msg.wa_message_id || '',
+      msg.wa_error_message || '',
+      msg.created_at,
+      msg.sent_at || '',
+      msg.delivered_at || '',
+      msg.failed_at || ''
+    ]);
+
+    const csv = [
+      headers.join(','),
+      ...rows.map(row => row.map(cell => `"${(cell || '').toString().replace(/"/g, '""')}"`).join(','))
+    ].join('\n');
+
+    return { success: true, csv, count: rows.length };
+  } catch (error) {
+    logger.error('Erreur export CSV:', error);
+    throw error;
+  }
+}
+
+/**
+ * Vérifier si un destinataire peut recevoir un message (API publique)
+ */
+async function checkRecipientCooldown(recipientPhone, clientId) {
+  return await canSendToRecipient(recipientPhone, clientId);
+}
+
+module.exports = {
+  sendMessage,
+  sendMessageViaWati,
+  getClientMessages,
+  getMessageById,
+  getClientStats,
+  exportMessagesToCSV,
+  checkRecipientCooldown,
+  canSendToRecipient
+};

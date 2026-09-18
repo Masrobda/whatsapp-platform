@@ -1,0 +1,266 @@
+// api/src/services/hetu-websocket.service.js
+const WebSocket = require('ws');
+const logger = require('../utils/logger');
+const authService = require('./alarm-auth.service');
+const alarmVideoService = require('./alarm-video.service');
+const { uploadAndConvertVideoFromStream } = require('./storage-upload.service');
+const { sendAlarmTemplate } = require('./whatsapp-send.service');
+const vehicleMappingService = require('./vehicle-mapping.service');
+const { normalizePhoneNumber } = require('../utils/phone-validator');
+const { markVideoAsSent, isVideoAlreadySent } = require('./alarm-notification.service');
+
+const alarmLabels = {
+  emergencyAlarm: "Alerte d'urgence détectée",
+  speedingAlarm: "Excès de vitesse détectée",
+  fatigueDrivingAlarm: "Conduite fatiguée détectée",
+  forwardCollision: "Collision frontale détectée",
+  laneDeparture: "Franchissement de ligne détectée",
+  pedestrianCollision: "Risque piéton détectée",
+  makeCalls: "Appel au volant détectée",
+};
+
+function getAlarmLabel(type) {
+  return alarmLabels[type] || `⚠️ Alarme ${type}`;
+}
+
+class HetuWebSocketService {
+  constructor() {
+    this.ws = null;
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectDelay = 5000;
+    this.heartbeatInterval = null;
+    this.username = null;
+    this.language = 'fr-FR';
+  }
+
+  async connect(username, language = 'fr-FR') {
+    this.username = username || process.env.HETU_WEBSOCKET_USERNAME;
+    this.language = language;
+    if (!this.username) {
+      logger.error('[HetuWS] Username non défini (HETU_WEBSOCKET_USERNAME)');
+      return;
+    }
+
+    try {
+      const token = await authService.getToken();
+      const encodedToken = encodeURIComponent(token);
+      const url = `${process.env.HETU_WEBSOCKET_URL || 'ws://api.hetuv2x.com:20007'}/vehicleWs/${this.username}/${encodedToken}/${this.language}`;
+      logger.info(`[HetuWS] Connexion à ${url}`);
+
+      this.ws = new WebSocket(url);
+
+      this.ws.on('open', () => {
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
+        logger.info('[HetuWS] Connecté');
+        this.subscribe();
+        this.startHeartbeat();
+      });
+
+      this.ws.on('message', async (data) => {
+        try {
+          const message = JSON.parse(data);
+          await this.handleMessage(message);
+        } catch (err) {
+          logger.error('[HetuWS] Erreur parsing message:', err.message);
+        }
+      });
+
+      this.ws.on('error', (err) => {
+        logger.error('[HetuWS] Erreur WebSocket:', err.message);
+      });
+
+      this.ws.on('close', () => {
+        this.isConnected = false;
+        this.stopHeartbeat();
+        logger.warn('[HetuWS] Déconnecté, tentative de reconnexion...');
+        this.reconnect();
+      });
+    } catch (err) {
+      logger.error('[HetuWS] Erreur connexion:', err.message);
+      this.reconnect();
+    }
+  }
+
+  subscribe() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const subscribeMsg = {
+      messageType: 'subscribe',
+      data: {
+        dataTypes: ['vehicleCommonAlarm', 'vehicleActiveSafeAlarm', 'vehicleAlarmFile'],
+        vehicleOnlineInterval: 1
+      }
+    };
+    this.ws.send(JSON.stringify(subscribeMsg));
+    logger.info('[HetuWS] Abonnement envoyé');
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ messageType: 'heartBeat', data: Date.now() }));
+      }
+    }, 30000);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  reconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      logger.error('[HetuWS] Nombre maximal de tentatives de reconnexion atteint');
+      return;
+    }
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
+    logger.info(`[HetuWS] Reconnexion dans ${delay}ms (tentative ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    setTimeout(() => this.connect(this.username, this.language), delay);
+  }
+
+  async handleMessage(message) {
+    const { messageType, data } = message;
+    if (!data) return;
+    switch (messageType) {
+      case 'vehicleCommonAlarm':
+      case 'vehicleActiveSafeAlarm':
+        await this.handleAlarm(data);
+        break;
+      default:
+        // ignorer
+    }
+  }
+
+  async handleAlarm(alarmData) {
+    try {
+      const {
+        licenseNum,
+        alarmType,
+        startTime,
+        location,
+        latitude,
+        longitude,
+        speed,
+        alarmSpeed,
+        driverName,
+        motorcadeName,
+        alarmId
+      } = alarmData;
+
+      if (!licenseNum) {
+        logger.warn('[HetuWS] Alarme sans plaque');
+        return;
+      }
+
+      // Récupérer le téléphone du conducteur (destinataire)
+      const phone = await vehicleMappingService.getPhoneByLicense(licenseNum);
+      const recipient = normalizePhoneNumber(phone);
+      if (!recipient) {
+        logger.warn(`[HetuWS] Aucun téléphone pour ${licenseNum}`);
+        return;
+      }
+
+      // --- Récupération du média (vidéo/image) ---
+      let mediaUrl = null;
+      let fileId = null;
+      let filePath = null;
+      let mediaType = 'video';
+
+      if (startTime) {
+        const start = new Date(startTime);
+        const end = new Date(start.getTime() + 60000);
+        const startStr = start.toISOString().replace('T', ' ').slice(0, 19);
+        const endStr = end.toISOString().replace('T', ' ').slice(0, 19);
+
+        try {
+          const result = await alarmVideoService.fetchAllVideos(licenseNum, startStr, endStr, alarmType);
+          const videos = result.data?.list || [];
+          const video = videos.find(v => v.uploadStatus === 1);
+          if (video) {
+            fileId = video.fileId;
+            filePath = video.filePath;
+            const alreadySent = await isVideoAlreadySent(fileId, filePath);
+            if (!alreadySent) {
+              const { stream, originalName } = await alarmVideoService.downloadVideoByPath(filePath, licenseNum, alarmType);
+              const uploadResult = await uploadAndConvertVideoFromStream(
+                stream,
+                originalName,
+                process.env.SYSTEM_CLIENT_ID,
+                licenseNum
+              );
+              if (uploadResult.success) {
+                mediaUrl = uploadResult.publicUrl;
+                if (mediaUrl.match(/\.(jpg|jpeg|png|gif)$/i)) mediaType = 'image';
+                else if (mediaUrl.match(/\.mp4$/i)) mediaType = 'video';
+              }
+            } else {
+              logger.info(`[HetuWS] Média déjà envoyé pour fileId=${fileId}`);
+              return;
+            }
+          }
+        } catch (err) {
+          logger.error(`[HetuWS] Erreur récupération média:`, err.message);
+        }
+      }
+
+      if (!mediaUrl) {
+        logger.warn(`[HetuWS] Aucun média pour l'alarme ${alarmType} de ${licenseNum} à ${startTime}`);
+        return;
+      }
+
+      // --- Construction des informations ---
+      const alarmLabel = getAlarmLabel(alarmType);
+      const vehicleInfo = `${licenseNum}${motorcadeName ? ` (${motorcadeName})` : ''}`;
+      const driver = driverName || 'Non spécifié';
+      const driverPhone = recipient; // le même numéro que le destinataire
+      const position = location || `${latitude || ''},${longitude || ''}`;
+      const gps = latitude && longitude ? `${latitude},${longitude}` : 'N/A';
+      const speedValue = speed || alarmSpeed || 0;
+      const time = startTime ? startTime.replace('T', ' ').slice(0, 19) : new Date().toISOString().slice(0, 19);
+
+      // Paramètres du template (9 paramètres)
+      const templateParams = {
+        "1": mediaUrl,           // média
+        "2": alarmLabel,
+        "3": vehicleInfo,
+        "4": driver,
+        "5": driverPhone,
+        "6": position,
+        "7": gps,
+        "8": speedValue + ' km/h',
+        "9": time
+      };
+
+      const templateName = mediaType === 'image' ? 'next_alarm_image_01' : 'next_alarm_video_02';
+
+      const sendResult = await sendAlarmTemplate(
+        recipient,
+        mediaUrl,
+        alarmLabel,
+        licenseNum,
+        time,
+        process.env.DEFAULT_WHATSAPP_NUMBER,
+        templateParams
+      );
+
+      if (sendResult.success) {
+        if (fileId && filePath) {
+          await markVideoAsSent(fileId, filePath, licenseNum, alarmType, recipient, sendResult.localMessageId);
+        }
+        logger.info(`[HetuWS] Alarme ${alarmType} envoyée à ${recipient} pour ${licenseNum} avec ${mediaType}`);
+      } else {
+        logger.error(`[HetuWS] Échec envoi alarme ${alarmType}: ${sendResult.error}`);
+      }
+    } catch (err) {
+      logger.error('[HetuWS] Erreur traitement alarme:', err.message);
+    }
+  }
+}
+
+module.exports = new HetuWebSocketService();

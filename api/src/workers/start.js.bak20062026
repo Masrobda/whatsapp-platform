@@ -1,0 +1,35 @@
+// src/workers/start.js
+// Point d'entrée legacy : message.worker + cleanup uniquement.
+// Le worker universel WhatsApp tourne désormais en processus PM2 indépendant
+// (whatsapp-worker → src/workers/whatsapp.worker.universal.js)
+require('dotenv').config();
+const logger = require('../utils/logger');
+
+// const messageWorker    = require('./message.worker');
+const { scheduleCleanupTasks } = require('./cleanup.worker');
+
+scheduleCleanupTasks();
+
+logger.info(`
+╔══════════════════════════════════════════════════╗
+║           🔧 LEGACY WORKERS DÉMARRÉS            ║
+║                                                  ║
+║  📨 Message Worker (legacy BullMQ): Actif        ║
+║  🧹 Cleanup Worker: Planifié (2h00 / jour)       ║
+║                                                  ║
+║  ℹ️  Worker WhatsApp Universel → processus PM2   ║
+║     indépendant "whatsapp-worker"                ║
+╚══════════════════════════════════════════════════╝
+`);
+
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt legacy workers...');
+  if (messageWorker?.close) await messageWorker.close();
+  setTimeout(() => process.exit(0), 5000);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt legacy workers...');
+  if (messageWorker?.close) await messageWorker.close();
+  setTimeout(() => process.exit(0), 5000);
+});

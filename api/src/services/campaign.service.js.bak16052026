@@ -1,0 +1,1095 @@
+// src/services/campaign.service.js
+// Module complet de gestion des campagnes WhatsApp
+const { query, getClient } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { addMessageToQueue } = require('./queue.service');
+const { canSendToRecipient } = require('./message.service');
+const logger = require('../utils/logger');
+const csv = require('csv-parse/sync');
+const xlsx = require('xlsx');
+
+// ============================================================
+// CRÉATION & CONFIGURATION
+// ============================================================
+
+/**
+ * Créer une nouvelle campagne
+ */
+async function createCampaign(clientId, userId, data) {
+  const db = await getClient();
+  try {
+    await db.query('BEGIN');
+
+    const {
+      name, description, campaign_type = 'broadcast',
+      template_id, template_name, template_language = 'fr', template_params = {},
+      phone_number, send_mode = 'instant', batch_size = 50,
+      batch_interval_seconds = 60, daily_limit = 1000, rate_per_minute = 30,
+      scheduled_at, priority = 5, category, tags = [],
+      contacts = [], segment_ids = []
+    } = data;
+
+    if (!name?.trim()) throw { statusCode: 400, code: 'NAME_REQUIRED', message: 'Nom de campagne requis' };
+    if (!phone_number) throw { statusCode: 400, code: 'PHONE_REQUIRED', message: 'Numéro émetteur requis' };
+    if (!template_name && campaign_type !== 'ab_test') throw { statusCode: 400, code: 'TEMPLATE_REQUIRED', message: 'Template requis' };
+
+    // Estimer le coût (0.005 USD par message en Cameroun)
+    const totalContacts = contacts.length;
+//    const estimatedCost = totalContacts * 0.005;
+      const clientResult = await db.query(
+  `SELECT message_cost FROM clients WHERE id = $1`,
+  [clientId]
+);
+const ratePerMessage = clientResult.rows[0]?.message_cost || 20; // 20 FCFA par défaut
+const estimatedCost = totalContacts * (ratePerMessage);
+
+    const campaignId = uuidv4();
+
+    const result = await db.query(
+      `INSERT INTO campaigns (
+        id, client_id, name, description, status, campaign_type, priority, category,
+        template_id, template_name, template_language, template_params, phone_number,
+        send_mode, batch_size, batch_interval_seconds, daily_limit, rate_per_minute,
+        scheduled_at, total_contacts, estimated_cost, tags, created_by, updated_by
+      ) VALUES (
+        $1,$2,$3,$4,'draft',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22
+      ) RETURNING *`,
+      [
+        campaignId, clientId, name.trim(), description || null, campaign_type,
+        priority, category || null, template_id || null, template_name || null,
+        template_language, JSON.stringify(template_params), phone_number,
+        send_mode, batch_size, batch_interval_seconds, daily_limit, rate_per_minute,
+        scheduled_at || null, totalContacts, estimatedCost,
+        JSON.stringify(tags), userId
+      ]
+    );
+
+    const campaign = result.rows[0];
+
+    // Insérer les contacts si fournis
+    if (contacts.length > 0) {
+      await insertCampaignContacts(db, campaignId, contacts, 'manual');
+    }
+
+    // Assigner les segments
+    for (const segmentId of segment_ids) {
+      await db.query(
+        `INSERT INTO campaign_segment_assignments (campaign_id, segment_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [campaignId, segmentId]
+      );
+    }
+
+    // Log
+    await logCampaignEvent(db, campaignId, null, 'info', 'campaign.created',
+      `Campagne "${name}" créée`, { totalContacts, send_mode });
+
+    await db.query('COMMIT');
+    logger.info(`Campagne créée: ${campaignId} par ${userId}`);
+
+    return { success: true, campaign };
+  } catch (error) {
+    await db.query('ROLLBACK');
+    logger.error('Erreur création campagne:', error);
+    throw error;
+  } finally {
+    db.release();
+  }
+}
+
+/**
+ * Mettre à jour une campagne
+ */
+async function updateCampaign(campaignId, clientId, userId, updates) {
+  const db = await getClient();
+  try {
+    await db.query('BEGIN');
+
+    const campaign = await getCampaignById(campaignId, clientId);
+    if (['running', 'completed', 'cancelled'].includes(campaign.status)) {
+      throw { statusCode: 400, code: 'INVALID_STATUS', message: 'Impossible de modifier une campagne en cours ou terminée' };
+    }
+
+    const allowed = ['name','description','template_name','template_language','template_params',
+      'phone_number','send_mode','batch_size','batch_interval_seconds','daily_limit',
+      'rate_per_minute','scheduled_at','priority','category','tags'];
+
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+
+    for (const key of allowed) {
+      if (updates[key] !== undefined) {
+        sets.push(`${key} = $${idx}`);
+        vals.push(typeof updates[key] === 'object' ? JSON.stringify(updates[key]) : updates[key]);
+        idx++;
+      }
+    }
+
+    if (sets.length === 0) throw { statusCode: 400, code: 'NO_UPDATES', message: 'Aucune modification' };
+
+    sets.push(`updated_by = $${idx}`, `updated_at = NOW()`);
+    vals.push(userId, campaignId, clientId);
+
+    await db.query(
+      `UPDATE campaigns SET ${sets.join(', ')} WHERE id = $${idx + 1} AND client_id = $${idx + 2}`,
+      vals
+    );
+
+    await logCampaignEvent(db, campaignId, null, 'info', 'campaign.updated', 'Campagne modifiée', updates);
+    await db.query('COMMIT');
+
+    return { success: true, campaign: await getCampaignById(campaignId, clientId) };
+  } catch (error) {
+    await db.query('ROLLBACK');
+    throw error;
+  } finally {
+    db.release();
+  }
+}
+
+// ============================================================
+// GESTION DES CONTACTS
+// ============================================================
+
+/**
+ * Insérer des contacts dans une campagne (helper interne)
+ */
+async function insertCampaignContacts(db, campaignId, contacts, source = 'manual') {
+  if (!contacts || contacts.length === 0) return 0;
+
+  const values = [];
+  const params = [];
+  let paramIdx = 1;
+
+  for (const contact of contacts) {
+    const phone = normalizePhoneForCampaign(contact.phone_number || contact.phone);
+    if (!phone) continue;
+
+    values.push(`($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},'pending')`);
+    params.push(
+      uuidv4(), campaignId, phone,
+      contact.name || null, contact.email || null,
+      JSON.stringify(contact.variables || {})
+    );
+  }
+
+  if (values.length === 0) return 0;
+
+  const inserted = await db.query(
+    `INSERT INTO campaign_contacts (id, campaign_id, phone_number, name, email, variables, status)
+     VALUES ${values.join(',')}
+     ON CONFLICT (campaign_id, phone_number) DO NOTHING
+     RETURNING id`,
+    params
+  );
+
+  // Mettre à jour le compteur
+  await db.query(
+    `UPDATE campaigns SET total_contacts = (
+      SELECT COUNT(*) FROM campaign_contacts WHERE campaign_id = $1
+    ) WHERE id = $1`,
+    [campaignId]
+  );
+
+  return inserted.rowCount;
+}
+
+/**
+ * Importer des contacts depuis un CSV
+ */
+async function importContactsFromCSV(campaignId, clientId, fileBuffer, options = {}) {
+  const db = await getClient();
+  try {
+    await db.query('BEGIN');
+
+    const campaign = await getCampaignById(campaignId, clientId);
+    if (!['draft', 'scheduled'].includes(campaign.status)) {
+      throw { statusCode: 400, code: 'INVALID_STATUS', message: 'Import impossible sur une campagne active' };
+    }
+
+    // Parser le CSV
+    const records = csv.parse(fileBuffer, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+
+    const contacts = records.map(row => {
+      const phone = row.phone_number || row.phone || row.telephone || row.numero || row['Téléphone'];
+      const name = row.name || row.nom || row.prenom || row['Nom'] || row['Prénom'];
+      const email = row.email || row['Email'];
+
+      // Les autres colonnes deviennent des variables
+      const variables = {};
+      for (const [key, val] of Object.entries(row)) {
+        if (!['phone_number','phone','telephone','numero','Téléphone','name','nom','prenom','Nom','Prénom','email','Email'].includes(key)) {
+          variables[key] = val;
+        }
+      }
+
+      return { phone_number: phone, name, email, variables };
+    });
+
+    // Validation et déduplication
+    const validContacts = [];
+    const invalidPhones = [];
+
+    for (const c of contacts) {
+      const normalized = normalizePhoneForCampaign(c.phone_number);
+      if (normalized) {
+        validContacts.push({ ...c, phone_number: normalized });
+      } else {
+        invalidPhones.push(c.phone_number);
+      }
+    }
+
+    // Vérifier blacklist client
+    const blacklisted = await db.query(
+      `SELECT phone_number FROM campaign_blacklist WHERE client_id = $1 AND phone_number = ANY($2)`,
+      [clientId, validContacts.map(c => c.phone_number)]
+    );
+    const blacklistedSet = new Set(blacklisted.rows.map(r => r.phone_number));
+
+    const filteredContacts = validContacts.filter(c => !blacklistedSet.has(c.phone_number));
+
+    const inserted = await insertCampaignContacts(db, campaignId, filteredContacts, 'csv');
+
+    await logCampaignEvent(db, campaignId, null, 'info', 'contacts.imported',
+      `${inserted} contacts importés depuis CSV`, {
+        total: records.length,
+        valid: validContacts.length,
+        invalid: invalidPhones.length,
+        blacklisted: blacklistedSet.size,
+        inserted
+      });
+
+    await db.query('COMMIT');
+
+    return {
+      success: true,
+      total: records.length,
+      imported: inserted,
+      invalid: invalidPhones.length,
+      blacklisted: blacklistedSet.size,
+      invalid_phones: invalidPhones.slice(0, 20)
+    };
+  } catch (error) {
+    await db.query('ROLLBACK');
+    throw error;
+  } finally {
+    db.release();
+  }
+}
+
+/**
+ * Détecte automatiquement si une variable contient un média (PDF, image, vidéo)
+ * et retourne les informations du média
+ */
+function detectMediaFromVariables(variables) {
+  if (!variables || typeof variables !== 'object') return null;
+  
+  // Extensions de fichiers supportées
+  const mediaPatterns = {
+    pdf: /\.(pdf)$/i,
+    image: /\.(png|jpg|jpeg|gif|webp)$/i,
+    video: /\.(mp4|mov|avi|mkv|webm)$/i,
+    audio: /\.(mp3|wav|ogg|m4a)$/i,
+    document: /\.(doc|docx|xls|xlsx|ppt|pptx)$/i
+  };
+  
+  // Parcourir toutes les variables
+  for (const [key, value] of Object.entries(variables)) {
+    if (typeof value === 'string') {
+      const trimmedValue = value.trim();
+      
+      // Vérifier si c'est une URL valide
+      if (trimmedValue.startsWith('http://') || trimmedValue.startsWith('https://')) {
+        // Vérifier le type de média
+        for (const [mediaType, pattern] of Object.entries(mediaPatterns)) {
+          if (pattern.test(trimmedValue)) {
+            console.log(`📎 [MEDIA DETECTED] ${mediaType} dans variable "${key}": ${trimmedValue}`);
+            return {
+              type: mediaType,
+              url: trimmedValue,
+              variableName: key,
+              isMedia: true
+            };
+          }
+        }
+      }
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Fusionne intelligemment les variables et détecte les médias
+ */
+function mergeTemplateParamsWithMediaDetection(defaultParams, contactVariables, contactName) {
+  // Fusionner les variables (contact écrase défaut)
+  const merged = { 
+    ...(typeof defaultParams === 'string' ? JSON.parse(defaultParams) : defaultParams || {}),
+    ...(contactVariables || {})
+  };
+  
+  // Ajouter le nom du contact si présent et non déjà défini
+  if (contactName && !merged.name) {
+    merged.name = contactName;
+  }
+  
+  // Détecter les médias
+  const media = detectMediaFromVariables(merged);
+  
+  return {
+    template_params: merged,
+    media: media  // Peut être null ou un objet { type, url, variableName }
+  };
+}
+
+/**
+ * Importer depuis Excel
+ */
+async function importContactsFromExcel(campaignId, clientId, fileBuffer) {
+  const workbook = xlsx.read(fileBuffer, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const records = xlsx.utils.sheet_to_json(sheet);
+
+  const contacts = records.map(row => {
+    const phone = String(row.phone_number || row.phone || row.telephone || row['Téléphone'] || '');
+    const name = row.name || row.nom || row['Nom'] || '';
+    const email = row.email || row['Email'] || '';
+    const variables = {};
+    for (const [k, v] of Object.entries(row)) {
+      if (!['phone_number','phone','telephone','Téléphone','name','nom','Nom','email','Email'].includes(k)) {
+        variables[String(k)] = String(v || '');
+      }
+    }
+    return { phone_number: phone, name: String(name), email: String(email), variables };
+  });
+
+  // Réutiliser la même logique que CSV
+  return importContactsFromCSVData(campaignId, clientId, contacts);
+}
+
+async function importContactsFromCSVData(campaignId, clientId, contacts) {
+  const db = await getClient();
+  try {
+    await db.query('BEGIN');
+    const inserted = await insertCampaignContacts(db, campaignId, contacts, 'csv');
+    await db.query('COMMIT');
+    return { success: true, imported: inserted };
+  } catch(e) {
+    await db.query('ROLLBACK');
+    throw e;
+  } finally {
+    db.release();
+  }
+}
+
+// ============================================================
+// LANCEMENT & CONTRÔLE
+// ============================================================
+
+/**
+ * Lancer une campagne
+ */
+async function launchCampaign(campaignId, clientId, userId) {
+  const db = await getClient();
+  try {
+    await db.query('BEGIN');
+
+    const campaign = await getCampaignById(campaignId, clientId);
+
+    if (!['draft', 'scheduled', 'paused'].includes(campaign.status)) {
+      throw { statusCode: 400, code: 'INVALID_STATUS', message: `Impossible de lancer une campagne en état: ${campaign.status}` };
+    }
+
+    // Vérifier qu'il y a des contacts
+    if (campaign.total_contacts === 0) {
+      throw { statusCode: 400, code: 'NO_CONTACTS', message: 'Aucun contact dans la campagne' };
+    }
+
+    // Si planifiée dans le futur
+    if (campaign.scheduled_at && new Date(campaign.scheduled_at) > new Date()) {
+      await db.query(
+        `UPDATE campaigns SET status = 'scheduled', updated_by = $2, updated_at = NOW() WHERE id = $1`,
+        [campaignId, userId]
+      );
+      await db.query('COMMIT');
+      return { success: true, status: 'scheduled', message: 'Campagne planifiée' };
+    }
+
+    // Lancer immédiatement
+    await db.query(
+      `UPDATE campaigns SET status = 'running', started_at = NOW(), updated_by = $2, updated_at = NOW() WHERE id = $1`,
+      [campaignId, userId]
+    );
+
+    await logCampaignEvent(db, campaignId, null, 'info', 'campaign.launched',
+      `Campagne lancée par ${userId}`, { send_mode: campaign.send_mode });
+
+    await db.query('COMMIT');
+
+    // Démarrer l'envoi en arrière-plan (non bloquant)
+    processCampaignSend(campaign).catch(err => {
+      logger.error(`Erreur traitement campagne ${campaignId}:`, err);
+      markCampaignFailed(campaignId, err.message);
+    });
+
+    return { success: true, status: 'running', message: 'Campagne lancée' };
+  } catch (error) {
+    await db.query('ROLLBACK');
+    throw error;
+  } finally {
+    db.release();
+  }
+}
+
+/**
+ * Traitement asynchrone de l'envoi
+ */
+
+async function processCampaignSend(campaign) {
+  const { id: campaignId, client_id, phone_number, template_name, template_language,
+    template_params, batch_size, batch_interval_seconds, rate_per_minute } = campaign;
+
+  logger.info(`[CAMPAIGN] Démarrage envoi ${campaignId}`);
+
+  try {
+    let offset = 0;
+    let processedTotal = 0;
+
+    while (true) {
+      const statusCheck = await query(
+        `SELECT status FROM campaigns WHERE id = $1`, [campaignId]
+      );
+      if (!statusCheck.rows[0] || statusCheck.rows[0].status !== 'running') {
+        logger.info(`[CAMPAIGN] ${campaignId} arrêtée (status: ${statusCheck.rows[0]?.status})`);
+        break;
+      }
+
+      const contacts = await query(
+        `SELECT * FROM campaign_contacts
+         WHERE campaign_id = $1 AND status = 'pending'
+         ORDER BY created_at ASC
+         LIMIT $2 OFFSET $3`,
+        [campaignId, batch_size, offset]
+      );
+
+      if (contacts.rows.length === 0) break;
+
+       for (const contact of contacts.rows) {
+  try {
+    const canSend = await canSendToRecipient(contact.phone_number, client_id);
+
+    if (!canSend.canSend) {
+      await query(
+        `UPDATE campaign_contacts SET status = 'skipped', skip_reason = $1, updated_at = NOW()
+         WHERE id = $2`,
+        [canSend.reason, contact.id]
+      );
+      continue;
+    }
+
+    // 🔥 1. D'abord, créer le messageId
+    const messageId = uuidv4();
+    console.log(`📝 Génération messageId: ${messageId} pour ${contact.phone_number}`);
+
+    // 🔥 2. Parser contact.variables si nécessaire
+    let contactVars = contact.variables;
+    if (typeof contactVars === 'string') {
+      try {
+        contactVars = JSON.parse(contactVars);
+        console.log(`✅ Variables parsées depuis JSON:`, Object.keys(contactVars));
+      } catch(e) {
+        console.error(`❌ Erreur parsing JSON:`, e);
+        contactVars = {};
+      }
+    }
+
+    // 🔥 3. Fusionner les variables et détecter les médias
+    const { template_params: mergedParams, media: detectedMedia } = mergeTemplateParamsWithMediaDetection(
+      template_params,
+      contactVars,
+      contact.name
+    );
+
+    console.log(`📝 Contact ${contact.phone_number}:`, {
+      hasMedia: !!detectedMedia,
+      mediaType: detectedMedia?.type,
+      mediaUrl: detectedMedia?.url,
+      paramsCount: Object.keys(mergedParams).length
+    });
+
+          // 🔥 3. Insérer dans messages global
+          await query(
+            `INSERT INTO messages (id, client_id, recipient_phone, message_type, template_name,
+              template_language, template_params, wa_status, queued_at, channel, metadata)
+             VALUES ($1,$2,$3,'template',$4,$5,$6,'queued',NOW(),'whatsapp',$7)`,
+            [
+              messageId, client_id, contact.phone_number, template_name,
+              template_language || 'fr',
+              JSON.stringify(mergedParams),
+              JSON.stringify({ campaign_id: campaignId, contact_id: contact.id })
+            ]
+          );
+
+          // 🔥 4. Table client
+          const clientTable = `messages_client_${client_id.replace(/-/g, '_')}`;
+          await query(
+            `INSERT INTO ${clientTable} (id, recipient_phone, message_type, template_name,
+              template_language, template_params, wa_status, queued_at)
+             VALUES ($1,$2,'template',$3,$4,$5,'queued',NOW())`,
+            [messageId, contact.phone_number, template_name, template_language || 'fr', JSON.stringify(mergedParams)]
+          );
+
+          // 🔥 5. Décrémenter quota
+          await query(`UPDATE clients SET quota_remaining = quota_remaining - 1 WHERE id = $1`, [client_id]);
+
+          // 🔥 6. Préparer les données pour la queue
+          // TOUJOURS 'template' pour les templates WhatsApp
+          const queueData = {
+            phoneNumber: phone_number,
+            messageId: messageId,
+            client_id,
+            recipient_phone: contact.phone_number,
+            message_type: 'template',  // ← TOUJOURS 'template' pour les templates
+            template_name: template_name,
+            template_language: template_language || 'fr',
+            template_params: mergedParams,
+            campaign_id: campaignId,
+            campaign_contact_id: contact.id
+          };
+
+          // 🔥 7. Gestion intelligente des médias
+          if (detectedMedia) {
+            // Cas 1: PDF → utiliser invoice_data pour sendInvoiceWithPDF
+            if (detectedMedia.type === 'pdf') {
+              queueData.invoice_data = {
+                pdfUrl: detectedMedia.url,
+                number: mergedParams.numero_facture || mergedParams.invoice_number || '001'
+              };
+              console.log(`📄 [MEDIA] Ajout invoice_data pour PDF: ${detectedMedia.url}`);
+            } 
+            // Cas 2: Autres médias (image, vidéo, audio) → envoyer comme média simple
+            else {
+              queueData.message_type = 'media';
+              queueData.media_type = detectedMedia.type;
+              queueData.media_url = detectedMedia.url;
+              queueData.caption = `Votre ${detectedMedia.type} de ${mergedParams.name || 'client'}`;
+              console.log(`📎 [MEDIA] Ajout à la queue: ${detectedMedia.type} - ${detectedMedia.url}`);
+            }
+          }
+
+          // 🔥 8. Ajouter à la queue BullMQ
+          await addMessageToQueue(queueData);
+
+          // 🔥 9. Mettre à jour le contact
+          await query(
+            `UPDATE campaign_contacts SET status = 'queued', queued_at = NOW(), wa_message_id = $1, updated_at = NOW() WHERE id = $2`,
+            [messageId, contact.id]
+          );
+
+          processedTotal++;
+
+          // Rate limiting
+          const delayMs = Math.ceil(60000 / rate_per_minute);
+          await sleep(delayMs);
+
+        } catch (contactError) {
+          logger.error(`[CAMPAIGN] Erreur contact ${contact.id}:`, contactError);
+          await query(
+            `UPDATE campaign_contacts SET status = 'failed', error_message = $1, failed_at = NOW(), updated_at = NOW()
+             WHERE id = $2`,
+            [contactError.message, contact.id]
+          );
+        }
+      }
+
+      if (contacts.rows.length === batch_size) {
+        logger.info(`[CAMPAIGN] Batch terminé, pause ${batch_interval_seconds}s`);
+        await sleep(batch_interval_seconds * 1000);
+      }
+
+      offset += batch_size;
+    }
+
+    const remaining = await query(
+      `SELECT COUNT(*) as count FROM campaign_contacts WHERE campaign_id = $1 AND status = 'pending'`,
+      [campaignId]
+    );
+
+    if (parseInt(remaining.rows[0].count) === 0) {
+      await query(
+        `UPDATE campaigns SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [campaignId]
+      );
+      await logCampaignEventDirect(campaignId, 'info', 'campaign.completed',
+        `Campagne terminée: ${processedTotal} messages envoyés`);
+    }
+
+  } catch (error) {
+    logger.error(`[CAMPAIGN] Erreur fatale ${campaignId}:`, error);
+    await markCampaignFailed(campaignId, error.message);
+  }
+}
+
+/**
+ * Mettre en pause une campagne
+ */
+async function pauseCampaign(campaignId, clientId, userId) {
+  const campaign = await getCampaignById(campaignId, clientId);
+  if (campaign.status !== 'running') {
+    throw { statusCode: 400, code: 'NOT_RUNNING', message: 'La campagne n\'est pas en cours' };
+  }
+
+  await query(
+    `UPDATE campaigns SET status = 'paused', paused_at = NOW(), updated_by = $2, updated_at = NOW() WHERE id = $1`,
+    [campaignId, userId]
+  );
+
+  await logCampaignEventDirect(campaignId, 'warn', 'campaign.paused', `Pausée par ${userId}`);
+  return { success: true };
+}
+
+/**
+ * Annuler une campagne
+ */
+async function cancelCampaign(campaignId, clientId, userId) {
+  const campaign = await getCampaignById(campaignId, clientId);
+  if (['completed', 'cancelled'].includes(campaign.status)) {
+    throw { statusCode: 400, code: 'ALREADY_DONE', message: 'Campagne déjà terminée ou annulée' };
+  }
+
+  await query(
+    `UPDATE campaigns SET status = 'cancelled', updated_by = $2, updated_at = NOW() WHERE id = $1`,
+    [campaignId, userId]
+  );
+
+  // Annuler les contacts pending
+  await query(
+    `UPDATE campaign_contacts SET status = 'skipped', skip_reason = 'Campaign cancelled', updated_at = NOW()
+     WHERE campaign_id = $1 AND status IN ('pending','queued')`,
+    [campaignId]
+  );
+
+  await logCampaignEventDirect(campaignId, 'warn', 'campaign.cancelled', `Annulée par ${userId}`);
+  return { success: true };
+}
+
+async function markCampaignFailed(campaignId, reason) {
+  await query(
+    `UPDATE campaigns SET status = 'failed', updated_at = NOW() WHERE id = $1`,
+    [campaignId]
+  );
+  await logCampaignEventDirect(campaignId, 'error', 'campaign.failed', reason);
+}
+
+// ============================================================
+// LECTURE & STATISTIQUES
+// ============================================================
+
+async function getCampaigns(clientId, filters = {}) {
+  console.log('🔍 getCampaigns appelé avec clientId:', clientId);
+  
+  const { page = 1, limit = 20, status, search, category, campaign_type } = filters;
+  const offset = (page - 1) * limit;
+
+  let where = 'WHERE c.client_id = $1';
+  const params = [clientId];
+  let idx = 2;
+
+  if (status) { where += ` AND c.status = $${idx++}`; params.push(status); }
+  if (campaign_type) { where += ` AND c.campaign_type = $${idx++}`; params.push(campaign_type); }
+  if (category) { where += ` AND c.category = $${idx++}`; params.push(category); }
+  if (search) {
+    where += ` AND (c.name ILIKE $${idx} OR c.description ILIKE $${idx})`;
+    params.push(`%${search}%`); idx++;
+  }
+
+  console.log('📝 Requête campaigns avec params:', params);
+  
+  const countRes = await query(`SELECT COUNT(*) FROM campaigns c ${where}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  const res = await query(
+    `SELECT c.*,
+       CASE WHEN c.total_contacts > 0
+         THEN ROUND((c.delivered_count::numeric / c.total_contacts) * 100, 1)
+         ELSE 0 END as delivery_rate,
+       CASE WHEN c.sent_count > 0
+         THEN ROUND((c.read_count::numeric / c.sent_count) * 100, 1)
+         ELSE 0 END as read_rate,
+       u.email as created_by_email
+     FROM campaigns c
+     LEFT JOIN users u ON c.created_by = u.id
+     ${where}
+     ORDER BY c.created_at DESC
+     LIMIT $${idx} OFFSET $${idx+1}`,
+    [...params, limit, offset]
+  );
+
+  console.log(`✅ ${res.rows.length} campagnes trouvées`);
+
+  return {
+    success: true,
+    campaigns: res.rows,
+    pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / limit) }
+  };
+}
+
+async function getCampaignById(campaignId, clientId) {
+  const res = await query(
+    `SELECT c.*,
+       CASE WHEN c.total_contacts > 0
+         THEN ROUND((c.delivered_count::numeric / c.total_contacts) * 100, 1)
+         ELSE 0 END as delivery_rate,
+       CASE WHEN c.sent_count > 0
+         THEN ROUND((c.read_count::numeric / c.sent_count) * 100, 1)
+         ELSE 0 END as read_rate,
+       u.email as created_by_email
+     FROM campaigns c
+     LEFT JOIN users u ON c.created_by = u.id
+     WHERE c.id = $1 ${clientId ? 'AND c.client_id = $2' : ''}`,
+    clientId ? [campaignId, clientId] : [campaignId]
+  );
+
+  if (res.rows.length === 0) {
+    throw { statusCode: 404, code: 'NOT_FOUND', message: 'Campagne non trouvée' };
+  }
+  return res.rows[0];
+}
+
+async function getCampaignStats(campaignId, clientId) {
+  const campaign = await getCampaignById(campaignId, clientId);
+
+  // 🔥 Utiliser la table campaign_stats_daily au lieu de recalculer
+  const daily = await query(
+    `SELECT stat_date, sent, delivered, read, failed, replied, cost
+     FROM campaign_stats_daily
+     WHERE campaign_id = $1
+     ORDER BY stat_date ASC`,
+    [campaignId]
+  );
+
+  const contactStats = await query(
+    `SELECT status, COUNT(*) as count
+     FROM campaign_contacts
+     WHERE campaign_id = $1
+     GROUP BY status`,
+    [campaignId]
+  );
+
+  const statusMap = {};
+  for (const row of contactStats.rows) {
+    statusMap[row.status] = parseInt(row.count);
+  }
+
+  return {
+    success: true,
+    campaign: {
+      id: campaign.id,
+      name: campaign.name,
+      status: campaign.status,
+      total_contacts: campaign.total_contacts,
+      sent_count: campaign.sent_count,
+      delivered_count: campaign.delivered_count,
+      read_count: campaign.read_count,
+      failed_count: campaign.failed_count,
+      replied_count: campaign.replied_count,
+      delivery_rate: campaign.delivery_rate,
+      read_rate: campaign.read_rate,
+      actual_cost: campaign.actual_cost,
+      started_at: campaign.started_at,
+      completed_at: campaign.completed_at
+    },
+    contact_status_breakdown: statusMap,
+    daily_stats: daily.rows  // Maintenant alimenté par les triggers
+  };
+}
+
+async function getGlobalCampaignStats(clientId) {
+  // Correction: Ne pas utiliser clientId = null
+  if (!clientId) {
+    throw { statusCode: 400, code: 'CLIENT_ID_REQUIRED', message: 'Client ID requis' };
+  }
+
+  const res = await query(
+    `SELECT
+       COUNT(*) as total_campaigns,
+       COUNT(CASE WHEN status = 'running' THEN 1 END) as active_campaigns,
+       COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_campaigns,
+       COALESCE(SUM(total_contacts), 0) as total_contacts,
+       COALESCE(SUM(sent_count), 0) as total_sent,
+       COALESCE(SUM(delivered_count), 0) as total_delivered,
+       COALESCE(SUM(read_count), 0) as total_read,
+       COALESCE(SUM(failed_count), 0) as total_failed,
+       COALESCE(SUM(actual_cost), 0) as total_cost,
+       CASE WHEN SUM(sent_count) > 0
+         THEN ROUND((SUM(delivered_count)::numeric / SUM(sent_count)) * 100, 1)
+         ELSE 0 END as avg_delivery_rate,
+       CASE WHEN SUM(sent_count) > 0
+         THEN ROUND((SUM(read_count)::numeric / SUM(sent_count)) * 100, 1)
+         ELSE 0 END as avg_read_rate
+     FROM campaigns
+     WHERE client_id = $1`,
+    [clientId]
+  );
+
+  const recent = await query(
+    `SELECT id, name, status, total_contacts, sent_count, delivered_count, read_count,
+       created_at, started_at, completed_at
+     FROM campaigns
+     WHERE client_id = $1
+     ORDER BY created_at DESC
+     LIMIT 5`,
+    [clientId]
+  );
+
+  // 🔥 UTILISER LA TABLE campaign_stats_daily (alimentée par les triggers)
+  const dailyStats = await query(
+    `SELECT 
+       ds.stat_date,
+       SUM(ds.sent) as sent,
+       SUM(ds.delivered) as delivered,
+       SUM(ds.read) as read,
+       SUM(ds.failed) as failed,
+       SUM(ds.cost) as cost
+     FROM campaign_stats_daily ds
+     INNER JOIN campaigns c ON c.id = ds.campaign_id
+     WHERE c.client_id = $1
+       AND ds.stat_date >= (CURRENT_DATE - INTERVAL '7 days')
+     GROUP BY ds.stat_date
+     ORDER BY ds.stat_date ASC`,
+    [clientId]
+  );
+
+  return {
+    success: true,
+    stats: res.rows[0],
+    recent_campaigns: recent.rows,
+    daily_stats: dailyStats.rows  // Maintenant avec les vraies données des triggers
+  };
+}
+
+async function getCampaignContacts(campaignId, clientId, filters = {}) {
+  await getCampaignById(campaignId, clientId); // vérifier accès
+  const { page = 1, limit = 50, status, search } = filters;
+  const offset = (page - 1) * limit;
+
+  let where = 'WHERE campaign_id = $1';
+  const params = [campaignId];
+  let idx = 2;
+
+  if (status) { where += ` AND status = $${idx++}`; params.push(status); }
+  if (search) {
+    where += ` AND (phone_number ILIKE $${idx} OR name ILIKE $${idx})`;
+    params.push(`%${search}%`); idx++;
+  }
+
+  const countRes = await query(`SELECT COUNT(*) FROM campaign_contacts ${where}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  const res = await query(
+    `SELECT * FROM campaign_contacts ${where} ORDER BY created_at ASC LIMIT $${idx} OFFSET $${idx+1}`,
+    [...params, limit, offset]
+  );
+
+  return {
+    success: true,
+    contacts: res.rows,
+    pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / limit) }
+  };
+}
+
+async function getCampaignLogs(campaignId, clientId, filters = {}) {
+  await getCampaignById(campaignId, clientId);
+  const { limit = 100, level } = filters;
+
+  let where = 'WHERE campaign_id = $1';
+  const params = [campaignId];
+  if (level) { where += ' AND level = $2'; params.push(level); }
+
+  const res = await query(
+    `SELECT * FROM campaign_logs ${where} ORDER BY created_at DESC LIMIT $${params.length + 1}`,
+    [...params, limit]
+  );
+
+  return { success: true, logs: res.rows };
+}
+
+// ============================================================
+// UTILITAIRES INTERNES
+// ============================================================
+
+async function logCampaignEvent(db, campaignId, contactId, level, event, message, metadata = {}) {
+  await db.query(
+    `INSERT INTO campaign_logs (id, campaign_id, contact_id, level, event, message, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [uuidv4(), campaignId, contactId, level, event, message, JSON.stringify(metadata)]
+  );
+}
+
+async function logCampaignEventDirect(campaignId, level, event, message, metadata = {}) {
+  try {
+    await query(
+      `INSERT INTO campaign_logs (id, campaign_id, level, event, message, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uuidv4(), campaignId, level, event, message, JSON.stringify(metadata)]
+    );
+  } catch(e) {
+    logger.error('Erreur log campagne:', e);
+  }
+}
+
+function normalizePhoneForCampaign(phone) {
+  if (!phone) return null;
+  let cleaned = String(phone).replace(/[\s\-\(\)\.]/g, '').replace(/\D/g, '');
+  if (!cleaned) return null;
+
+  if (cleaned.startsWith('237') && cleaned.length >= 12) return `+${cleaned}`;
+  if (cleaned.length === 9) return `+237${cleaned}`;
+  if (cleaned.length === 8) return `+2376${cleaned}`;
+  if (cleaned.length >= 10) return `+${cleaned}`;
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * fonction utilitaire
+ */
+
+function parseContactVariables(variables) {
+  if (!variables) return {};
+  if (typeof variables === 'object') return variables;
+  if (typeof variables === 'string') {
+    try {
+      return JSON.parse(variables);
+    } catch(e) {
+      console.error('Erreur parsing variables:', e);
+      return {};
+    }
+  }
+  return {};
+}
+
+/**
+ * Mettre à jour les stats de la campagne (appelé depuis webhook WATI)
+ */
+async function updateCampaignContactStatus(waMessageId, newStatus) {
+  try {
+    console.log(`📊 updateCampaignContactStatus: waMessageId=${waMessageId}, newStatus=${newStatus}`);
+
+    const campaignResult = await query(
+      `SELECT metadata->>'campaign_id' as campaign_id,
+              metadata->>'contact_id' as contact_id
+       FROM messages
+       WHERE wa_message_id = $1
+       LIMIT 1`,
+      [waMessageId]
+    );
+
+    if (campaignResult.rows.length === 0) {
+      console.log(`❌ Aucun message trouvé`);
+      return;
+    }
+
+    const { campaign_id, contact_id } = campaignResult.rows[0];
+
+    if (!campaign_id || !contact_id) return;
+
+    // Mettre à jour le statut du contact
+    const tsField = { sent: 'sent_at', delivered: 'delivered_at', read: 'read_at', failed: 'failed_at' }[newStatus];
+
+    await query(
+      `UPDATE campaign_contacts
+       SET status = $1 ${tsField ? `, ${tsField} = NOW()` : ''}, updated_at = NOW()
+       WHERE id = $2`,
+      [newStatus, contact_id]
+    );
+
+    // 🔥 Si c'est un delivered, mettre à jour sent_at aussi
+    if (newStatus === 'delivered') {
+      await query(
+        `UPDATE campaign_contacts 
+         SET sent_at = NOW() 
+         WHERE id = $1 AND sent_at IS NULL`,
+        [contact_id]
+      );
+    }
+
+    // RECALCULER TOUS LES COMPTEURS
+    const stats = await query(
+      `SELECT
+         COUNT(*) as total_contacts,
+         COUNT(CASE WHEN status IN ('sent', 'delivered', 'read') THEN 1 END) as sent_count,
+         COUNT(CASE WHEN status IN ('delivered', 'read') THEN 1 END) as delivered_count,
+         COUNT(CASE WHEN status = 'read' THEN 1 END) as read_count,
+         COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_count
+       FROM campaign_contacts
+       WHERE campaign_id = $1`,
+      [campaign_id]
+    );
+
+    const s = stats.rows[0];
+
+    await query(
+      `UPDATE campaigns
+       SET sent_count = $1,
+           delivered_count = $2,
+           read_count = $3,
+           failed_count = $4,
+           updated_at = NOW()
+       WHERE id = $5`,
+      [s.sent_count, s.delivered_count, s.read_count, s.failed_count, campaign_id]
+    );
+
+    // Recalculer le coût
+    const clientResult = await query(
+      `SELECT message_cost FROM clients
+       WHERE id = (SELECT client_id FROM campaigns WHERE id = $1)`,
+      [campaign_id]
+    );
+
+    const costPerMessage = parseFloat(clientResult.rows[0]?.message_cost || 20);
+    const actualCost = (s.delivered_count * costPerMessage) / 620;
+
+    await query(
+      `UPDATE campaigns SET actual_cost = $1 WHERE id = $2`,
+      [actualCost.toFixed(4), campaign_id]
+    );
+
+    console.log(`✅ Campaign ${campaign_id}: sent=${s.sent_count}, delivered=${s.delivered_count}, read=${s.read_count}, cost=${actualCost}`);
+
+  } catch (error) {
+    logger.error('Erreur updateCampaignContactStatus:', error);
+  }
+}
+
+// ============================================================
+// EXPORTS
+// ============================================================
+
+module.exports = {
+  createCampaign,
+  updateCampaign,
+  getCampaigns,
+  getCampaignById,
+  getCampaignStats,
+  getGlobalCampaignStats,
+  getCampaignContacts,
+  getCampaignLogs,
+  launchCampaign,
+  pauseCampaign,
+  cancelCampaign,
+  importContactsFromCSV,
+  importContactsFromExcel,
+  updateCampaignContactStatus,
+  normalizePhoneForCampaign
+};

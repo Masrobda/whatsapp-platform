@@ -1,0 +1,468 @@
+// app/dashboard/chatbot/page.tsx
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+
+// URL de base (nettoyée pour éviter le double /api/v1)
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com';
+const baseUrl = API_BASE.replace(/\/api\/v1\/?$/, '');
+
+function getAuthToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem('token');
+}
+
+async function apiFetch(path: string, options: RequestInit = {}) {
+  const token = getAuthToken();
+  const res = await fetch(`${baseUrl}/api/v1${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  const data = await res.json();
+  if (!res.ok || data.success === false) {
+    throw new Error(data.error || data.message || 'Erreur API');
+  }
+  return data;
+}
+
+// ─── TYPES ─────────────────────────────────────────────────────────
+type Stats = {
+  conversations: {
+    lang_select: string;
+    main_menu: string;
+    invoice_input: string;
+    invoice_confirm: string;
+    last_invoice_input: string;
+    currently_locked: string;
+    active_today: string;
+    total_conversations: string;
+  };
+  contacts: { total_activated: string; activated_today: string };
+  link_clicks: { clicks_total: string; clicks_today: string };
+};
+
+type Conversation = {
+  phone: string;
+  language: string | null;
+  state: string;
+  contact_name: string | null;
+  invoice_attempts: number;
+  locked_until: string | null;
+  last_message_at: string;
+};
+
+type ActivatedContact = {
+  contract_number: string;
+  client_name: string;
+  whatsapp_phone: string;
+  activated_at: string;
+};
+
+type LinkClick = {
+  date: string;   // format 'YYYY-MM-DD'
+  clicks: number;
+};
+
+// ─── CONSTANTES ────────────────────────────────────────────────────
+const STATE_LABELS: Record<string, string> = {
+  LANG_SELECT: 'Choix de langue',
+  MAIN_MENU: 'Menu principal',
+  INVOICE_CONTRACT_INPUT: 'Saisie contrat (facture digitale)',
+  INVOICE_CONFIRM: 'Confirmation contrat',
+  LAST_INVOICE_CONTRACT_INPUT: 'Saisie contrat (dernière facture)',
+};
+
+function isLocked(lockedUntil: string | null) {
+  return !!lockedUntil && new Date(lockedUntil).getTime() > Date.now();
+}
+
+function lockCountdown(lockedUntil: string) {
+  const ms = new Date(lockedUntil).getTime() - Date.now();
+  if (ms <= 0) return 'Expiré';
+  return `${Math.ceil(ms / 60000)} min restantes`;
+}
+
+// ─── COMPOSANT PRINCIPAL ──────────────────────────────────────────
+export default function ChatbotDashboardPage() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [tab, setTab] = useState<'conversations' | 'contracts' | 'clicks'>('conversations');
+
+  // Conversations
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [convPagination, setConvPagination] = useState({ total: 0, page: 1, totalPages: 1 });
+  const [stateFilter, setStateFilter] = useState('');
+  const [lockedOnly, setLockedOnly] = useState(false);
+  const [phoneFilter, setPhoneFilter] = useState('');
+
+  // Contacts activés
+  const [contacts, setContacts] = useState<ActivatedContact[]>([]);
+  const [contactsPagination, setContactsPagination] = useState({ total: 0, page: 1, totalPages: 1 });
+  const [contractSearch, setContractSearch] = useState('');
+
+  // Clics sur le lien
+  const [linkClicks, setLinkClicks] = useState<LinkClick[]>([]);
+  const [loadingClicks, setLoadingClicks] = useState(false);
+
+  // États communs
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // ─── CHARGEMENT DES DONNÉES ────────────────────────────────────
+
+  const loadStats = useCallback(async () => {
+    try {
+      const data = await apiFetch('/bot/stats');
+      setStats(data.stats);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }, []);
+
+  const loadConversations = useCallback(async (page = 1) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (stateFilter) params.set('state', stateFilter);
+      if (phoneFilter) params.set('phone', phoneFilter);
+      if (lockedOnly) params.set('locked', 'true');
+      params.set('page', String(page));
+      params.set('limit', '20');
+
+      const data = await apiFetch(`/bot/conversations?${params.toString()}`);
+      setConversations(data.conversations);
+      setConvPagination(data.pagination);
+      setError(null);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [stateFilter, phoneFilter, lockedOnly]);
+
+  const loadContacts = useCallback(async (page = 1) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (contractSearch) params.set('search', contractSearch);
+      params.set('page', String(page));
+      params.set('limit', '20');
+
+      const data = await apiFetch(`/bot/contracts?${params.toString()}`);
+      setContacts(data.contacts);
+      setContactsPagination(data.pagination);
+      setError(null);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [contractSearch]);
+
+  const loadLinkClicks = useCallback(async (days = 7) => {
+    setLoadingClicks(true);
+    try {
+      const data = await apiFetch(`/bot/link-clicks?days=${days}`);
+      setLinkClicks(data.clicks || []);
+      setError(null);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoadingClicks(false);
+    }
+  }, []);
+
+  async function handleUnlock(phone: string) {
+    try {
+      await apiFetch(`/bot/conversations/${encodeURIComponent(phone)}/unlock`, { method: 'POST' });
+      loadConversations(convPagination.page);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }
+
+  // ─── EFFETS ─────────────────────────────────────────────────────
+
+  useEffect(() => {
+    loadStats();
+    const interval = setInterval(loadStats, 30000);
+    return () => clearInterval(interval);
+  }, [loadStats]);
+
+  useEffect(() => {
+    if (tab === 'conversations') loadConversations(1);
+  }, [tab, stateFilter, phoneFilter, lockedOnly, loadConversations]);
+
+  useEffect(() => {
+    if (tab === 'contracts') loadContacts(1);
+  }, [tab, contractSearch, loadContacts]);
+
+  useEffect(() => {
+    if (tab === 'clicks') loadLinkClicks(7);
+  }, [tab, loadLinkClicks]);
+
+  // ─── RENDU ──────────────────────────────────────────────────────
+
+  return (
+    <div className="p-6 space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold text-primary">Chatbot Socadel</h1>
+        <p className="text-neutral-500">Suivi des conversations, abonnements et activité du bot WhatsApp.</p>
+      </div>
+
+      {error && <div className="alert-info border-red-400 bg-red-50 text-red-700">{error}</div>}
+
+      {/* Cartes de stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <StatCard label="Conversations actives (24h)" value={stats?.conversations.active_today} />
+        <StatCard label="Comptes bloqués" value={stats?.conversations.currently_locked} isDanger />
+        <StatCard label="Abonnements activés" value={stats?.contacts.total_activated} />
+        <StatCard label="Activés aujourd'hui" value={stats?.contacts.activated_today} />
+      </div>
+
+      {/* Répartition par état */}
+      <div className="card">
+        <h2 className="text-sm font-semibold text-neutral-600 mb-3">Répartition des conversations par étape</h2>
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
+          <StateChip label="Choix langue" value={stats?.conversations.lang_select} />
+          <StateChip label="Menu principal" value={stats?.conversations.main_menu} />
+          <StateChip label="Saisie contrat" value={stats?.conversations.invoice_input} />
+          <StateChip label="Confirmation" value={stats?.conversations.invoice_confirm} />
+          <StateChip label="Dernière facture" value={stats?.conversations.last_invoice_input} />
+        </div>
+      </div>
+
+      {/* Onglets */}
+      <div className="flex gap-4 border-b border-neutral-200">
+        <button
+          className={`pb-2 px-1 ${tab === 'conversations' ? 'nav-link-active' : 'nav-link'}`}
+          onClick={() => setTab('conversations')}
+        >
+          Conversations
+        </button>
+        <button
+          className={`pb-2 px-1 ${tab === 'contracts' ? 'nav-link-active' : 'nav-link'}`}
+          onClick={() => setTab('contracts')}
+        >
+          Abonnements activés
+        </button>
+        <button
+          className={`pb-2 px-1 ${tab === 'clicks' ? 'nav-link-active' : 'nav-link'}`}
+          onClick={() => setTab('clicks')}
+        >
+          Clics sur le lien
+        </button>
+      </div>
+
+      {/* ─── CONTENU DES ONGLETS ────────────────────────────────── */}
+
+      {tab === 'conversations' && (
+        <div className="space-y-4">
+          <div className="card flex flex-wrap gap-4 items-end">
+            <div>
+              <label className="block text-sm text-neutral-600 mb-1">Étape</label>
+              <select className="text-input px-3 py-2" value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}>
+                <option value="">Toutes</option>
+                {Object.entries(STATE_LABELS).map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm text-neutral-600 mb-1">Numéro</label>
+              <input className="text-input px-3 py-2" placeholder="+237..." value={phoneFilter} onChange={(e) => setPhoneFilter(e.target.value)} />
+            </div>
+            <label className="flex items-center gap-2 text-sm text-neutral-600">
+              <input type="checkbox" checked={lockedOnly} onChange={(e) => setLockedOnly(e.target.checked)} />
+              Bloqués uniquement
+            </label>
+            <button className="btn-outline" onClick={() => loadConversations(1)}>Rafraîchir</button>
+          </div>
+
+          <div className="card overflow-x-auto">
+            <table className="table-standard">
+              <thead>
+                <tr>
+                  <th className="px-4 py-2 text-left">Numéro</th>
+                  <th className="px-4 py-2 text-left">Nom</th>
+                  <th className="px-4 py-2 text-left">Langue</th>
+                  <th className="px-4 py-2 text-left">Étape</th>
+                  <th className="px-4 py-2 text-left">Tentatives</th>
+                  <th className="px-4 py-2 text-left">Statut</th>
+                  <th className="px-4 py-2 text-left">Dernier message</th>
+                  <th className="px-4 py-2 text-left">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && <tr><td colSpan={8} className="px-4 py-6 text-center text-neutral-500">Chargement...</td></tr>}
+                {!loading && conversations.length === 0 && (
+                  <tr><td colSpan={8} className="px-4 py-6 text-center text-neutral-500">Aucune conversation</td></tr>
+                )}
+                {conversations.map((c) => (
+                  <tr key={c.phone}>
+                    <td className="px-4 py-2">{c.phone}</td>
+                    <td className="px-4 py-2">{c.contact_name || '—'}</td>
+                    <td className="px-4 py-2 uppercase text-sm">{c.language || '—'}</td>
+                    <td className="px-4 py-2 text-sm">{STATE_LABELS[c.state] || c.state}</td>
+                    <td className="px-4 py-2 text-sm">{c.invoice_attempts}/3</td>
+                    <td className="px-4 py-2">
+                      {isLocked(c.locked_until) ? (
+                        <span className="badge-warning bg-red-100 text-red-700">Bloqué — {lockCountdown(c.locked_until!)}</span>
+                      ) : (
+                        <span className="badge-success">Actif</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2 text-sm text-neutral-500">{new Date(c.last_message_at).toLocaleString('fr-FR')}</td>
+                    <td className="px-4 py-2">
+                      {isLocked(c.locked_until) && (
+                        <button className="btn-outline text-sm px-3 py-1" onClick={() => handleUnlock(c.phone)}>
+                          Débloquer
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pagination pagination={convPagination} onChange={(p) => loadConversations(p)} />
+          </div>
+        </div>
+      )}
+
+      {tab === 'contracts' && (
+        <div className="space-y-4">
+          <div className="card flex flex-wrap gap-4 items-end">
+            <div>
+              <label className="block text-sm text-neutral-600 mb-1">Recherche</label>
+              <input
+                className="text-input px-3 py-2"
+                placeholder="N° contrat, nom, numéro..."
+                value={contractSearch}
+                onChange={(e) => setContractSearch(e.target.value)}
+              />
+            </div>
+            <button className="btn-outline" onClick={() => loadContacts(1)}>Rafraîchir</button>
+          </div>
+
+          <div className="card overflow-x-auto">
+            <table className="table-standard">
+              <thead>
+                <tr>
+                  <th className="px-4 py-2 text-left">Contrat</th>
+                  <th className="px-4 py-2 text-left">Client</th>
+                  <th className="px-4 py-2 text-left">Numéro WhatsApp</th>
+                  <th className="px-4 py-2 text-left">Activé le</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && <tr><td colSpan={4} className="px-4 py-6 text-center text-neutral-500">Chargement...</td></tr>}
+                {!loading && contacts.length === 0 && (
+                  <tr><td colSpan={4} className="px-4 py-6 text-center text-neutral-500">Aucun abonnement activé</td></tr>
+                )}
+                {contacts.map((c) => (
+                  <tr key={`${c.contract_number}-${c.whatsapp_phone}`}>
+                    <td className="px-4 py-2">{c.contract_number}</td>
+                    <td className="px-4 py-2">{c.client_name}</td>
+                    <td className="px-4 py-2">{c.whatsapp_phone}</td>
+                    <td className="px-4 py-2 text-sm text-neutral-500">{new Date(c.activated_at).toLocaleString('fr-FR')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pagination pagination={contactsPagination} onChange={(p) => loadContacts(p)} />
+          </div>
+        </div>
+      )}
+
+      {tab === 'clicks' && (
+        <div className="space-y-4">
+          <div className="card flex flex-wrap gap-4 items-end">
+            <div>
+              <label className="block text-sm text-neutral-600 mb-1">Période (jours)</label>
+              <select
+                className="text-input px-3 py-2"
+                defaultValue={7}
+                onChange={(e) => loadLinkClicks(parseInt(e.target.value))}
+              >
+                <option value={7}>7 derniers jours</option>
+                <option value={14}>14 derniers jours</option>
+                <option value={30}>30 derniers jours</option>
+              </select>
+            </div>
+            <button className="btn-outline" onClick={() => loadLinkClicks()}>Rafraîchir</button>
+          </div>
+
+          <div className="card overflow-x-auto">
+            <table className="table-standard">
+              <thead>
+                <tr>
+                  <th className="px-4 py-2 text-left">Date</th>
+                  <th className="px-4 py-2 text-left">Nombre de clics</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loadingClicks && (
+                  <tr><td colSpan={2} className="px-4 py-6 text-center text-neutral-500">Chargement...</td></tr>
+                )}
+                {!loadingClicks && linkClicks.length === 0 && (
+                  <tr><td colSpan={2} className="px-4 py-6 text-center text-neutral-500">Aucun clic enregistré</td></tr>
+                )}
+                {linkClicks.map((item) => (
+                  <tr key={item.date}>
+                    <td className="px-4 py-2">{new Date(item.date).toLocaleDateString('fr-FR')}</td>
+                    <td className="px-4 py-2 font-semibold">{item.clicks}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── COMPOSANTS UTILITAIRES ──────────────────────────────────────
+
+function StatCard({ label, value, isDanger }: { label: string; value?: string; isDanger?: boolean }) {
+  return (
+    <div className="card">
+      <div className="text-sm text-neutral-500">{label}</div>
+      <div className={`text-3xl font-semibold mt-1 ${isDanger ? 'text-red-600' : 'text-primary'}`}>{value ?? '—'}</div>
+    </div>
+  );
+}
+
+function StateChip({ label, value }: { label: string; value?: string }) {
+  return (
+    <div className="bg-neutral-100 rounded-lg px-3 py-2 text-center">
+      <div className="text-lg font-semibold text-primary">{value ?? '—'}</div>
+      <div className="text-neutral-500">{label}</div>
+    </div>
+  );
+}
+
+function Pagination({
+  pagination,
+  onChange,
+}: {
+  pagination: { total: number; page: number; totalPages: number };
+  onChange: (page: number) => void;
+}) {
+  return (
+    <div className="flex justify-between items-center mt-4 text-sm text-neutral-500">
+      <span>{pagination.total} résultat(s) — page {pagination.page}/{pagination.totalPages || 1}</span>
+      <div className="flex gap-2">
+        <button className="btn-outline px-3 py-1" disabled={pagination.page <= 1} onClick={() => onChange(pagination.page - 1)}>
+          Précédent
+        </button>
+        <button className="btn-outline px-3 py-1" disabled={pagination.page >= pagination.totalPages} onClick={() => onChange(pagination.page + 1)}>
+          Suivant
+        </button>
+      </div>
+    </div>
+  );
+}

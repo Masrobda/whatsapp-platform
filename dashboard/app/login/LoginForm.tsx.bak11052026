@@ -1,0 +1,190 @@
+'use client';
+
+import { useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
+import { auth } from '@/lib/api';
+import Cookies from 'js-cookie';
+import Button from '@/components/ui/Button';
+import Input from '@/components/ui/Input';
+import { FiMail, FiLock, FiAlertCircle } from 'react-icons/fi';
+
+export default function LoginForm() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const sessionExpired = searchParams.get('session') === 'expired';
+
+  const [formData, setFormData] = useState({
+    email: '',
+    password: '',
+    rememberMe: false,
+  });
+  const [userType, setUserType] = useState<'client' | 'user'>('client');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setIsLoading(true);
+
+    try {
+      const loginRes = await auth.login(formData.email, formData.password, userType);
+      const token = loginRes.token;
+      const rawUserData = loginRes.user || loginRes.client;
+
+      if (!rawUserData) {
+        throw new Error("L'API n'a renvoyé aucune donnée utilisateur.");
+      }
+
+      const userData = {
+        ...rawUserData,
+        type: rawUserData.type || userType,
+      };
+
+      Cookies.set('token', token, { expires: formData.rememberMe ? 30 : 7 });
+      Cookies.set('user', JSON.stringify(userData), {
+        expires: formData.rememberMe ? 30 : 7,
+        path: '/',
+      });
+
+      // Réinitialiser le timer d'inactivité au login
+      localStorage.setItem('lastActivity', Date.now().toString());
+
+      window.location.href = '/dashboard';
+    } catch (err: any) {
+      let serverMessage = 'Une erreur est survenue. Veuillez réessayer.';
+
+      if (err.response?.data?.message) {
+        serverMessage = err.response.data.message;
+      } else if (err.response?.data?.code) {
+        const code = err.response.data.code;
+        if (code === 'ACCOUNT_BLOCKED_TEMP') {
+          serverMessage = err.response.data.message || 'Compte temporairement bloqué.';
+        } else if (code === 'ACCOUNT_BLOCKED') {
+          serverMessage = err.response.data.message || 'Compte bloqué définitivement.';
+        } else if (code === 'ACCOUNT_DISABLED') {
+          serverMessage = err.response.data.message || 'Compte désactivé.';
+        }
+      }
+
+      setError(serverMessage);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <>
+      {/* Message session expirée */}
+      {sessionExpired && (
+        <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg text-yellow-800 text-center">
+          <p className="font-medium text-lg">Session terminée pour inactivité</p>
+          <p className="text-sm mt-2">
+            Vous avez été déconnecté automatiquement après 30 minutes sans activité.<br />
+            Veuillez vous reconnecter.
+          </p>
+        </div>
+      )}
+
+      {/* Toggle Client/Équipe */}
+      <div className="flex gap-2 mb-6 p-1 bg-gray-100 rounded-lg">
+        <button
+          type="button"
+          onClick={() => setUserType('client')}
+          className={`flex-1 py-2 px-4 rounded-md font-medium transition-all ${
+            userType === 'client'
+              ? 'bg-white text-primary shadow-sm'
+              : 'text-gray-600 hover:text-dark'
+          }`}
+        >
+          Client
+        </button>
+        <button
+          type="button"
+          onClick={() => setUserType('user')}
+          className={`flex-1 py-2 px-4 rounded-md font-medium transition-all ${
+            userType === 'user'
+              ? 'bg-white text-primary shadow-sm'
+              : 'text-gray-600 hover:text-dark'
+          }`}
+        >
+          Équipe
+        </button>
+      </div>
+
+      {/* Erreur générale */}
+      {error && (
+        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-error">
+          <FiAlertCircle className="flex-shrink-0" />
+          <span className="text-sm">{error}</span>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <Input
+          type="email"
+          label="Email"
+          placeholder="votre@email.com"
+          icon={<FiMail />}
+          value={formData.email}
+          onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+          required
+        />
+
+        <Input
+          type="password"
+          label="Mot de passe"
+          placeholder="••••••••"
+          icon={<FiLock />}
+          value={formData.password}
+          onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+          required
+        />
+
+        <div className="flex items-center justify-between">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={formData.rememberMe}
+              onChange={(e) => setFormData({ ...formData, rememberMe: e.target.checked })}
+              className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+            />
+            <span className="text-sm text-gray-600">Se souvenir de moi</span>
+          </label>
+
+          <Link
+            href="/forgot-password"
+            className="text-sm text-primary hover:text-primary-dark font-medium"
+          >
+            Mot de passe oublié ?
+          </Link>
+        </div>
+
+        <Button
+          type="submit"
+          variant="primary"
+          className="w-full"
+          isLoading={isLoading}
+        >
+          Se connecter
+        </Button>
+      </form>
+
+      <div className="relative my-6">
+        <div className="absolute inset-0 flex items-center">
+          <div className="w-full border-t border-gray-300" />
+        </div>
+        <div className="relative flex justify-center text-sm">
+          <span className="px-2 bg-white text-gray-500">Nouveau client ?</span>
+        </div>
+      </div>
+
+      <Link href="/register">
+        <Button variant="outline" className="w-full">
+          Créer un compte
+        </Button>
+      </Link>
+    </>
+  );
+}

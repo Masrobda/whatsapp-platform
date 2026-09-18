@@ -1,0 +1,10 @@
+export function middleware(request) {
+  // Forcer le rechargement des chunks
+  const response = NextResponse.next();
+  response.headers.set('Cache-Control', 'no-store, must-revalidate');
+  return response;
+}
+
+export const config = {
+  matcher: '/dashboard/:path*',
+};

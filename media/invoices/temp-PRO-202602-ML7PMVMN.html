@@ -1,0 +1,321 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Facture Proforma PRO-202602-ML7PMVMN</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 20mm;
+    }
+
+    body {
+      font-family: 'Arial', sans-serif;
+      margin: 0;
+      padding: 0;
+      color: #333;
+      line-height: 1.5;
+      font-size: 12px;
+      position: relative;
+    }
+
+    .watermark {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate(-45deg);
+      font-size: 80px;
+      color: rgba(45, 80, 22, 0.08);
+      font-weight: bold;
+      z-index: -1;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 30px;
+      border-bottom: 3px solid #2d5016;
+      padding-bottom: 15px;
+    }
+
+    .logo {
+      font-size: 28px;
+      font-weight: bold;
+      color: #2d5016;
+      margin-bottom: 5px;
+    }
+
+    .company-info {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #555;
+    }
+
+    .invoice-info {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 30px;
+      gap: 20px;
+    }
+
+    .client-info, .invoice-details {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .section-title {
+      font-weight: bold;
+      color: #2d5016;
+      margin-bottom: 10px;
+      border-bottom: 2px solid #8bc34a;
+      padding-bottom: 5px;
+      font-size: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      font-size: 11px;
+    }
+
+    th {
+      background: #2d5016;
+      color: white;
+      padding: 10px 8px;
+      text-align: left;
+      font-weight: bold;
+      border: 1px solid #1a3a0d;
+    }
+
+    td {
+      padding: 10px 8px;
+      border: 1px solid #ddd;
+    }
+
+    .total-section {
+      margin-top: 25px;
+      text-align: right;
+    }
+
+    .total-row {
+      display: flex;
+      justify-content flex-end;
+      margin: 6px 0;
+    }
+
+    .total-label {
+      width: 150px;
+      font-weight: bold;
+      text-align: right;
+      padding-right: 15px;
+    }
+
+    .total-value {
+      width: 120px;
+      text-align: right;
+      font-weight: bold;
+    }
+
+    .grand-total {
+      font-size: 14px;
+      color: #2d5016;
+      font-weight: bold;
+      border-top: 2px solid #2d5016;
+      padding-top: 8px;
+      margin-top: 8px;
+    }
+
+    .footer {
+      margin-top: 40px;
+      text-align: center;
+      font-size: 10px;
+      color: #777;
+      border-top: 1px solid #ddd;
+      padding-top: 15px;
+    }
+
+    /* Zones pour le tampon et QR code (visibles dans l'éditeur) */
+    .stamp-area {
+      position: fixed;
+      right: 30mm;
+      bottom: 30mm;
+      width: 120px;
+      height: 120px;
+      opacity: 0.8;
+      z-index: 1000;
+    }
+
+    .qr-area {
+      position: fixed;
+      right: 20mm;
+      bottom: 10mm;
+      width: 80px;
+      height: 80px;
+      z-index: 1000;
+    }
+
+    .qr-text {
+      position: fixed;
+      right: 20mm;
+      bottom: 7mm;
+      font-size: 8px;
+      color: #666;
+      text-align: center;
+      width: 80px;
+      z-index: 1000;
+    }
+
+    .stamp-text {
+      position: fixed;
+      right: 30mm;
+      bottom: 25mm;
+      font-size: 9px;
+      color: #2d5016;
+      text-align: center;
+      width: 120px;
+      font-weight: bold;
+      z-index: 1000;
+    }
+
+    /* Cacher les zones en impression */
+    @media print {
+      .stamp-area, .qr-area, .qr-text, .stamp-text {
+        display: none;
+      }
+    }
+
+    /* Styling pour les montants */
+    .amount {
+      text-align: right;
+      font-family: 'Courier New', monospace;
+    }
+
+    .page-break {
+      page-break-before: always;
+    }
+  </style>
+</head>
+<body>
+  <!-- Watermark -->
+  <div class="watermark">PROFORMA</div>
+
+  <!-- Zones indicatives (visibles seulement dans l'éditeur) -->
+  <div class="stamp-area">
+    <div style="border: 2px dashed #2d5016; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #2d5016; font-size: 10px;">
+      TAMPON ICI
+    </div>
+  </div>
+  <div class="stamp-text">TAMPON OFFICIEL</div>
+  
+  <div class="qr-area">
+    <div style="border: 2px dashed #007bff; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #007bff; font-size: 10px;">
+      QR CODE ICI
+    </div>
+  </div>
+  <div class="qr-text">Scanner pour vérifier</div>
+
+  <!-- En-tête -->
+  <div class="header">
+    <div class="logo">NEXT LTD</div>
+    <div class="company-info">
+      Numeric EXport Technologies<br>
+      Douala, Cameroun<br>
+      Email: team@numericexport.com | Web: numericexport.com<br>
+      RCCM: CM-DLA-2023-B12345 | NUI: P123456789012
+    </div>
+  </div>
+
+  <!-- Informations client et facture -->
+  <div class="invoice-info">
+    <div class="client-info">
+      <div class="section-title">FACTURÉ À</div>
+      <strong>Ma Super Entreprise</strong><br>
+      test@example.com<br>
+      <br>
+      Douala, Cameroun<br>
+      
+    </div>
+
+    <div class="invoice-details">
+      <div class="section-title">DÉTAILS FACTURE</div>
+      <strong>FACTURE PROFORMA</strong><br>
+      <strong>N° :</strong> PRO-202602-ML7PMVMN<br>
+      <strong>Date :</strong> 04/02/2026<br>
+      <strong>Échéance :</strong> 06/03/2026<br>
+      <strong>Commande :</strong> ORD-ML7PM1NR-D75F3A<br>
+      <strong>Référence client :</strong> CLT-47139571
+    </div>
+  </div>
+
+  <!-- Tableau des produits -->
+  <table>
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th style="text-align: center;">Quantité</th>
+        <th style="text-align: right;">Prix Unitaire</th>
+        <th style="text-align: right;">Montant</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Messages WhatsApp Business API</td>
+        <td style="text-align: center;">100</td>
+        <td style="text-align: right;" class="amount">15.00 FCFA</td>
+        <td style="text-align: right;" class="amount">1500.00 FCFA</td>
+      </tr>
+      <tr>
+        <td colspan="3" style="text-align: right; font-weight: bold;">Sous-total HT :</td>
+        <td style="text-align: right; font-weight: bold;" class="amount">1500.00 FCFA</td>
+      </tr>
+      <tr>
+        <td colspan="3" style="text-align: right;">TVA (19.25%) :</td>
+        <td style="text-align: right;" class="amount">288.75 FCFA</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- Total -->
+  <div class="total-section">
+    <div class="total-row">
+      <div class="total-label">TOTAL TTC :</div>
+      <div class="total-value grand-total">1788.75 FCFA</div>
+    </div>
+  </div>
+
+  <!-- Conditions et mentions -->
+  <div class="footer">
+    <div style="text-align: left; margin-bottom: 15px;">
+      <strong>Conditions de paiement :</strong><br>
+      Paiement par virement bancaire dans les 30 jours suivant la date de facture.<br>
+      Tout retard de paiement entraînera l'application d'intérêts de retard au taux légal.
+    </div>
+    
+    <div style="text-align: left; margin-bottom: 15px;">
+      <strong>Informations bancaires :</strong><br>
+      NEXT LTD<br>
+      Banque: Banque Commerciale<br>
+      IBAN: CM21 2000 1000 1234 5678 9012 345<br>
+      BIC/SWIFT: BCMCXXXXXXX
+    </div>
+    
+    <div style="margin: 20px 0; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
+      <strong>Mentions légales :</strong><br>
+      Facture établie en conformité avec la législation en vigueur.<br>
+      Cette facture proforma n'a pas de valeur comptable.<br>
+      Toute réclamation doit être formulée par écrit dans les 8 jours suivant la réception.
+    </div>
+    
+    <div style="margin-top: 30px; font-size: 9px; color: #666;">
+      Document généré électroniquement le 04/02/2026 à 07:32:40<br>
+      Facture PRO-202602-ML7PMVMN | Commande ORD-ML7PM1NR-D75F3A<br>
+      © 2026 NEXT LTD - Tous droits réservés
+    </div>
+  </div>
+</body>
+</html>
+    

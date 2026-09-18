@@ -1,0 +1,157 @@
+// api/src/services/socadel-invoice-send.service.js
+'use strict';
+
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const CHATBOT_CLIENT_ID =
+  process.env.CHATBOT_CLIENT_ID || 'ccd14b70-aa49-4906-8abc-5ff097e16107';
+
+/**
+ * Envoie la dernière facture pour un contrat et enregistre le pending
+ * pour flag ABONNE au delivered/read (étape 4).
+ *
+ * Non bloquant côté appelant : à lancer en setImmediate / Promise.allSettled.
+ */
+async function sendLastInvoiceAfterRegister({
+  contractNumber,
+  recipientPhone,
+  collector = {},
+  clientId = CHATBOT_CLIENT_ID
+}) {
+  if (!contractNumber || !recipientPhone) {
+    return { success: false, message: 'contractNumber et recipientPhone requis' };
+  }
+
+  // 1) Pending dès le départ (même si l'envoi échoue on a la trace)
+  const pendingIns = await query(
+    `INSERT INTO socadel_invoice_pending
+       (contract_number, recipient_phone, channel, collected_by_type, collected_by_id, status)
+     VALUES ($1, $2, 'whatsapp', $3, $4, 'pending')
+     RETURNING id`,
+    [
+      contractNumber,
+      recipientPhone,
+      collector.type || null,
+      collector.id || null
+    ]
+  );
+  const pendingId = pendingIns.rows[0]?.id;
+
+  try {
+    // 2) Utiliser le service facture existant (template + PDF)
+    const lastInvoiceService = require('./last-invoice.service');
+
+    // botNumber optionnel : last-invoice / WATI résolvent souvent le channel
+    const botNumber =
+      process.env.CHATBOT_WHATSAPP_NUMBER ||
+      process.env.SOCADEL_INVOICE_WHATSAPP_NUMBER ||
+      null;
+
+    const result = await lastInvoiceService.requestLastInvoice(
+      contractNumber,
+      recipientPhone,
+      botNumber
+    );
+
+    if (result?.success) {
+      // Si last-invoice renvoie des ids, les stocker
+      const messageId = result.messageId || result.message_id || null;
+      const watiLocalId =
+        result.localMessageId ||
+        result.wati_local_id ||
+        result.watiMessageId ||
+        null;
+
+      await query(
+        `UPDATE socadel_invoice_pending
+         SET status = 'sent',
+             message_id = COALESCE($2, message_id),
+             wati_local_id = COALESCE($3, wati_local_id)
+         WHERE id = $1`,
+        [pendingId, messageId, watiLocalId]
+      );
+
+      logger.info(
+        `[SOCADEL-INVOICE] Facture envoyée contrat=${contractNumber} phone=${recipientPhone} pending=${pendingId}`
+      );
+
+      return {
+        success: true,
+        pendingId,
+        messageId,
+        watiLocalId,
+        alreadySent: !!result.alreadySent
+      };
+    }
+
+    // Échec métier (pas de facture, template, etc.)
+    await query(
+      `UPDATE socadel_invoice_pending SET status = 'failed' WHERE id = $1`,
+      [pendingId]
+    );
+
+    logger.warn(
+      `[SOCADEL-INVOICE] Échec envoi contrat=${contractNumber}: ${result?.message || 'inconnu'}`
+    );
+
+    return {
+      success: false,
+      pendingId,
+      message: result?.message || 'Échec envoi facture'
+    };
+  } catch (err) {
+    logger.error(`[SOCADEL-INVOICE] Erreur contrat=${contractNumber}:`, err.message);
+
+    if (pendingId) {
+      await query(
+        `UPDATE socadel_invoice_pending SET status = 'failed' WHERE id = $1`,
+        [pendingId]
+      ).catch(() => {});
+    }
+
+    return { success: false, pendingId, message: err.message };
+  }
+}
+
+/**
+ * Envoie une facture pour chaque contrat (parallèle borné)
+ */
+async function sendLastInvoicesForContracts({
+  contracts,
+  recipientPhone,
+  collector
+}) {
+  const list = [...new Set((contracts || []).filter(Boolean))];
+  if (!list.length || !recipientPhone) {
+    return { results: [], sent: 0, failed: 0 };
+  }
+
+  const results = await Promise.allSettled(
+    list.map((contractNumber) =>
+      sendLastInvoiceAfterRegister({
+        contractNumber,
+        recipientPhone,
+        collector
+      })
+    )
+  );
+
+  const mapped = results.map((r, i) => ({
+    contract: list[i],
+    ...(r.status === 'fulfilled'
+      ? r.value
+      : { success: false, message: r.reason?.message || 'error' })
+  }));
+
+  return {
+    results: mapped,
+    sent: mapped.filter((x) => x.success).length,
+    failed: mapped.filter((x) => !x.success).length
+  };
+}
+
+module.exports = {
+  sendLastInvoiceAfterRegister,
+  sendLastInvoicesForContracts
+};

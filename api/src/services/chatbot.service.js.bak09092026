@@ -1,0 +1,748 @@
+// api/src/services/chatbot.service.js
+'use strict';
+
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const CONTRACT_REGEX = /^20\d{7}$/;
+const MAX_ATTEMPTS = 3;
+const LOCK_MINUTES = 15;
+const INACTIVITY_MINUTES = 3;
+
+const MESSAGES = {
+  fr: {
+    welcome: () =>
+      `Bienvenue chez Socadel 👋\nJe suis ravi(e) de vous aider aujourd'hui.\n\n` +
+      `Si vous souhaitez communiquer en français, tapez 1\n` +
+      `If you'd like to continue in English, type 2\n\n1️⃣ Français\n2️⃣ English`,
+
+    greeting: (name) => `Bonjour ${name} 👋\nComment puis-je vous aider ?`,
+
+    langInvalid: () => `Choix invalide. Tapez 1 pour Français ou 2 pour English.`,
+
+    mainMenu: (name) =>
+      `Cher(e) ${name}, pour vous aider rapidement, veuillez choisir :\n\n` +
+      `1️⃣ S'inscrire à la facture digitale\n` +
+      `2️⃣ Recevoir ma dernière facture\n` +
+      `3️⃣ Terminer la conversation`,
+
+    menuInvalid: () =>
+      `Choix invalide. Tapez :\n` +
+      `1️⃣ S'inscrire à la facture digitale\n` +
+      `2️⃣ Recevoir ma dernière facture\n` +
+      `3️⃣ Terminer la conversation`,
+
+    legalWarning: () =>
+      `⚠️ Important — sécurité et responsabilité\n\n` +
+      `N'inscrivez que vos propres contrats. L'utilisation d'un numéro de contrat ` +
+      `qui ne vous appartient pas peut entraîner le refus du service, la suspension ` +
+      `de l'accès digital, et le cas échéant des poursuites en cas d'usage frauduleux ` +
+      `de données ou de documents d'autrui.\n\n` +
+      `Tapez OUI pour continuer l'inscription, ou NON pour annuler.`,
+
+    invoicePrompt: () =>
+      `SOCADEL — Facture digitale 📄\n` +
+      `Saisissez votre n° de contrat (9 chiffres, commence par 20).\nEx: 203456789`,
+
+    formatError: (attempt) =>
+      `Format incorrect. Le n° de contrat doit avoir 9 chiffres et commencer par 20. (tentative ${attempt}/${MAX_ATTEMPTS})`,
+
+    contractNotFound: (attempt) =>
+      `Numéro de contrat introuvable. Vérifiez et réessayez. (tentative ${attempt}/${MAX_ATTEMPTS})`,
+
+    confirm: (contract, name) =>
+      `Vérification :\nContrat ${contract}\nTitulaire : ${name}\n\n` +
+      `Confirmez-vous qu'il s'agit bien de votre contrat ?\n✅ OUI | ❌ NON`,
+
+    alreadyLinked: (contract, maskedPhone) =>
+      `Le contrat ${contract} est déjà associé au numéro WhatsApp ${maskedPhone}.\n\n` +
+      `Souhaitez-vous tout de même poursuivre l'inscription avec VOTRE numéro actuel ?\n` +
+      `✅ OUI (poursuivre) | ❌ NON (annuler)`,
+
+    confirmInvalid: () => `Merci de répondre par OUI ou NON.`,
+
+    confirmDeny: (attempt) =>
+      `Saisissez à nouveau le numéro de contrat (tentative ${attempt}/${MAX_ATTEMPTS})`,
+
+    locked: () =>
+      `Trop d'erreurs consécutives. Accès bloqué pendant ${LOCK_MINUTES} min.`,
+
+    stillLocked: (min) =>
+      `Limite de tentatives atteinte. Réessayez dans ${min} minute(s).`,
+
+    subscribeSuccess: (name) =>
+      `${name}, votre inscription à la facture digitale est activée. ` +
+      `Vous recevrez vos factures sur WhatsApp via nos numéros officiels.\n` +
+      `Merci pour votre engagement écoresponsable.\n\nService client : 8010`,
+
+    phoneLimit: () =>
+      `Ce numéro WhatsApp est déjà lié au maximum de 10 contrats. ` +
+      `Contactez le 8010 pour assistance.`,
+
+    // Dernière facture — sécurisée
+    lastInvoiceNoContract: () =>
+      `Aucun contrat n'est associé à votre numéro WhatsApp.\n` +
+      `Inscrivez-vous d'abord à la facture digitale (option 1), puis réessayez.`,
+
+    lastInvoiceList: (lines) =>
+      `Contrats associés à votre WhatsApp :\n\n${lines}\n\n` +
+      `Répondez avec le numéro de la liste (ex: 1) pour recevoir la facture.`,
+
+    lastInvoiceInvalidChoice: () =>
+      `Choix invalide. Répondez avec le numéro correspondant au contrat dans la liste.`,
+
+    lastInvoiceDenied: () =>
+      `Accès refusé : ce contrat n'est pas associé à votre numéro WhatsApp.\n` +
+      `La consultation de facture est limitée aux contrats enregistrés sur ce numéro.`,
+
+    lastInvoiceAck: () =>
+      `Merci, nous traitons votre demande. Vous recevrez votre dernière facture sous peu.`,
+
+    invoiceAlreadySent: () =>
+      `Cette facture vous a déjà été envoyée. Consultez votre historique WhatsApp.`,
+
+    goodbye: () =>
+      `Merci de nous avoir contactés. N'hésitez pas à revenir vers nous.\nÀ bientôt — Socadel.`,
+
+    inactivityClose: () =>
+      `Merci de nous avoir contactés. N'hésitez pas à revenir vers nous.`,
+  },
+
+  en: {
+    welcome: () =>
+      `Welcome to Socadel 👋\nI'm happy to help you today.\n\n` +
+      `Si vous souhaitez communiquer en français, tapez 1\n` +
+      `If you'd like to continue in English, type 2\n\n1️⃣ Français\n2️⃣ English`,
+
+    greeting: (name) => `Hello ${name} 👋\nHow can I help you?`,
+
+    langInvalid: () => `Invalid choice. Type 1 for Français or 2 for English.`,
+
+    mainMenu: (name) =>
+      `Dear ${name}, please choose an option:\n\n` +
+      `1️⃣ Subscribe to digital invoice\n` +
+      `2️⃣ Receive my latest invoice\n` +
+      `3️⃣ End conversation`,
+
+    menuInvalid: () =>
+      `Invalid choice. Type:\n` +
+      `1️⃣ Subscribe to digital invoice\n` +
+      `2️⃣ Receive my latest invoice\n` +
+      `3️⃣ End conversation`,
+
+    legalWarning: () =>
+      `⚠️ Important — security & liability\n\n` +
+      `Only register your own contracts. Using someone else's contract number ` +
+      `may lead to service refusal, suspension of digital access, and possible ` +
+      `legal action in case of fraudulent use of another person's data or documents.\n\n` +
+      `Type YES to continue registration, or NO to cancel.`,
+
+    invoicePrompt: () =>
+      `SOCADEL — Digital invoice 📄\n` +
+      `Enter your contract number (9 digits, starting with 20).\nEx: 203456789`,
+
+    formatError: (attempt) =>
+      `Invalid format. Contract number must have 9 digits and start with 20. (attempt ${attempt}/${MAX_ATTEMPTS})`,
+
+    contractNotFound: (attempt) =>
+      `Contract not found. Please check and try again. (attempt ${attempt}/${MAX_ATTEMPTS})`,
+
+    confirm: (contract, name) =>
+      `Verification:\nContract ${contract}\nAccount holder: ${name}\n\n` +
+      `Do you confirm this is your contract?\n✅ YES | ❌ NO`,
+
+    alreadyLinked: (contract, maskedPhone) =>
+      `Contract ${contract} is already linked to WhatsApp ${maskedPhone}.\n\n` +
+      `Do you still want to continue registration with YOUR current number?\n` +
+      `✅ YES (continue) | ❌ NO (cancel)`,
+
+    confirmInvalid: () => `Please reply with YES or NO.`,
+
+    confirmDeny: (attempt) =>
+      `Please re-enter the contract number (attempt ${attempt}/${MAX_ATTEMPTS})`,
+
+    locked: () =>
+      `Too many consecutive errors. Access locked for ${LOCK_MINUTES} min.`,
+
+    stillLocked: (min) =>
+      `Attempt limit reached. Please try again in ${min} minute(s).`,
+
+    subscribeSuccess: (name) =>
+      `${name}, your digital invoice subscription is active. ` +
+      `You will receive invoices on WhatsApp via our official numbers.\n` +
+      `Thank you for your eco-responsible commitment.\n\nCustomer service: 8010`,
+
+    phoneLimit: () =>
+      `This WhatsApp number is already linked to the maximum of 10 contracts. ` +
+      `Please contact 8010 for assistance.`,
+
+    lastInvoiceNoContract: () =>
+      `No contract is linked to your WhatsApp number.\n` +
+      `Please subscribe to digital invoice first (option 1), then try again.`,
+
+    lastInvoiceList: (lines) =>
+      `Contracts linked to your WhatsApp:\n\n${lines}\n\n` +
+      `Reply with the list number (e.g. 1) to receive the invoice.`,
+
+    lastInvoiceInvalidChoice: () =>
+      `Invalid choice. Reply with the number matching a contract in the list.`,
+
+    lastInvoiceDenied: () =>
+      `Access denied: this contract is not linked to your WhatsApp number.\n` +
+      `Invoice access is limited to contracts registered on this number.`,
+
+    lastInvoiceAck: () =>
+      `Thank you, we are processing your request. You will receive your latest invoice shortly.`,
+
+    invoiceAlreadySent: () =>
+      `This invoice was already sent. Please check your WhatsApp history.`,
+
+    goodbye: () =>
+      `Thank you for contacting us. Feel free to reach out again.\nSee you soon — Socadel.`,
+
+    inactivityClose: () =>
+      `Thank you for contacting us. Feel free to reach out again.`,
+  },
+};
+
+function normalizeInput(text) {
+  return (text || '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .trim();
+}
+
+function isYes(input) {
+  return ['oui', 'yes', '1', 'o', 'y'].includes(input);
+}
+
+function isNo(input) {
+  return ['non', 'no', 'n'].includes(input);
+}
+
+function isGreeting(input) {
+  const g = [
+    'bonjour', 'bonsoir', 'salut', 'hello', 'hi', 'hey', 'good morning',
+    'good afternoon', 'good evening', 'bjr', 'bsr', 'coucou'
+  ];
+  return g.some((w) => input === w || input.startsWith(w + ' '));
+}
+
+function maskPhone(phone) {
+  const p = normalizePhone(phone);
+  if (p.length < 6) return '****';
+  return p.slice(0, 4) + '****' + p.slice(-3);
+}
+
+function normalizePhone(p) {
+  if (!p) return '';
+  return String(p).replace(/[^0-9+]/g, '').trim();
+}
+
+// ============================================================
+// CONVERSATION
+// ============================================================
+async function getOrCreateConversation(phone, botNumber) {
+  const existing = await query(`SELECT * FROM bot_conversations WHERE phone = $1`, [phone]);
+  if (existing.rows.length > 0) {
+    // Rouvrir si clôturée
+    if (existing.rows[0].closed_at) {
+      await query(
+        `UPDATE bot_conversations SET closed_at = NULL, state = COALESCE(state, 'MAIN_MENU'), updated_at = NOW()
+         WHERE phone = $1`,
+        [phone]
+      );
+      const refreshed = await query(`SELECT * FROM bot_conversations WHERE phone = $1`, [phone]);
+      return refreshed.rows[0];
+    }
+    return existing.rows[0];
+  }
+  const created = await query(
+    `INSERT INTO bot_conversations (phone, bot_number, state)
+     VALUES ($1, $2, 'LANG_SELECT')
+     RETURNING *`,
+    [phone, botNumber]
+  );
+  return created.rows[0];
+}
+
+async function updateConversation(phone, fields) {
+  const setClauses = [];
+  const values = [];
+  for (const [key, value] of Object.entries(fields)) {
+    values.push(value);
+    setClauses.push(`${key} = $${values.length}`);
+  }
+  values.push(phone);
+  await query(
+    `UPDATE bot_conversations
+     SET ${setClauses.join(', ')}, updated_at = NOW(), last_message_at = NOW()
+     WHERE phone = $${values.length}`,
+    values
+  );
+}
+
+function remainingLockMinutes(lockedUntil) {
+  if (!lockedUntil) return 0;
+  const ms = new Date(lockedUntil).getTime() - Date.now();
+  return ms > 0 ? Math.ceil(ms / 60000) : 0;
+}
+
+// ============================================================
+// LOOKUPS
+// ============================================================
+async function findContract(contractNumber) {
+  const result = await query(
+    `SELECT contract_number, client_name FROM contracts
+     WHERE contract_number = $1 AND is_active = true`,
+    [contractNumber]
+  );
+  return result.rows[0] || null;
+}
+
+/** Contrats liés à ce WhatsApp (principal + secondaires) */
+async function findContractsForPhone(phone) {
+  const norm = normalizePhone(phone);
+  const result = await query(
+    `
+    SELECT DISTINCT contract_number, client_name, whatsapp_phone, 'primary' AS src
+    FROM whatsapp_valid_contacts
+    WHERE regexp_replace(COALESCE(whatsapp_phone, ''), '[^0-9+]', '', 'g')
+        = regexp_replace($1, '[^0-9+]', '', 'g')
+    UNION
+    SELECT DISTINCT wcp.contract_number,
+           COALESCE(wvc.client_name, c.client_name) AS client_name,
+           wcp.whatsapp_phone,
+           'secondary' AS src
+    FROM whatsapp_contact_phones wcp
+    LEFT JOIN whatsapp_valid_contacts wvc ON wvc.contract_number = wcp.contract_number
+    LEFT JOIN contracts c ON c.contract_number = wcp.contract_number
+    WHERE regexp_replace(COALESCE(wcp.whatsapp_phone, ''), '[^0-9+]', '', 'g')
+        = regexp_replace($1, '[^0-9+]', '', 'g')
+    ORDER BY contract_number
+    `,
+    [norm]
+  );
+  // Dédupliquer par contract_number
+  const map = new Map();
+  for (const row of result.rows) {
+    if (!map.has(row.contract_number)) map.set(row.contract_number, row);
+  }
+  return [...map.values()];
+}
+
+async function isContractLinkedToPhone(contractNumber, phone) {
+  const list = await findContractsForPhone(phone);
+  return list.some((c) => c.contract_number === contractNumber);
+}
+
+async function countContractsForPhone(phone) {
+  const r = await query(
+    `SELECT COUNT(DISTINCT contract_number)::int AS n
+     FROM whatsapp_valid_contacts
+     WHERE regexp_replace(COALESCE(whatsapp_phone, ''), '[^0-9+]', '', 'g')
+         = regexp_replace($1, '[^0-9+]', '', 'g')`,
+    [phone]
+  );
+  return r.rows[0]?.n || 0;
+}
+
+async function activateContact(contractNumber, clientName, phone) {
+  const existing = await query(
+    `SELECT whatsapp_phone, activated_at, client_name
+     FROM whatsapp_valid_contacts WHERE contract_number = $1`,
+    [contractNumber]
+  );
+
+  if (existing.rows.length > 0) {
+    const currentPhone = existing.rows[0].whatsapp_phone;
+    const same = normalizePhone(currentPhone) === normalizePhone(phone);
+    if (!same && phone) {
+      await query(
+        `INSERT INTO whatsapp_contact_phones
+           (contract_number, whatsapp_phone, source, is_primary, collected_by_type)
+         VALUES ($1, $2, 'chatbot', false, 'chatbot')
+         ON CONFLICT (contract_number, whatsapp_phone) DO NOTHING`,
+        [contractNumber, phone]
+      );
+    }
+    if (clientName && clientName !== existing.rows[0].client_name) {
+      await query(
+        `UPDATE whatsapp_valid_contacts SET client_name = $1 WHERE contract_number = $2`,
+        [clientName, contractNumber]
+      );
+    }
+    return { mode: 'already_subscribed', keptPrimary: true, secondaryAdded: !same };
+  }
+
+  const n = await countContractsForPhone(phone);
+  if (n >= 10) {
+    const err = new Error('PHONE_LIMIT_10');
+    err.code = 'PHONE_LIMIT_10';
+    throw err;
+  }
+
+  await query(
+    `INSERT INTO whatsapp_valid_contacts
+       (contract_number, client_name, whatsapp_phone, activated_at)
+     VALUES ($1, $2, $3, NOW())`,
+    [contractNumber, clientName, phone]
+  );
+  await query(
+    `INSERT INTO whatsapp_contact_phones
+       (contract_number, whatsapp_phone, source, is_primary, collected_by_type)
+     VALUES ($1, $2, 'chatbot', true, 'chatbot')
+     ON CONFLICT (contract_number, whatsapp_phone) DO NOTHING`,
+    [contractNumber, phone]
+  );
+  return { mode: 'created' };
+}
+
+async function handleInvoiceAttemptFailure(phone, conversation, t, errorMessageFn, repromptFn, backToState) {
+  const attempts = (conversation.invoice_attempts || 0) + 1;
+  if (attempts >= MAX_ATTEMPTS) {
+    const lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60000);
+    await updateConversation(phone, {
+      invoice_attempts: attempts,
+      locked_until: lockedUntil,
+      state: backToState || conversation.state,
+    });
+    return { reply: t.locked() };
+  }
+  await updateConversation(phone, {
+    invoice_attempts: attempts,
+    state: backToState || conversation.state,
+  });
+  return { reply: `${errorMessageFn(attempts)}\n\n${repromptFn()}` };
+}
+
+async function closeConversation(phone, t) {
+  await updateConversation(phone, {
+    state: 'MAIN_MENU',
+    closed_at: new Date(),
+    draft_contract_number: null,
+    draft_client_name: null,
+    draft_existing_phone: null,
+    invoice_attempts: 0,
+  });
+  return { reply: t.goodbye() };
+}
+
+// ============================================================
+// MOTEUR
+// ============================================================
+async function processIncomingText({ phone, text, senderName, botNumber }) {
+  let conversation = await getOrCreateConversation(phone, botNumber);
+
+  if (conversation.locked_until && new Date(conversation.locked_until) <= new Date()) {
+    await updateConversation(phone, { locked_until: null, invoice_attempts: 0 });
+    conversation.locked_until = null;
+    conversation.invoice_attempts = 0;
+  }
+
+  const lang = conversation.language || 'fr';
+  const t = MESSAGES[lang] || MESSAGES.fr;
+  const input = normalizeInput(text);
+  const displayName = conversation.contact_name || senderName || 'Client';
+
+  // Première interaction / langue
+  if (conversation.state === 'LANG_SELECT' && !conversation.language) {
+    if (input === '1' || input === '2') {
+      const language = input === '1' ? 'fr' : 'en';
+      await updateConversation(phone, {
+        language,
+        contact_name: displayName,
+        state: 'MAIN_MENU',
+        closed_at: null,
+      });
+      return {
+        reply: MESSAGES[language].mainMenu(displayName),
+        requiresTemplate: true,
+      };
+    }
+    await updateConversation(phone, { contact_name: displayName });
+    return { reply: MESSAGES.fr.welcome(), requiresTemplate: true };
+  }
+
+  // Salutation en cours de conversation → politesse + menu
+  if (
+    conversation.language &&
+    conversation.state === 'MAIN_MENU' &&
+    isGreeting(input)
+  ) {
+    return {
+      reply: `${t.greeting(displayName)}\n\n${t.mainMenu(displayName)}`,
+    };
+  }
+
+  switch (conversation.state) {
+    case 'LANG_SELECT': {
+      if (input === '1' || input === '2') {
+        const language = input === '1' ? 'fr' : 'en';
+        await updateConversation(phone, { language, state: 'MAIN_MENU', closed_at: null });
+        return { reply: MESSAGES[language].mainMenu(displayName) };
+      }
+      return { reply: t.langInvalid() };
+    }
+
+    case 'MAIN_MENU': {
+      if (input === '1') {
+        const lockLeft = remainingLockMinutes(conversation.locked_until);
+        if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+        await updateConversation(phone, {
+          state: 'INVOICE_LEGAL',
+          invoice_attempts: 0,
+          draft_contract_number: null,
+          draft_client_name: null,
+          draft_existing_phone: null,
+        });
+        return { reply: t.legalWarning() };
+      }
+      if (input === '2') {
+        const contracts = await findContractsForPhone(phone);
+        if (!contracts.length) {
+          return { reply: t.lastInvoiceNoContract() };
+        }
+        const lines = contracts
+          .map((c, i) => `${i + 1}. ${c.contract_number} — ${c.client_name || 'Client'}`)
+          .join('\n');
+        // Stocker la liste ordonnée dans draft (JSON limité) via draft_client_name détourné
+        // Mieux: utiliser draft_contract_number pour le choix ; on stocke JSON dans un champ texte
+        await updateConversation(phone, {
+          state: 'LAST_INVOICE_SELECT',
+          draft_client_name: JSON.stringify(
+            contracts.map((c) => c.contract_number)
+          ),
+        });
+        return { reply: t.lastInvoiceList(lines) };
+      }
+      if (input === '3') {
+        return closeConversation(phone, t);
+      }
+      return { reply: t.menuInvalid() };
+    }
+
+    case 'INVOICE_LEGAL': {
+      if (isYes(input)) {
+        await updateConversation(phone, { state: 'INVOICE_CONTRACT_INPUT' });
+        return { reply: t.invoicePrompt() };
+      }
+      if (isNo(input)) {
+        await updateConversation(phone, { state: 'MAIN_MENU' });
+        return { reply: t.mainMenu(displayName) };
+      }
+      return { reply: t.confirmInvalid() };
+    }
+
+    case 'INVOICE_CONTRACT_INPUT': {
+      const lockLeft = remainingLockMinutes(conversation.locked_until);
+      if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+
+      // Accepter aussi "20xxxxxxxx" sans normaliser trop agressivement
+      const raw = (text || '').toString().replace(/\s/g, '');
+      const contractInput = CONTRACT_REGEX.test(input) ? input : raw;
+
+      if (!CONTRACT_REGEX.test(contractInput)) {
+        return handleInvoiceAttemptFailure(phone, conversation, t, t.formatError, t.invoicePrompt);
+      }
+
+      const contract = await findContract(contractInput);
+      if (!contract) {
+        return handleInvoiceAttemptFailure(phone, conversation, t, t.contractNotFound, t.invoicePrompt);
+      }
+
+      // Déjà un WhatsApp principal différent ?
+      const existingLink = await query(
+        `SELECT whatsapp_phone FROM whatsapp_valid_contacts WHERE contract_number = $1`,
+        [contract.contract_number]
+      );
+
+      if (
+        existingLink.rows.length > 0 &&
+        normalizePhone(existingLink.rows[0].whatsapp_phone) !== normalizePhone(phone)
+      ) {
+        await updateConversation(phone, {
+          state: 'INVOICE_ALREADY_LINKED',
+          draft_contract_number: contract.contract_number,
+          draft_client_name: contract.client_name,
+          draft_existing_phone: existingLink.rows[0].whatsapp_phone,
+        });
+        return {
+          reply: t.alreadyLinked(
+            contract.contract_number,
+            maskPhone(existingLink.rows[0].whatsapp_phone)
+          ),
+        };
+      }
+
+      await updateConversation(phone, {
+        state: 'INVOICE_CONFIRM',
+        draft_contract_number: contract.contract_number,
+        draft_client_name: contract.client_name,
+        draft_existing_phone: null,
+      });
+      return {
+        reply: t.confirm(contract.contract_number, contract.client_name),
+      };
+    }
+
+    case 'INVOICE_ALREADY_LINKED': {
+      if (isYes(input)) {
+        // Poursuite → confirmation identité titulaire
+        await updateConversation(phone, { state: 'INVOICE_CONFIRM' });
+        return {
+          reply: t.confirm(
+            conversation.draft_contract_number,
+            conversation.draft_client_name
+          ),
+        };
+      }
+      if (isNo(input)) {
+        await updateConversation(phone, {
+          state: 'MAIN_MENU',
+          draft_contract_number: null,
+          draft_client_name: null,
+          draft_existing_phone: null,
+        });
+        return { reply: t.mainMenu(displayName) };
+      }
+      return { reply: t.confirmInvalid() };
+    }
+
+    case 'INVOICE_CONFIRM': {
+      const lockLeft = remainingLockMinutes(conversation.locked_until);
+      if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+
+      if (isYes(input)) {
+        const name = conversation.draft_client_name;
+        try {
+          await activateContact(
+            conversation.draft_contract_number,
+            conversation.draft_client_name,
+            phone
+          );
+        } catch (e) {
+          if (e.code === 'PHONE_LIMIT_10') {
+            await updateConversation(phone, {
+              state: 'MAIN_MENU',
+              invoice_attempts: 0,
+              draft_contract_number: null,
+              draft_client_name: null,
+              draft_existing_phone: null,
+            });
+            return { reply: t.phoneLimit() };
+          }
+          logger.error('[CHATBOT] activateContact error:', e.message);
+          throw e;
+        }
+        await updateConversation(phone, {
+          state: 'MAIN_MENU',
+          invoice_attempts: 0,
+          draft_contract_number: null,
+          draft_client_name: null,
+          draft_existing_phone: null,
+        });
+        return { reply: t.subscribeSuccess(name) };
+      }
+
+      if (isNo(input)) {
+        return handleInvoiceAttemptFailure(
+          phone,
+          conversation,
+          t,
+          t.confirmDeny,
+          t.invoicePrompt,
+          'INVOICE_CONTRACT_INPUT'
+        );
+      }
+      return { reply: t.confirmInvalid() };
+    }
+
+    case 'LAST_INVOICE_SELECT': {
+      let list = [];
+      try {
+        list = JSON.parse(conversation.draft_client_name || '[]');
+      } catch (_) {
+        list = [];
+      }
+      const idx = parseInt(input, 10);
+      if (!idx || idx < 1 || idx > list.length) {
+        return { reply: t.lastInvoiceInvalidChoice() };
+      }
+      const contractNumber = list[idx - 1];
+
+      // Double contrôle sécurité
+      const allowed = await isContractLinkedToPhone(contractNumber, phone);
+      if (!allowed) {
+        await updateConversation(phone, {
+          state: 'MAIN_MENU',
+          draft_client_name: null,
+        });
+        return { reply: t.lastInvoiceDenied() };
+      }
+
+      let replyMessage = t.lastInvoiceAck();
+      try {
+        const lastInvoiceService = require('./last-invoice.service');
+        const result = await lastInvoiceService.requestLastInvoice(
+          contractNumber,
+          phone,
+          botNumber
+        );
+        if (result.success === false && result.message) {
+          replyMessage = result.message;
+        }
+      } catch (err) {
+        logger.error('[CHATBOT] dernière facture:', err.message);
+      }
+
+      await updateConversation(phone, {
+        state: 'MAIN_MENU',
+        draft_client_name: null,
+      });
+      return { reply: replyMessage };
+    }
+
+    default: {
+      await updateConversation(phone, { state: 'MAIN_MENU' });
+      return { reply: t.mainMenu(displayName) };
+    }
+  }
+}
+
+/**
+ * Clôture les conversations inactives > 3 minutes (appelé par cron)
+ * @returns {Promise<Array<{phone, bot_number, language}>>}
+ */
+async function findInactiveConversations() {
+  const result = await query(
+    `SELECT phone, bot_number, language, contact_name
+     FROM bot_conversations
+     WHERE closed_at IS NULL
+       AND language IS NOT NULL
+       AND last_message_at IS NOT NULL
+       AND last_message_at < NOW() - INTERVAL '${INACTIVITY_MINUTES} minutes'
+       AND state IS DISTINCT FROM 'LANG_SELECT'`
+  );
+  return result.rows;
+}
+
+async function markClosed(phone) {
+  await query(
+    `UPDATE bot_conversations
+     SET closed_at = NOW(), state = 'MAIN_MENU', updated_at = NOW()
+     WHERE phone = $1`,
+    [phone]
+  );
+}
+
+module.exports = {
+  processIncomingText,
+  MESSAGES,
+  activateContact,
+  findInactiveConversations,
+  markClosed,
+  INACTIVITY_MINUTES,
+};
