@@ -1,0 +1,126 @@
+const fs = require('fs-extra');
+const path = require('path');
+const { pipeline } = require('stream/promises');
+const { v4: uuidv4 } = require('uuid');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const ffmpeg = require('fluent-ffmpeg');
+
+const STORAGE_PATH = process.env.STORAGE_PATH || '/var/www/storage/clients';
+
+async function convertToWhatsAppCompatible(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-c:v libx264', '-preset fast', '-crf 23',
+        '-maxrate 1.5M', '-bufsize 3M',
+        '-c:a aac', '-b:a 128k',
+        '-movflags +faststart',
+        '-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
+        '-pix_fmt yuv420p'
+      ])
+      .on('end', () => resolve())
+      .on('error', reject)
+      .save(outputPath);
+  });
+}
+
+async function uploadAndConvertVideoFromStream(stream, originalFilename, clientId, licensePlate = null) {
+  let tempInputPath = null;
+  let tempConvertedPath = null;
+  try {
+    // Chercher l'espace de stockage actif pour ce client
+    let spaceRes = await query(
+      `SELECT id FROM storage_spaces
+       WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL
+       LIMIT 1`,
+      [clientId]
+    );
+
+    let spaceId;
+    if (spaceRes.rowCount === 0) {
+      // Créer un espace par défaut (50 Mo)
+      logger.warn(`Aucun espace actif pour client ${clientId}, création automatique...`);
+      spaceId = uuidv4();
+      const defaultSizeBytes = 50 * 1024 * 1024; // 50 Mo
+      const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // +1 an
+
+      await query(
+        `INSERT INTO storage_spaces
+         (id, client_id, size_limit_bytes, current_usage_bytes, is_active, expires_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [spaceId, clientId, defaultSizeBytes, 0, true, expiresAt, clientId]
+      );
+      await fs.ensureDir(path.join(STORAGE_PATH, spaceId));
+      logger.info(`Espace de stockage créé pour client ${clientId} : ${spaceId}`);
+    } else {
+      spaceId = spaceRes.rows[0].id;
+    }
+
+    const clientFolder = path.join(STORAGE_PATH, spaceId);
+    await fs.ensureDir(clientFolder);
+
+    // Dossier temporaire
+    const tempDir = path.join(STORAGE_PATH, 'temp_conversion');
+    await fs.ensureDir(tempDir);
+    const uniqueId = uuidv4().replace(/-/g, '');
+    tempInputPath = path.join(tempDir, `input_${uniqueId}.tmp`);
+    tempConvertedPath = path.join(tempDir, `conv_${uniqueId}.mp4`);
+
+    // Écrire le flux d'entrée
+    const writeStream = fs.createWriteStream(tempInputPath);
+    await pipeline(stream, writeStream);
+
+    // Convertir en MP4 compatible WhatsApp
+    await convertToWhatsAppCompatible(tempInputPath, tempConvertedPath);
+
+    // Générer le nom final
+    const timestamp = Date.now();
+    const baseName = path.basename(originalFilename, path.extname(originalFilename)).replace(/[^a-zA-Z0-9]/g, '_');
+    const storedFilename = `${timestamp}-${uuidv4().substring(0,8)}-${baseName}.mp4`;
+    const finalPath = path.join(clientFolder, storedFilename);
+    await fs.move(tempConvertedPath, finalPath, { overwrite: true });
+
+    const stats = await fs.stat(finalPath);
+    const fileSize = stats.size;
+
+    // Enregistrer en base
+    await query(
+      `INSERT INTO storage_files
+       (space_id, filename, original_filename, file_path, file_size, mime_type, uploaded_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [spaceId, storedFilename, originalFilename, finalPath, fileSize, 'video/mp4', clientId]
+    );
+
+    // Générer l'URL publique
+    const publicToken = uuidv4().replace(/-/g, '');
+    const baseUrl = process.env.APP_URL || 'https://numericexport.cloud';
+    const safeOriginal = encodeURIComponent(originalFilename);
+    const publicUrl = `${baseUrl}/api/v1/storage/s/${publicToken}/${safeOriginal}`;
+    await query(
+      `UPDATE storage_files SET public_token = $1, public_url = $2
+       WHERE space_id = $3 AND filename = $4`,
+      [publicToken, publicUrl, spaceId, storedFilename]
+    );
+
+    // Mettre à jour l'utilisation de l'espace
+    await query(
+      `UPDATE storage_spaces
+       SET current_usage_bytes = current_usage_bytes + $1, last_activity = NOW()
+       WHERE id = $2`,
+      [fileSize, spaceId]
+    );
+
+    logger.info(`Vidéo uploadée avec succès : ${publicUrl}`);
+    return { success: true, publicUrl, filename: storedFilename, size: fileSize };
+
+  } catch (err) {
+    logger.error('[StorageUpload] Erreur:', err.message);
+    return { success: false, error: err.message };
+  } finally {
+    if (tempInputPath && await fs.pathExists(tempInputPath)) await fs.remove(tempInputPath).catch(() => {});
+    if (tempConvertedPath && await fs.pathExists(tempConvertedPath)) await fs.remove(tempConvertedPath).catch(() => {});
+  }
+}
+
+module.exports = { uploadAndConvertVideoFromStream };

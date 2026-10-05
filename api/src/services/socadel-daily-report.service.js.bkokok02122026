@@ -1,0 +1,954 @@
+// api/src/services/socadel-daily-report.service.js
+'use strict';
+
+const fs = require('fs');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const WHATSAPP_UNIT_VALUE = parseInt(process.env.SOCADEL_REPORT_UNIT_VALUE || '110', 10);
+const QUERY_TIMEOUT_MS = parseInt(process.env.SOCADEL_REPORT_QUERY_TIMEOUT_MS || '60000', 10);
+
+/* ───────────────────────── Helpers ───────────────────────── */
+const nbsp = (s) => String(s).replace(/[\u202f\u00a0]/g, '\u00a0');
+const fmt = (n) => nbsp(Number(n || 0).toLocaleString('fr-FR'));
+const fmtPct = (n) => nbsp(`${Number(n || 0).toFixed(1).replace('.', ',')} %`);
+const esc = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+function pct(num, den) {
+  if (!den || den <= 0) return 0;
+  return Math.round((Number(num) / Number(den)) * 1000) / 10;
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+function toDay(v) {
+  if (v instanceof Date) return v;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v));
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(v);
+}
+const ymd = (v) => {
+  const d = toDay(v);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const dm = (v) => {
+  const d = toDay(v);
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`;
+};
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timeout ${label} ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function step(label, fn, fallback) {
+  const t0 = Date.now();
+  try {
+    const r = await withTimeout(fn(), QUERY_TIMEOUT_MS, label);
+    logger.info(`[SOCADEL-REPORT] ${label} OK (+${Date.now() - t0}ms)`);
+    return r;
+  } catch (err) {
+    console.error(`[SOCADEL-REPORT] ${label} ÉCHEC: ${err.message}`);
+    try {
+      logger.error(`[SOCADEL-REPORT] ${label} ÉCHEC: ${err.message}`);
+    } catch (_) {}
+    if (fallback === undefined) throw err;
+    return fallback;
+  }
+}
+
+/* ───────────────────────── Données ───────────────────────── */
+async function getDateBounds() {
+  const r = await query(`
+    SELECT
+      (NOW() AT TIME ZONE 'Africa/Douala')::date AS today,
+      ((NOW() AT TIME ZONE 'Africa/Douala')::date::timestamp AT TIME ZONE 'Africa/Douala') AS today_start,
+      ((((NOW() AT TIME ZONE 'Africa/Douala')::date + 1)::timestamp) AT TIME ZONE 'Africa/Douala') AS tomorrow_start
+  `);
+  return r.rows[0];
+}
+
+function enrich(row) {
+  const abonne_digital = (row.whatsapp_ok || 0) + (row.sms || 0);
+  return {
+    ...row,
+    abonne_digital,
+    taux_collecte: pct(row.checked, row.total),
+    taux_abonne_digital: pct(abonne_digital, row.total),
+    taux_whatsapp: pct(row.whatsapp_ok, row.total),
+    taux_sms: pct(row.sms, row.total),
+    montant: abonne_digital * WHATSAPP_UNIT_VALUE,
+  };
+}
+
+/**
+ * Agrégats géo + global (1 scan).
+ * whatsapp_ok = statut ABONNE
+ * sms dans les tableaux géo = check OK + rapport OK (affichage répartition)
+ */
+async function fetchAggregates() {
+  const r = await query(`
+    SELECT
+      CASE GROUPING(region_n, division_n, mrc_n, agence_n)
+        WHEN 15 THEN 'global'
+        WHEN 7  THEN 'region'
+        WHEN 11 THEN 'division'
+        WHEN 13 THEN 'mrc'
+        WHEN 14 THEN 'agence'
+      END AS dim,
+      COALESCE(region_n, division_n, mrc_n, agence_n) AS label,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE has_phone)::int  AS collectes,
+      COUNT(*) FILTER (WHERE is_checked)::int AS checked,
+      COUNT(*) FILTER (WHERE is_wa)::int      AS whatsapp_ok,
+      COUNT(*) FILTER (WHERE is_sms)::int     AS sms
+    FROM (
+      SELECT
+        COALESCE(NULLIF(region::text,   ''), 'Non renseigné') AS region_n,
+        COALESCE(NULLIF(division::text, ''), 'Non renseigné') AS division_n,
+        COALESCE(NULLIF(mrc::text,      ''), 'Non renseigné') AS mrc_n,
+        COALESCE(NULLIF(agence::text,   ''), 'Non renseigné') AS agence_n,
+        (numero_telephone IS NOT NULL AND numero_telephone <> '') AS has_phone,
+        (check_status = 'OK') AS is_checked,
+        (statut = 'ABONNE')   AS is_wa,
+        (check_status = 'OK' AND UPPER(COALESCE(rapport, '')) = 'OK') AS is_sms
+      FROM socadel_contacts
+    ) s
+    GROUP BY GROUPING SETS ((region_n), (division_n), (mrc_n), (agence_n), ())
+  `);
+
+  const out = { global: null, region: [], division: [], mrc: [], agence: [] };
+  for (const row of r.rows) {
+    if (row.dim === 'global') out.global = enrich(row);
+    else if (out[row.dim]) out[row.dim].push(enrich(row));
+  }
+  for (const dim of ['region', 'division', 'mrc', 'agence']) {
+    out[dim].sort(
+      (a, b) =>
+        b.taux_abonne_digital - a.taux_abonne_digital ||
+        b.abonne_digital - a.abonne_digital ||
+        b.total - a.total
+    );
+    out[dim].forEach((row, i) => (row.rang = i + 1));
+  }
+  if (!out.global) {
+    out.global = enrich({ total: 0, collectes: 0, checked: 0, whatsapp_ok: 0, sms: 0 });
+  }
+  return out;
+}
+
+/**
+ * SMS (uniquement) / En attente Meta / Non délivrées
+ * Même logique que le dashboard stats.
+ */
+async function fetchNonAbonneBreakdown() {
+  const r = await query(`
+    WITH fc AS (
+      SELECT
+        service_no,
+        UPPER(COALESCE(rapport, 'MRA')) AS rap
+      FROM socadel_contacts
+      WHERE check_status = 'OK'
+        AND statut = 'NON ABONNE'
+    ),
+    inv AS (
+      SELECT
+        contract_number,
+        BOOL_OR(status = 'sent')    AS has_sent,
+        BOOL_OR(status = 'pending') AS has_pending,
+        BOOL_OR(status = 'failed')  AS has_failed
+      FROM socadel_invoice_pending
+      WHERE status IN ('sent', 'pending', 'failed')
+      GROUP BY contract_number
+    )
+    SELECT
+      COUNT(*) FILTER (WHERE fc.rap = 'MRA')::int                                 AS non_abonne_total,
+      COUNT(*) FILTER (WHERE fc.rap = 'MRA' AND inv.has_sent)::int                AS en_attente_meta,
+      COUNT(*) FILTER (WHERE fc.rap = 'MRA' AND inv.has_pending)::int             AS non_abonne_pending,
+      COUNT(*) FILTER (WHERE fc.rap = 'MRA' AND inv.has_failed)::int              AS non_delivrees,
+      COUNT(*) FILTER (WHERE fc.rap = 'MRA' AND inv.contract_number IS NULL)::int AS non_abonne_sans_envoi,
+      COUNT(*) FILTER (WHERE fc.rap = 'OK')::int                                  AS sms
+    FROM fc
+    LEFT JOIN inv ON inv.contract_number = fc.service_no
+  `);
+  return (
+    r.rows[0] || {
+      non_abonne_total: 0,
+      en_attente_meta: 0,
+      non_abonne_pending: 0,
+      non_delivrees: 0,
+      non_abonne_sans_envoi: 0,
+      sms: 0,
+    }
+  );
+}
+
+async function fetchItineraryQuality() {
+  const r = await query(`
+    SELECT
+      COUNT(*)::int AS n_itineraires,
+      COUNT(*) FILTER (WHERE taux >= 95)::int AS iti_ge_95,
+      COUNT(*) FILTER (WHERE taux < 95)::int  AS iti_lt_95
+    FROM (
+      SELECT
+        itineraires,
+        (COUNT(*) FILTER (WHERE check_status = 'OK')::float
+          / NULLIF(COUNT(*), 0) * 100) AS taux
+      FROM socadel_contacts
+      WHERE itineraires IS NOT NULL AND itineraires <> ''
+      GROUP BY itineraires
+    ) t
+  `);
+  return r.rows[0] || { n_itineraires: 0, iti_ge_95: 0, iti_lt_95: 0 };
+}
+
+async function fetchDailyTrend(days = 30) {
+  const r = await query(
+    `
+    WITH bounds AS (
+      SELECT
+        (NOW() AT TIME ZONE 'Africa/Douala')::date AS today,
+        ((NOW() AT TIME ZONE 'Africa/Douala')::date - ($1::int - 1))::date AS from_day,
+        ((((NOW() AT TIME ZONE 'Africa/Douala')::date - ($1::int - 1))::timestamp)
+          AT TIME ZONE 'Africa/Douala') AS from_ts
+    ),
+    days AS (
+      SELECT generate_series(
+        (SELECT from_day FROM bounds),
+        (SELECT today FROM bounds),
+        '1 day'::interval
+      )::date AS jour
+    ),
+    checks AS (
+      SELECT
+        (COALESCE(check_date, updated_at) AT TIME ZONE 'Africa/Douala')::date AS jour,
+        COUNT(*)::int AS checked
+      FROM socadel_contacts, bounds
+      WHERE check_status = 'OK'
+        AND COALESCE(check_date, updated_at) >= bounds.from_ts
+      GROUP BY 1
+    ),
+    abos AS (
+      SELECT
+        (COALESCE(activated_at, api_date) AT TIME ZONE 'Africa/Douala')::date AS jour,
+        COUNT(*)::int AS abonne
+      FROM socadel_contacts, bounds
+      WHERE statut = 'ABONNE'
+        AND COALESCE(activated_at, api_date) >= bounds.from_ts
+      GROUP BY 1
+    )
+    SELECT
+      d.jour,
+      COALESCE(c.checked, 0)::int AS checked,
+      COALESCE(a.abonne, 0)::int AS abonne
+    FROM days d
+    LEFT JOIN checks c ON c.jour = d.jour
+    LEFT JOIN abos a ON a.jour = d.jour
+    ORDER BY d.jour
+    `,
+    [days]
+  );
+  return r.rows;
+}
+
+/* ── Paiement (vue ≥ 95 %) ── */
+async function fetchPaiementByMrc() {
+  const r = await query(`
+    SELECT
+      mrc,
+      COUNT(DISTINCT itineraire)::int AS nb_itineraires,
+      COUNT(*)::int AS nb_lignes_collecteurs,
+      COALESCE(SUM(checks), 0)::int AS checks,
+      COALESCE(SUM(ab_digital), 0)::int AS ab_digital,
+      COALESCE(SUM(whatsapp), 0)::int AS whatsapp,
+      COALESCE(SUM(sms), 0)::int AS sms,
+      COALESCE(SUM(montant), 0)::bigint AS montant_total
+    FROM v_socadel_paiement_itineraires
+    GROUP BY mrc
+    ORDER BY ab_digital DESC
+  `);
+  return r.rows;
+}
+
+async function fetchPaiementTopAgents(limit = 10) {
+  const r = await query(
+    `
+    SELECT
+      noms,
+      matricule,
+      email_ou_telephone,
+      COALESCE(SUM(checks), 0)::int AS checks,
+      COALESCE(SUM(ab_digital), 0)::int AS ab_digital,
+      COALESCE(SUM(whatsapp), 0)::int AS whatsapp,
+      COALESCE(SUM(sms), 0)::int AS sms,
+      COALESCE(SUM(montant), 0)::bigint AS montant_total
+    FROM v_socadel_paiement_itineraires
+    WHERE type_collecteur = 'agent_socadel'
+    GROUP BY noms, matricule, email_ou_telephone
+    ORDER BY ab_digital DESC
+    LIMIT $1
+    `,
+    [limit]
+  );
+  return r.rows.map((row, i) => ({ ...row, rang: i + 1 }));
+}
+
+async function fetchPaiementTopPartenaires(limit = 10) {
+  const r = await query(
+    `
+    SELECT
+      noms,
+      email_ou_telephone,
+      entreprise,
+      COALESCE(SUM(checks), 0)::int AS checks,
+      COALESCE(SUM(ab_digital), 0)::int AS ab_digital,
+      COALESCE(SUM(whatsapp), 0)::int AS whatsapp,
+      COALESCE(SUM(sms), 0)::int AS sms,
+      COALESCE(SUM(montant), 0)::bigint AS montant_total
+    FROM v_socadel_paiement_itineraires
+    WHERE type_collecteur = 'partenaire_terrain'
+    GROUP BY noms, email_ou_telephone, entreprise
+    ORDER BY ab_digital DESC
+    LIMIT $1
+    `,
+    [limit]
+  );
+  return r.rows.map((row, i) => ({ ...row, rang: i + 1 }));
+}
+
+async function buildReportData() {
+  const t0 = Date.now();
+  logger.info('[SOCADEL-REPORT] collecte des données…');
+
+  const [
+    bounds,
+    agg,
+    nonAbo,
+    itiQ,
+    trend,
+    paiementMrc,
+    paiementAgents,
+    paiementPartenaires,
+  ] = await Promise.all([
+    step('bounds', getDateBounds),
+    step('agrégats', fetchAggregates),
+    step('non-abonné / SMS / Meta', fetchNonAbonneBreakdown, {
+      sms: 0,
+      en_attente_meta: 0,
+      non_delivrees: 0,
+      non_abonne_total: 0,
+      non_abonne_pending: 0,
+      non_abonne_sans_envoi: 0,
+    }),
+    step('itinéraires', fetchItineraryQuality, {
+      n_itineraires: 0,
+      iti_ge_95: 0,
+      iti_lt_95: 0,
+    }),
+    step('trend 30j', () => fetchDailyTrend(30), []),
+    step('paiement MRC', fetchPaiementByMrc, []),
+    step('paiement top agents', () => fetchPaiementTopAgents(10), []),
+    step('paiement top partenaires', () => fetchPaiementTopPartenaires(10), []),
+  ]);
+
+  // SMS (uniquement), Meta, non délivrées = logique dashboard
+  // Abonné digital global = WA OK (agrégat) + SMS uniquement (non abo rapport OK)
+  const whatsapp_ok = agg.global.whatsapp_ok || 0;
+  const sms = nonAbo.sms || 0;
+  const abonne_digital = whatsapp_ok + sms;
+
+  const global = {
+    ...agg.global,
+    whatsapp_ok,
+    sms,
+    abonne_digital,
+    taux_abonne_digital: pct(abonne_digital, agg.global.total),
+    taux_whatsapp: pct(whatsapp_ok, agg.global.total),
+    taux_sms: pct(sms, agg.global.total),
+    montant: abonne_digital * WHATSAPP_UNIT_VALUE,
+    en_attente_meta: nonAbo.en_attente_meta || 0,
+    non_delivrees: nonAbo.non_delivrees || 0,
+    non_abonne_total: nonAbo.non_abonne_total || 0,
+    non_abonne_pending: nonAbo.non_abonne_pending || 0,
+    non_abonne_sans_envoi: nonAbo.non_abonne_sans_envoi || 0,
+    ...itiQ,
+  };
+
+  logger.info(`[SOCADEL-REPORT] données prêtes en ${Date.now() - t0}ms`);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    bounds,
+    global,
+    byRegion: agg.region,
+    byDivision: agg.division,
+    byMrc: agg.mrc,
+    byAgence: agg.agence,
+    trend,
+    paiementMrc,
+    paiementAgents,
+    paiementPartenaires,
+  };
+}
+
+/* ───────────────────────── Rendu HTML ───────────────────────── */
+const FONT = "'Segoe UI',Helvetica,Arial,sans-serif";
+const C = {
+  page: '#eef2f7',
+  navy: '#12305a',
+  navy2: '#1b4272',
+  blue: '#2563a8',
+  blueLight: '#7aa5d6',
+  blueSoft: '#e8f0fa',
+  blueSofter: '#f5f8fc',
+  slate: '#64748b',
+  border: '#dbe3ee',
+  text: '#1e293b',
+  muted: '#64748b',
+};
+
+function buildReportHtml(data) {
+  const g = data.global;
+  const dateLabelRaw = toDay(data.bounds.today).toLocaleDateString('fr-FR', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+  const dateLabel = dateLabelRaw.charAt(0).toUpperCase() + dateLabelRaw.slice(1);
+  const generatedLabel = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Douala' });
+
+  const cell = (o = {}) =>
+    `padding:6px;font-size:${o.size || 11}px;text-align:${o.align || 'left'};` +
+    `${o.bold ? 'font-weight:700;' : ''}${o.color ? `color:${o.color};` : ''}${o.bg ? `background:${o.bg};` : ''}`;
+  const headCell = (align) =>
+    `padding:8px 6px;background:${C.navy};color:#ffffff;font-size:10px;font-weight:600;text-align:${align};white-space:nowrap;`;
+  const tblStyle = `border-collapse:collapse;border:1px solid ${C.border};font-family:${FONT};color:${C.text};`;
+
+  function progressBar(rate, color, h = 6) {
+    const w = Math.round(Math.min(100, Math.max(0, Number(rate) || 0)));
+    const left =
+      w > 0
+        ? `<td width="${w}%" bgcolor="${color}" style="background:${color};height:${h}px;font-size:0;line-height:0;">&nbsp;</td>`
+        : '';
+    const right =
+      w < 100
+        ? `<td width="${100 - w}%" bgcolor="#e2e8f0" style="background:#e2e8f0;height:${h}px;font-size:0;line-height:0;">&nbsp;</td>`
+        : '';
+    return `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:8px;"><tr>${left}${right}</tr></table>`;
+  }
+
+  function sectionTitle(title, subtitle) {
+    return `
+    <tr><td style="padding:28px 28px 10px 28px;">
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"><tr>
+        <td width="4" bgcolor="${C.blue}" style="background:${C.blue};">&nbsp;</td>
+        <td style="padding-left:12px;font-family:${FONT};">
+          <div style="font-size:15px;font-weight:700;color:${C.navy};">${esc(title)}</div>
+          ${subtitle ? `<div style="font-size:11px;color:${C.muted};margin-top:2px;">${esc(subtitle)}</div>` : ''}
+        </td>
+      </tr></table>
+    </td></tr>`;
+  }
+
+  function kpiCard(c) {
+    return `
+      <td width="25%" valign="top" style="padding:6px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border:1px solid ${C.border};border-top:3px solid ${c.color || C.navy};">
+          <tr><td style="padding:12px 14px;font-family:${FONT};">
+            <div style="font-size:10px;color:${C.muted};text-transform:uppercase;letter-spacing:0.6px;">${esc(c.label)}</div>
+            <div style="font-size:23px;font-weight:700;color:${C.navy};margin-top:4px;">${c.value}</div>
+            <div style="font-size:10.5px;color:${C.muted};margin-top:2px;min-height:13px;">${c.sub ? c.sub : '&nbsp;'}</div>
+            ${c.rate != null ? progressBar(c.rate, c.color || C.blue) : ''}
+          </td></tr>
+        </table>
+      </td>`;
+  }
+
+  function kpiRows(cards) {
+    let html = '';
+    for (let i = 0; i < cards.length; i += 4) {
+      const slice = cards.slice(i, i + 4);
+      while (slice.length < 4) slice.push(null);
+      html += `<tr><td style="padding:0 22px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        ${slice.map((c) => (c ? kpiCard(c) : '<td width="25%"></td>')).join('')}
+      </tr></table></td></tr>`;
+    }
+    return html;
+  }
+
+  const trend = data.trend || [];
+  const sumChecked = trend.reduce((a, t) => a + (t.checked || 0), 0);
+  const sumAbo = trend.reduce((a, t) => a + (t.abonne || 0), 0);
+  const last7 = trend.slice(-7);
+  const l7Checked = last7.reduce((a, t) => a + (t.checked || 0), 0);
+  const l7Abo = last7.reduce((a, t) => a + (t.abonne || 0), 0);
+  const todayT = trend[trend.length - 1] || { checked: 0, abonne: 0 };
+  const peak = trend.reduce(
+    (best, t) => ((t.checked || 0) > (best.checked || 0) ? t : best),
+    { checked: 0 }
+  );
+  const avg = trend.length ? Math.round(sumChecked / trend.length) : 0;
+
+  function trendChart() {
+    if (!trend.length) return '';
+    const H = 110;
+    const maxT = Math.max(1, ...trend.map((t) => Math.max(t.checked || 0, t.abonne || 0)));
+    const bar = (v, color) => {
+      const h = v > 0 ? Math.max(2, Math.round((v / maxT) * H)) : 1;
+      const col = v > 0 ? color : '#e2e8f0';
+      return `<td valign="bottom"><table cellpadding="0" cellspacing="0"><tr><td width="7" height="${h}" bgcolor="${col}" style="font-size:0;line-height:0;">&nbsp;</td></tr></table></td>`;
+    };
+    const cols = trend
+      .map(
+        (t) =>
+          `<td valign="bottom" align="center" style="padding:0 1px;"><table cellpadding="0" cellspacing="0"><tr>${bar(t.checked || 0, C.navy2)}${bar(t.abonne || 0, C.blueLight)}</tr></table></td>`
+      )
+      .join('');
+    const labels = trend
+      .map(
+        (t) =>
+          `<td align="center" style="padding-top:4px;font-family:${FONT};font-size:8px;color:${C.muted};">${pad(toDay(t.jour).getDate())}</td>`
+      )
+      .join('');
+    return `
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${C.blueSofter};border:1px solid ${C.border};">
+      <tr><td style="padding:14px 14px 10px 14px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>${cols}</tr>
+          <tr>${labels}</tr>
+        </table>
+      </td></tr>
+      <tr><td style="padding:0 14px 12px 14px;font-family:${FONT};font-size:10.5px;color:${C.muted};">
+        <span style="display:inline-block;width:10px;height:10px;background:${C.navy2};vertical-align:middle;"></span>&nbsp;Numéros vérifiés
+        &nbsp;&nbsp;&nbsp;
+        <span style="display:inline-block;width:10px;height:10px;background:${C.blueLight};vertical-align:middle;"></span>&nbsp;Abonnés WhatsApp
+        &nbsp;&nbsp;·&nbsp;&nbsp;Période : ${dm(trend[0].jour)} → ${dm(trend[trend.length - 1].jour)}
+      </td></tr>
+    </table>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:10px;"><tr>
+      ${[
+        ['Total 30 j · vérifiés', fmt(sumChecked)],
+        ['Total 30 j · abonnés', fmt(sumAbo)],
+        ['Moyenne / jour', fmt(avg)],
+        [
+          'Pic journalier',
+          peak.jour
+            ? `${fmt(peak.checked)} <span style="font-size:10px;color:${C.muted};font-weight:400;">(${dm(peak.jour)})</span>`
+            : '—',
+        ],
+      ]
+        .map(
+          ([l, v]) => `<td width="25%" style="padding:0 6px 0 0;"><table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${C.border};"><tr><td style="padding:8px 10px;font-family:${FONT};">
+            <div style="font-size:9.5px;color:${C.muted};text-transform:uppercase;letter-spacing:0.5px;">${l}</div>
+            <div style="font-size:15px;font-weight:700;color:${C.navy};margin-top:2px;">${v}</div>
+          </td></tr></table></td>`
+        )
+        .join('')}
+    </tr></table>`;
+  }
+
+  function breakdownTable(title, rows) {
+    if (!rows?.length) return '';
+    const sum = rows.reduce(
+      (a, r) => ({
+        total: a.total + r.total,
+        collectes: a.collectes + r.collectes,
+        checked: a.checked + r.checked,
+        whatsapp_ok: a.whatsapp_ok + r.whatsapp_ok,
+        sms: a.sms + r.sms,
+        abonne_digital: a.abonne_digital + r.abonne_digital,
+      }),
+      { total: 0, collectes: 0, checked: 0, whatsapp_ok: 0, sms: 0, abonne_digital: 0 }
+    );
+    const body = rows
+      .map((r, i) => {
+        const bg = i % 2 ? C.blueSofter : '#ffffff';
+        const top3 = r.rang <= 3;
+        return `<tr>
+        <td style="${cell({ align: 'center', bg, bold: top3, color: top3 ? C.blue : C.muted })}">${r.rang}</td>
+        <td style="${cell({ bg, bold: top3 })}">${esc(r.label)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.total)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.collectes)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.abonne_digital)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.whatsapp_ok)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.sms)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmtPct(r.taux_collecte)}</td>
+        <td style="${cell({ align: 'right', bg, bold: true, color: C.navy })}">${fmtPct(r.taux_abonne_digital)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.montant)}</td>
+      </tr>`;
+      })
+      .join('');
+    const f = (o) => cell({ bold: true, bg: C.blueSoft, color: C.navy, ...o });
+    const footer = `<tr>
+        <td style="${f({})}"></td>
+        <td style="${f({})}">TOTAL</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.total)}</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.collectes)}</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.abonne_digital)}</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.whatsapp_ok)}</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.sms)}</td>
+        <td style="${f({ align: 'right' })}">${fmtPct(pct(sum.checked, sum.total))}</td>
+        <td style="${f({ align: 'right' })}">${fmtPct(pct(sum.abonne_digital, sum.total))}</td>
+        <td style="${f({ align: 'right' })}">${fmt(sum.abonne_digital * WHATSAPP_UNIT_VALUE)}</td>
+      </tr>`;
+    const heads = [
+      ['Rang', 'center'],
+      ['Libellé', 'left'],
+      ['À migrer', 'right'],
+      ['Collectés', 'right'],
+      ['Ab. digital', 'right'],
+      ['WhatsApp', 'right'],
+      ['SMS', 'right'],
+      ['Tx collecte', 'right'],
+      ['Tx ab. digital', 'right'],
+      ['Montant', 'right'],
+    ];
+    return `${sectionTitle(title, `${rows.length} élément(s) · classement par taux ab. digital`)}
+    <tr><td style="padding:0 28px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="${tblStyle}">
+        <thead><tr>${heads.map(([h, a]) => `<th style="${headCell(a)}">${h}</th>`).join('')}</tr></thead>
+        <tbody>${body}${footer}</tbody>
+      </table>
+    </td></tr>`;
+  }
+
+  function paiementMrcTable(rows) {
+    if (!rows?.length) return '';
+    const sum = rows.reduce(
+      (a, r) => ({
+        nb_itineraires: a.nb_itineraires + (r.nb_itineraires || 0),
+        checks: a.checks + (r.checks || 0),
+        ab_digital: a.ab_digital + (r.ab_digital || 0),
+        whatsapp: a.whatsapp + (r.whatsapp || 0),
+        sms: a.sms + (r.sms || 0),
+        montant_total: a.montant_total + Number(r.montant_total || 0),
+      }),
+      { nb_itineraires: 0, checks: 0, ab_digital: 0, whatsapp: 0, sms: 0, montant_total: 0 }
+    );
+    const body = rows
+      .map((r, i) => {
+        const bg = i % 2 ? C.blueSofter : '#ffffff';
+        return `<tr>
+        <td style="${cell({ bg })}">${esc(r.mrc)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.nb_itineraires)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.checks)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.ab_digital)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.whatsapp)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.sms)}</td>
+        <td style="${cell({ align: 'right', bg, bold: true, color: C.navy })}">${fmt(r.montant_total)}</td>
+      </tr>`;
+      })
+      .join('');
+    const f = (o) => cell({ bold: true, bg: C.blueSoft, color: C.navy, ...o });
+    const footer = `<tr>
+      <td style="${f({})}">TOTAL</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.nb_itineraires)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.checks)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.ab_digital)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.whatsapp)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.sms)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.montant_total)}</td>
+    </tr>`;
+    const heads = [
+      ['MRC', 'left'],
+      ['Itinéraires ≥95 %', 'right'],
+      ['Checks', 'right'],
+      ['Ab. digital', 'right'],
+      ['WhatsApp', 'right'],
+      ['SMS', 'right'],
+      ['Montant', 'right'],
+    ];
+    return `${sectionTitle('Paiement — par MRC', 'Itinéraires traités ≥ 95 % uniquement · montant = ab. digital × 35')}
+    <tr><td style="padding:0 28px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="${tblStyle}">
+        <thead><tr>${heads.map(([h, a]) => `<th style="${headCell(a)}">${h}</th>`).join('')}</tr></thead>
+        <tbody>${body}${footer}</tbody>
+      </table>
+    </td></tr>`;
+  }
+
+  function paiementTopTable(title, rows, isAgent) {
+    if (!rows?.length) return '';
+    const sum = rows.reduce(
+      (a, r) => ({
+        checks: a.checks + (r.checks || 0),
+        ab_digital: a.ab_digital + (r.ab_digital || 0),
+        whatsapp: a.whatsapp + (r.whatsapp || 0),
+        sms: a.sms + (r.sms || 0),
+        montant_total: a.montant_total + Number(r.montant_total || 0),
+      }),
+      { checks: 0, ab_digital: 0, whatsapp: 0, sms: 0, montant_total: 0 }
+    );
+    const body = rows
+      .map((r, i) => {
+        const bg = i % 2 ? C.blueSofter : '#ffffff';
+        const top3 = r.rang <= 3;
+        return `<tr>
+        <td style="${cell({ align: 'center', bg, bold: top3, color: top3 ? C.blue : C.muted })}">${r.rang}</td>
+        <td style="${cell({ bg, bold: top3 })}">${esc(r.noms || '—')}</td>
+        <td style="${cell({ bg })}">${esc((isAgent ? r.matricule : r.entreprise) || '—')}</td>
+        <td style="${cell({ bg })}">${esc(r.email_ou_telephone || '—')}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.checks)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.ab_digital)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.whatsapp)}</td>
+        <td style="${cell({ align: 'right', bg })}">${fmt(r.sms)}</td>
+        <td style="${cell({ align: 'right', bg, bold: true, color: C.navy })}">${fmt(r.montant_total)}</td>
+      </tr>`;
+      })
+      .join('');
+    const f = (o) => cell({ bold: true, bg: C.blueSoft, color: C.navy, ...o });
+    const footer = `<tr>
+      <td style="${f({})}"></td>
+      <td style="${f({})}" colspan="3">TOTAL (top ${rows.length})</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.checks)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.ab_digital)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.whatsapp)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.sms)}</td>
+      <td style="${f({ align: 'right' })}">${fmt(sum.montant_total)}</td>
+    </tr>`;
+    const heads = [
+      ['Rang', 'center'],
+      ['Nom', 'left'],
+      [isAgent ? 'Matricule' : 'Entreprise', 'left'],
+      [isAgent ? 'Email' : 'Téléphone', 'left'],
+      ['Checks', 'right'],
+      ['Ab. digital', 'right'],
+      ['WhatsApp', 'right'],
+      ['SMS', 'right'],
+      ['Montant', 'right'],
+    ];
+    return `${sectionTitle(title, 'Uniquement itinéraires ≥ 95 % · classement par ab. digital')}
+    <tr><td style="padding:0 28px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="${tblStyle}">
+        <thead><tr>${heads.map(([h, a]) => `<th style="${headCell(a)}">${h}</th>`).join('')}</tr></thead>
+        <tbody>${body}${footer}</tbody>
+      </table>
+    </td></tr>`;
+  }
+
+  const cards = [
+    { label: 'Total à migrer', value: fmt(g.total), sub: 'Base de contacts', color: C.navy },
+    {
+      label: 'N° collectés',
+      value: fmt(g.collectes),
+      sub: `${fmtPct(pct(g.collectes, g.total))} de la base`,
+      rate: pct(g.collectes, g.total),
+      color: C.blue,
+    },
+    {
+      label: 'N° vérifiés',
+      value: fmt(g.checked),
+      sub: `Taux de collecte ${fmtPct(g.taux_collecte)}`,
+      rate: g.taux_collecte,
+      color: C.blue,
+    },
+    {
+      label: 'Abonnés digitaux',
+      value: fmt(g.abonne_digital),
+      sub: `WhatsApp ${fmt(g.whatsapp_ok)} + SMS ${fmt(g.sms)}`,
+      rate: g.taux_abonne_digital,
+      color: C.navy2,
+    },
+    {
+      label: 'WhatsApp OK',
+      value: fmt(g.whatsapp_ok),
+      sub: `Taux ${fmtPct(g.taux_whatsapp)}`,
+      rate: g.taux_whatsapp,
+      color: C.blueLight,
+    },
+    {
+      label: 'SMS (uniquement)',
+      value: fmt(g.sms),
+      sub: `Check OK · non abonné · rapport OK`,
+      rate: g.taux_sms,
+      color: C.blueLight,
+    },
+    {
+      label: 'En attente Meta',
+      value: fmt(g.en_attente_meta),
+      sub: 'MRA non abonné · statut sent',
+      color: C.slate,
+    },
+    {
+      label: 'Non délivrées',
+      value: fmt(g.non_delivrees),
+      sub: 'MRA non abonné · statut failed',
+      color: C.slate,
+    },
+    {
+      label: 'Montant total',
+      value: fmt(g.montant),
+      sub: `Ab. digital × ${WHATSAPP_UNIT_VALUE}`,
+      color: C.navy,
+    },
+    {
+      label: 'Itinéraires',
+      value: fmt(g.n_itineraires),
+      sub: `≥ 95 % : ${fmt(g.iti_ge_95)} · < 95 % : ${fmt(g.iti_lt_95)}`,
+      rate: pct(g.iti_ge_95, g.n_itineraires),
+      color: C.blue,
+    },
+    {
+      label: "Aujourd'hui",
+      value: fmt(todayT.checked),
+      sub: `vérifiés · ${fmt(todayT.abonne)} abonnés`,
+      color: C.navy2,
+    },
+    {
+      label: '7 derniers jours',
+      value: fmt(l7Checked),
+      sub: `vérifiés · ${fmt(l7Abo)} abonnés`,
+      color: C.navy2,
+    },
+  ];
+
+  const preheader = `Abonnés digitaux : ${fmt(g.abonne_digital)} sur ${fmt(g.total)} (${fmtPct(g.taux_abonne_digital)}) · Montant : ${fmt(g.montant)}`;
+
+  const html = `<!DOCTYPE html>
+<html lang="fr"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rapport collecte WhatsApp — ${esc(dateLabel)}</title>
+<!--[if mso]><style>table{border-collapse:collapse;}td,th{font-family:Arial,sans-serif;}</style><![endif]-->
+</head>
+<body style="margin:0;padding:0;background:${C.page};">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:${C.page};font-size:1px;">${esc(preheader)}</div>
+<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${C.page}" style="background:${C.page};">
+<tr><td align="center" style="padding:20px 8px;">
+<table width="900" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:900px;max-width:900px;background:#ffffff;border:1px solid ${C.border};">
+  <tr><td bgcolor="${C.navy}" style="background:${C.navy};padding:26px 28px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+      <td valign="middle" style="font-family:${FONT};">
+        <div style="font-size:11px;letter-spacing:2px;color:#a9c2e3;text-transform:uppercase;">SOCADEL · Collecte WhatsApp</div>
+        <div style="font-size:24px;font-weight:700;color:#ffffff;margin-top:6px;">Rapport journalier</div>
+        <div style="font-size:12px;color:#c9d9ee;margin-top:4px;">Migration digitale · WhatsApp &amp; SMS</div>
+      </td>
+      <td valign="middle" align="right" style="font-family:${FONT};">
+        <div style="font-size:11px;color:#a9c2e3;text-transform:uppercase;letter-spacing:1px;">Situation au</div>
+        <div style="font-size:15px;font-weight:600;color:#ffffff;margin-top:4px;">${esc(dateLabel)}</div>
+      </td>
+    </tr></table>
+  </td></tr>
+  <tr><td bgcolor="${C.blue}" style="background:${C.blue};height:3px;font-size:0;line-height:0;">&nbsp;</td></tr>
+  <tr><td style="padding:22px 28px 8px 28px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${C.blueSoft};border:1px solid ${C.border};"><tr><td style="padding:16px 18px;font-family:${FONT};">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td valign="bottom">
+          <div style="font-size:11px;color:${C.muted};text-transform:uppercase;letter-spacing:0.6px;">Progression de la migration digitale</div>
+          <div style="font-size:12px;color:${C.text};margin-top:4px;"><b>${fmt(g.abonne_digital)}</b> abonnés digitaux sur <b>${fmt(g.total)}</b> numéros à migrer</div>
+        </td>
+        <td valign="bottom" align="right" style="font-size:30px;font-weight:700;color:${C.navy};">${fmtPct(g.taux_abonne_digital)}</td>
+      </tr></table>
+      ${progressBar(g.taux_abonne_digital, C.blue, 10)}
+    </td></tr></table>
+  </td></tr>
+  ${sectionTitle('Indicateurs clés', null)}
+  ${kpiRows(cards)}
+  ${sectionTitle('Suivi journalier — 30 derniers jours', 'Numéros vérifiés et abonnés WhatsApp par jour')}
+  <tr><td style="padding:0 28px;">${trendChart()}</td></tr>
+  ${breakdownTable('Répartition par région', data.byRegion)}
+  ${breakdownTable('Répartition par division', data.byDivision)}
+  ${breakdownTable('Répartition par MRC', data.byMrc)}
+  ${breakdownTable('Répartition par agence', data.byAgence)}
+  ${paiementMrcTable(data.paiementMrc)}
+  ${paiementTopTable('Top 10 agents Socadel (paiement ≥ 95 %)', data.paiementAgents, true)}
+  ${paiementTopTable('Top 10 partenaires terrain (paiement ≥ 95 %)', data.paiementPartenaires, false)}
+  <tr><td style="padding:30px 28px 24px 28px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${C.border};"><tr><td style="padding-top:12px;font-family:${FONT};font-size:10px;line-height:1.6;color:#94a3b8;">
+      Rapport automatique généré le ${esc(generatedLabel)} (heure de Douala).<br/>
+      Abonné digital = WhatsApp OK + SMS (uniquement) · Taux = indicateur / total à migrer · Montant global = Ab. digital × ${WHATSAPP_UNIT_VALUE}.<br/>
+      SMS (uniquement) / En attente Meta / Non délivrées : checks OK non abonnés (rapport OK ou MRA + pending invoice).<br/>
+      Paiement : uniquement itinéraires ≥ 95 % (vue v_socadel_paiement_itineraires, montant × 35).
+    </td></tr></table>
+  </td></tr>
+</table></td></tr></table>
+</body></html>`;
+
+  return html.replace(/>\s+</g, '><').replace(/\n\s*/g, '');
+}
+
+/* ───────────────────────── Envoi email ───────────────────────── */
+async function sendDailyReportEmail({ to, cc } = {}) {
+  const recipients =
+    to ||
+    process.env.SOCADEL_REPORT_EMAIL_TO ||
+    process.env.REPORT_EMAIL_TO ||
+    'patrick.tondjou@camlight.cm';
+
+  const data = await buildReportData();
+
+  logger.info('[SOCADEL-REPORT] buildReportHtml…');
+  const html = buildReportHtml(data);
+  logger.info(`[SOCADEL-REPORT] HTML length=${html.length}`);
+
+  try {
+    fs.writeFileSync('/tmp/socadel-report.html', html, 'utf8');
+    logger.info('[SOCADEL-REPORT] HTML écrit /tmp/socadel-report.html');
+  } catch (err) {
+    logger.warn(`[SOCADEL-REPORT] écriture /tmp: ${err.message}`);
+  }
+
+  const day = ymd(data.bounds.today);
+  const g = data.global;
+  const subject = `Socadel — Rapport collecte WhatsApp — ${day}`;
+  const text =
+    `Rapport Socadel du ${day}\n` +
+    `Total à migrer : ${g.total}\n` +
+    `N° collectés : ${g.collectes}\n` +
+    `Abonnés digitaux : ${g.abonne_digital} (${g.taux_abonne_digital} %)\n` +
+    `SMS (uniquement) : ${g.sms}\n` +
+    `En attente Meta : ${g.en_attente_meta}\n` +
+    `Non délivrées : ${g.non_delivrees}\n` +
+    `Montant : ${g.montant}\n`;
+
+  const emailService = require('./email.service');
+  const transporter =
+    emailService.transporter ||
+    (typeof emailService.getTransporter === 'function'
+      ? emailService.getTransporter()
+      : null);
+  if (!transporter) throw new Error('email.service: transporter introuvable');
+
+  const from =
+    process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER;
+
+  if (typeof transporter.verify === 'function') {
+    try {
+      await withTimeout(transporter.verify(), 15000, 'smtp.verify');
+      logger.info('[SOCADEL-REPORT] SMTP verify OK');
+    } catch (err) {
+      logger.warn(`[SOCADEL-REPORT] SMTP verify: ${err.message}`);
+    }
+  }
+
+  logger.info(`[SOCADEL-REPORT] Envoi email → ${recipients} (sans pièce jointe)`);
+  const info = await withTimeout(
+    transporter.sendMail({
+      from,
+      to: recipients,
+      cc: cc || process.env.SOCADEL_REPORT_EMAIL_CC || undefined,
+      subject,
+      html, // même contenu que /tmp — pas de pièce jointe
+      text,
+    }),
+    90000,
+    'sendMail'
+  );
+
+  logger.info(`[SOCADEL-REPORT] Email OK id=${info.messageId}`);
+  return { success: true, to: recipients, date: day, messageId: info.messageId };
+}
+
+module.exports = {
+  buildReportData,
+  buildReportHtml,
+  sendDailyReportEmail,
+  WHATSAPP_UNIT_VALUE,
+};

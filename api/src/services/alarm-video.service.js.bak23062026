@@ -1,0 +1,87 @@
+const axios = require('axios');
+const logger = require('../utils/logger');
+const authService = require('./alarm-auth.service');
+
+class AlarmVideoService {
+  constructor() {
+    this.baseURL = process.env.ALARM_API_BASE_URL || 'https://api.hetuv2x.com';
+  }
+
+  async _callApi(method, path, body = null, retry = true) {
+    const headers = await authService.getHeaders();
+    const url = `${this.baseURL}${path}`;
+    try {
+      const response = await axios({ method, url, data: body, headers, timeout: 20000 });
+      // Si la réponse n'a pas de champ 'code' (cas improbable pour les endpoints JSON)
+      if (response.data.code === undefined && response.status === 200) {
+        logger.warn('[Hetu] Réponse sans code, mais HTTP 200 -> accepté');
+        return { code: 200, data: response.data };
+      }
+      if (response.data.code === 200) return response.data;
+      if (response.data.code === 500 && response.data.message === 'CODE_0572') {
+        logger.warn('[Hetu] CODE_0572 -> liste vide');
+        return { code: 200, data: { list: [] } };
+      }
+      throw new Error(`API error: CODE_${response.data.code} - ${response.data.message || 'Unknown'}`);
+    } catch (err) {
+      if (retry && err.response?.status === 401) {
+        logger.warn('[Hetu] Token expiré, refresh...');
+        authService.forceRefresh();
+        return this._callApi(method, path, body, false);
+      }
+      throw err;
+    }
+  }
+
+  async fetchFirstAlarmVideo(licenseNum, alarmType, startTime, endTime, channelNum = null) {
+    // Payload SANS alarmType
+    const payload = {
+      licenseNum,
+      startTime,
+      endTime,
+      fileType: 1
+    };
+    if (channelNum) payload.channelNum = channelNum;
+
+    logger.info(`[AlarmVideo] Requête media/file: ${JSON.stringify(payload)}`);
+    const result = await this._callApi('POST', '/vehicle-openapi/historyreplay/media/file', payload);
+    let videos = result.data?.list || [];
+
+    if (alarmType && videos.length > 0) {
+      videos = videos.filter(v => v.alarmType === alarmType);
+      logger.info(`[AlarmVideo] Filtrage alarmType=${alarmType} → ${videos.length} vidéo(s)`);
+    }
+
+    if (videos.length === 0) {
+      throw new Error(`Aucune vidéo trouvée pour ${licenseNum}${alarmType ? ` avec alarme ${alarmType}` : ''} entre ${startTime} et ${endTime}`);
+    }
+
+    const video = videos.find(v => v.uploadStatus === 1) || videos[0];
+    if (!video.filePath) throw new Error(`filePath manquant pour la vidéo ${video.fileId}`);
+
+    logger.info(`[AlarmVideo] Vidéo sélectionnée: fileId=${video.fileId}, path=${video.filePath}`);
+
+    // ---- Téléchargement direct (binaire) ----
+    const headers = await authService.getHeaders();
+    const downloadUrl = `${this.baseURL}/vehicle-openapi/historyreplay/download?filePath=${encodeURIComponent(video.filePath)}`;
+    logger.info(`[AlarmVideo] Téléchargement depuis: ${downloadUrl}`);
+
+    const streamResponse = await axios({
+      method: 'GET',
+      url: downloadUrl,
+      responseType: 'stream',
+      headers,
+      timeout: 120000
+    });
+
+    const originalName = `${licenseNum}_${alarmType || 'alarm'}_${(video.fileTime || '').replace(/[-: ]/g, '')}.mp4`;
+    return {
+      stream: streamResponse.data,
+      originalName,
+      startTime: video.fileTime,
+      duration: video.videoDuration || 0
+    };
+  }
+}
+
+module.exports = new AlarmVideoService();

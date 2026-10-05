@@ -1,0 +1,892 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { client as clientAPI } from '@/lib/api';
+import { preludeAPI } from '@/lib/api/prelude';
+import Card, { CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
+import Button from '@/components/ui/Button';
+import Tabs from '@/components/ui/Tabs';
+import Pagination from '@/components/ui/Pagination';
+import { FiCopy, FiCheck, FiEye, FiEyeOff, FiSmartphone, FiMessageSquare, FiGlobe, FiCode, FiLink, FiMail, FiAlertCircle, FiPackage } from 'react-icons/fi';
+import { copyToClipboard } from '@/lib/utils';
+
+export default function DocumentationPage() {
+  const [credentials, setCredentials] = useState<any>(null);
+  const [templates, setTemplates] = useState<any[]>([]);
+  const [preferences, setPreferences] = useState<any>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState('quickstart');
+  
+  // Pagination pour les templates
+  const [templatePage, setTemplatePage] = useState(1);
+  const [templateTotal, setTemplateTotal] = useState(0);
+  const [templateLoading, setTemplateLoading] = useState(false);
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'templates') {
+      loadTemplates();
+    }
+  }, [activeTab, templatePage]);
+
+  const loadData = async () => {
+    try {
+      const [credsResp, prefsResp] = await Promise.all([
+        clientAPI.getCredentials(),
+        preludeAPI.getPreferences().catch(() => ({ data: null }))
+      ]);
+      setCredentials(credsResp.credentials);
+      setPreferences(prefsResp.data);
+    } catch (error) {
+      console.error('Erreur chargement données:', error);
+    }
+  };
+
+  const loadTemplates = async () => {
+    setTemplateLoading(true);
+    try {
+      // Appel à votre API templates existante
+      const response = await fetch(`/api/v1/templates?page=${templatePage}&limit=10&status=approved`, {
+        headers: {
+          'Authorization': `Bearer ${credentials?.api_token}`
+        }
+      });
+      const data = await response.json();
+      setTemplates(data.templates || []);
+      setTemplateTotal(data.pagination?.total || 0);
+    } catch (error) {
+      console.error('Erreur chargement templates:', error);
+    } finally {
+      setTemplateLoading(false);
+    }
+  };
+
+  const handleCopy = async (text: string, field: string) => {
+    const success = await copyToClipboard(text);
+    if (success) {
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(null), 2000);
+    }
+  };
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+
+  // ============================================
+  // CONTENU DES ONGLETS
+  // ============================================
+
+  const QuickStartTab = () => (
+    <div className="space-y-6">
+      {/* Credentials */}
+      <Card>
+        <CardHeader>
+          <CardTitle>🔐 Vos identifiants API</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-dark mb-2">API Token</label>
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <input
+                    type={showToken ? 'text' : 'password'}
+                    value={credentials?.api_token || 'Chargement...'}
+                    readOnly
+                    className="w-full px-4 py-2.5 border border-gray-300 rounded-lg bg-gray-50 font-mono text-sm"
+                  />
+                  <button
+                    onClick={() => setShowToken(!showToken)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-dark"
+                  >
+                    {showToken ? <FiEyeOff /> : <FiEye />}
+                  </button>
+                </div>
+                <Button
+                  variant="outline"
+                  onClick={() => handleCopy(credentials?.api_token, 'token')}
+                >
+                  {copiedField === 'token' ? <FiCheck /> : <FiCopy />}
+                </Button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-dark mb-2">URL de base</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={apiUrl}
+                  readOnly
+                  className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg bg-gray-50 font-mono text-sm"
+                />
+                <Button
+                  variant="outline"
+                  onClick={() => handleCopy(apiUrl, 'url')}
+                >
+                  {copiedField === 'url' ? <FiCheck /> : <FiCopy />}
+                </Button>
+              </div>
+            </div>
+
+            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+              <p className="text-sm text-yellow-800 flex items-start gap-2">
+                <FiAlertCircle className="text-yellow-500 mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>⚠️ Important :</strong> Vous devez utiliser votre numéro WhatsApp émetteur 
+                  (champ <code className="bg-yellow-100 px-1 rounded">phoneNumber</code>) qui vous a été attribué. 
+                  Ce numéro doit être actif et approuvé par Meta.
+                </span>
+              </p>
+            </div>
+
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <p className="text-sm text-blue-800 flex items-start gap-2">
+                <FiSmartphone className="text-blue-500 mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>Nouveau : Communication hybride WhatsApp + SMS</strong><br />
+                  Notre API gère automatiquement le fallback : si WhatsApp n'est pas disponible pour un destinataire, 
+                  le message est automatiquement envoyé par SMS (selon vos préférences).
+                </span>
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Vos préférences actuelles */}
+      {preferences && (
+        <Card>
+          <CardHeader>
+            <CardTitle>🎯 Vos préférences de communication</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Canal préféré</label>
+                <p className="text-lg font-semibold flex items-center gap-2 mt-1">
+                  {preferences.preferred_channel === 'whatsapp' ? (
+                    <>
+                      <FiSmartphone className="text-[#2d7a3e]" /> WhatsApp
+                    </>
+                  ) : (
+                    <>
+                      <FiMessageSquare className="text-[#1976d2]" /> SMS
+                    </>
+                  )}
+                </p>
+              </div>
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Fallback automatique</label>
+                <p className="text-lg font-semibold mt-1">
+                  {preferences.allow_fallback ? (
+                    <span className="text-[#2d7a3e]">✅ Activé</span>
+                  ) : (
+                    <span className="text-gray-500">❌ Désactivé</span>
+                  )}
+                </p>
+              </div>
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Limite quotidienne</label>
+                <p className="text-lg font-semibold mt-1">{preferences.daily_message_limit} messages</p>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-4">
+              Vous pouvez modifier ces préférences dans l'onglet "Configuration" de votre dashboard.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Exemple rapide avec phoneNumber */}
+      <Card>
+        <CardHeader>
+          <CardTitle>⚡ Envoi rapide (cURL)</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="bg-dark text-white p-4 rounded-lg font-mono text-sm overflow-x-auto relative">
+            <Button
+              size="sm"
+              variant="outline"
+              className="absolute top-2 right-2 z-10 bg-gray-700 text-white border-gray-600 hover:bg-gray-600"
+              onClick={() => handleCopy(`curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${credentials?.api_token || 'YOUR_TOKEN'}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "welcome_template",
+    "template_params": ["Jean"]
+  }'`, 'curl-quick')}
+            >
+              {copiedField === 'curl-quick' ? <FiCheck /> : <FiCopy />}
+            </Button>
+            <pre className="text-green-300">
+{`curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${credentials?.api_token || 'YOUR_TOKEN'}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "welcome_template",
+    "template_params": ["Jean"]
+  }'`}
+            </pre>
+            <p className="text-xs text-gray-400 mt-2">
+              <FiSmartphone className="inline mr-1" /> 
+              <code className="text-yellow-300">phoneNumber</code> = Votre numéro WhatsApp émetteur
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  const EndpointsTab = () => (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>📡 Points de terminaison disponibles</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-6">
+            {/* Section Messages */}
+            <div>
+              <h3 className="font-bold text-lg mb-3 text-[#2d7a3e]">Messages</h3>
+              
+              <div className="border-l-4 border-[#2d7a3e] pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-green-100 text-green-700 text-xs font-bold rounded">POST</span>
+                  <code className="text-sm font-mono">/messages/send</code>
+                </div>
+                <p className="text-sm text-gray-600 mb-2">
+                  Envoyer un message via WhatsApp ou SMS (fallback automatique si configuré)
+                </p>
+                <details className="text-sm">
+                  <summary className="text-[#2d7a3e] cursor-pointer">Voir les paramètres</summary>
+                  <pre className="bg-gray-50 p-3 rounded-lg mt-2 text-xs overflow-x-auto">
+{`{
+  "phoneNumber": "+237691234567",      // VOTRE numéro WhatsApp émetteur (obligatoire)
+  "recipient_phone": "+237600000000",   // Destinataire (format E.164)
+  "message_type": "template|text|media", // Type de message
+  "template_name": "welcome_template",   // Nom du template (si message_type=template)
+  "template_language": "fr",             // Langue du template
+  "template_params": ["Jean", "CMD-001"], // Paramètres du template
+  "message_content": "Texte libre",       // Si message_type=text
+  "media_url": "https://...",             // Si message_type=media
+  "media_type": "image|video|document"    // Type de média
+}`}
+                  </pre>
+                </details>
+              </div>
+
+              <div className="border-l-4 border-[#8bc34a] pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-blue-100 text-blue-700 text-xs font-bold rounded">GET</span>
+                  <code className="text-sm font-mono">/messages</code>
+                </div>
+                <p className="text-sm text-gray-600 mb-2">
+                  Récupérer l'historique de vos messages (avec pagination)
+                </p>
+                <p className="text-xs text-gray-500">
+                  Paramètres : page, limit, status, recipient_phone, start_date, end_date
+                </p>
+              </div>
+
+              <div className="border-l-4 border-blue-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-blue-100 text-blue-700 text-xs font-bold rounded">GET</span>
+                  <code className="text-sm font-mono">/messages/:id</code>
+                </div>
+                <p className="text-sm text-gray-600">
+                  Récupérer les détails d'un message spécifique
+                </p>
+              </div>
+
+              <div className="border-l-4 border-purple-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-purple-100 text-purple-700 text-xs font-bold rounded">GET</span>
+                  <code className="text-sm font-mono">/messages/stats/summary</code>
+                </div>
+                <p className="text-sm text-gray-600">
+                  Statistiques de vos envois (période: 7days, 30days, 90days)
+                </p>
+              </div>
+            </div>
+
+            {/* Section Templates */}
+            <div>
+              <h3 className="font-bold text-lg mb-3 text-[#1976d2]">Templates</h3>
+              
+              <div className="border-l-4 border-blue-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-blue-100 text-blue-700 text-xs font-bold rounded">GET</span>
+                  <code className="text-sm font-mono">/templates</code>
+                </div>
+                <p className="text-sm text-gray-600">Lister tous vos templates WhatsApp</p>
+              </div>
+
+              <div className="border-l-4 border-green-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-green-100 text-green-700 text-xs font-bold rounded">POST</span>
+                  <code className="text-sm font-mono">/templates</code>
+                </div>
+                <p className="text-sm text-gray-600">Créer un nouveau template</p>
+              </div>
+
+              <div className="border-l-4 border-orange-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-orange-100 text-orange-700 text-xs font-bold rounded">POST</span>
+                  <code className="text-sm font-mono">/templates/:id/submit</code>
+                </div>
+                <p className="text-sm text-gray-600">Soumettre un template à Meta pour approbation</p>
+              </div>
+            </div>
+
+            {/* Section Webhooks */}
+            <div>
+              <h3 className="font-bold text-lg mb-3 text-[#ff9800]">Webhooks</h3>
+              
+              <div className="border-l-4 border-orange-500 pl-4 mb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="px-2 py-1 bg-orange-100 text-orange-700 text-xs font-bold rounded">POST</span>
+                  <code className="text-sm font-mono">/webhook/360dialog</code>
+                </div>
+                <p className="text-sm text-gray-600">Endpoint pour recevoir les statuts des messages</p>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  const TemplatesTab = () => (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>📋 Vos templates disponibles</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {templateLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#2d7a3e]" />
+            </div>
+          ) : templates.length === 0 ? (
+            <div className="text-center py-12 text-gray-500">
+              <FiPackage className="text-5xl mx-auto mb-4 opacity-30" />
+              <p>Aucun template disponible</p>
+              <p className="text-sm mt-2">Créez vos templates dans l'onglet "Templates"</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {templates.map(template => (
+                <div key={template.id} className="border rounded-lg p-4 hover:border-[#2d7a3e] transition-colors">
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <h3 className="font-bold text-dark">{template.name}</h3>
+                      <p className="text-xs text-gray-500">ID: {template.id}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                      template.status === 'approved' ? 'bg-green-100 text-green-700' :
+                      template.status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                      'bg-red-100 text-red-700'
+                    }`}>
+                      {template.status}
+                    </span>
+                  </div>
+                  
+                  {template.body_content && (
+                    <div className="bg-gray-50 p-3 rounded-lg text-sm mb-3">
+                      <p className="text-gray-700 whitespace-pre-wrap">{template.body_content}</p>
+                    </div>
+                  )}
+
+                  {/* Variables extraites */}
+                  {template.variables && template.variables.length > 0 && (
+                    <div className="mb-3">
+                      <p className="text-xs font-medium text-gray-500 mb-1">Variables attendues :</p>
+                      <div className="flex flex-wrap gap-2">
+                        {template.variables.map((v: number) => (
+                          <span key={v} className="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">
+                            {'{{' + v + '}}'}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Exemple d'utilisation */}
+                  <div className="bg-dark text-white p-3 rounded-lg text-xs font-mono overflow-x-auto relative">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="absolute top-2 right-2 z-10 bg-gray-700 text-white border-gray-600 hover:bg-gray-600"
+                      onClick={() => handleCopy(`{
+  "phoneNumber": "+237691234567",
+  "recipient_phone": "+237600000000",
+  "message_type": "template",
+  "template_name": "${template.name}",
+  "template_params": [${template.variables?.map((v: number) => `"valeur_${v}"`).join(', ')}]
+}`, `template-${template.id}`)}
+                    >
+                      {copiedField === `template-${template.id}` ? <FiCheck /> : <FiCopy />}
+                    </Button>
+                    <pre className="text-green-300">
+{`{
+  "phoneNumber": "+237691234567",
+  "recipient_phone": "+237600000000",
+  "message_type": "template",
+  "template_name": "${template.name}",
+  "template_params": [${template.variables?.map((v: number) => `"valeur_${v}"`).join(', ')}]
+}`}
+                    </pre>
+                  </div>
+                </div>
+              ))}
+
+              {/* Pagination */}
+              {templateTotal > 10 && (
+                <div className="mt-4">
+                  <Pagination
+                    currentPage={templatePage}
+                    totalPages={Math.ceil(templateTotal / 10)}
+                    onPageChange={setTemplatePage}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  const WebhooksTab = () => (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>🔔 Configuration des webhooks</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-6">
+            <div className="bg-blue-50 p-4 rounded-lg">
+              <h3 className="font-semibold text-blue-800 mb-2">Comment ça fonctionne ?</h3>
+              <p className="text-sm text-blue-700">
+                Les webhooks permettent à votre application de recevoir des notifications en temps réel 
+                sur le statut de vos messages (envoyé, délivré, échec, etc.). 
+                Vous devez configurer votre endpoint pour recevoir les POST requests de notre API.
+              </p>
+            </div>
+
+            <div>
+              <h4 className="font-medium mb-3">1. Implémentez votre endpoint</h4>
+              <div className="bg-dark text-white p-4 rounded-lg text-sm overflow-x-auto relative">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="absolute top-2 right-2 z-10 bg-gray-700 text-white border-gray-600 hover:bg-gray-600"
+                  onClick={() => handleCopy(`// Exemple Node.js (Express)
+app.post('/webhook/whatsapp', (req, res) => {
+  const { entry } = req.body;
+  
+  if (entry && entry[0]?.changes) {
+    const change = entry[0].changes[0];
+    const status = change.value.statuses?.[0];
+    
+    if (status) {
+      console.log('Statut reçu:', {
+        messageId: status.id,
+        status: status.status,
+        timestamp: status.timestamp
+      });
+      
+      // Mettre à jour votre base de données
+      // updateMessageStatus(status.id, status.status);
+    }
+  }
+  
+  // Répondre rapidement
+  res.sendStatus(200);
+});`, 'webhook-node')}
+                >
+                  {copiedField === 'webhook-node' ? <FiCheck /> : <FiCopy />}
+                </Button>
+                <pre className="text-green-300">
+{`// Exemple Node.js (Express)
+app.post('/webhook/whatsapp', (req, res) => {
+  const { entry } = req.body;
+  
+  if (entry && entry[0]?.changes) {
+    const change = entry[0].changes[0];
+    const status = change.value.statuses?.[0];
+    
+    if (status) {
+      console.log('Statut reçu:', status);
+      // Traitez le statut ici
+    }
+  }
+  
+  res.sendStatus(200);
+});`}
+                </pre>
+              </div>
+            </div>
+
+            <div>
+              <h4 className="font-medium mb-3">2. Configurez l'URL dans votre dashboard</h4>
+              <p className="text-sm text-gray-600 mb-2">
+                Ajoutez l'URL de votre endpoint dans la section "Webhook" du dashboard 360dialog.
+              </p>
+              <div className="bg-yellow-50 p-3 rounded-lg">
+                <p className="text-sm text-yellow-800">
+                  <strong>URL de vérification :</strong> {apiUrl}/webhook/360dialog
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <h4 className="font-medium mb-3">3. Exemple de payload reçu</h4>
+              <div className="bg-dark text-white p-4 rounded-lg text-sm overflow-x-auto">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="absolute top-2 right-2 z-10 bg-gray-700 text-white border-gray-600 hover:bg-gray-600"
+                  onClick={() => handleCopy(`{
+  "entry": [{
+    "changes": [{
+      "value": {
+        "statuses": [{
+          "id": "wamid.123456789",
+          "status": "delivered",
+          "timestamp": "1709731200",
+          "recipient_id": "237600000000",
+          "conversation": {
+            "id": "conversation_123",
+            "expiration_timestamp": "1709817600"
+          }
+        }]
+      }
+    }]
+  }]
+}`, 'webhook-payload')}
+                >
+                  {copiedField === 'webhook-payload' ? <FiCheck /> : <FiCopy />}
+                </Button>
+                <pre className="text-green-300">
+{`{
+  "entry": [{
+    "changes": [{
+      "value": {
+        "statuses": [{
+          "id": "wamid.123456789",
+          "status": "delivered",
+          "timestamp": "1709731200",
+          "recipient_id": "237600000000"
+        }]
+      }
+    }]
+  }]
+}`}
+                </pre>
+              </div>
+            </div>
+
+            <div className="bg-yellow-50 p-4 rounded-lg">
+              <h4 className="font-semibold text-yellow-800 mb-2">⚠️ Important</h4>
+              <ul className="list-disc list-inside text-sm text-yellow-700 space-y-1">
+                <li>Répondez toujours avec un code 200 OK pour accuser réception</li>
+                <li>Si vous ne répondez pas, nous retenterons jusqu'à 3 fois</li>
+                <li>Le webhook reçoit les statuts : sent, delivered, read, failed</li>
+                <li>Conservez l'ID du message (wamid) pour le tracking</li>
+              </ul>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  const CodeExamplesTab = () => {
+    const examples = {
+      curl: `curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${credentials?.api_token || 'YOUR_TOKEN'}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "welcome_template",
+    "template_params": ["Jean"]
+  }'`,
+
+      javascript: `// Avec fetch
+const response = await fetch('${apiUrl}/messages/send', {
+  method: 'POST',
+  headers: {
+    'Authorization': 'Bearer ${credentials?.api_token || 'YOUR_TOKEN'}',
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    phoneNumber: '+237691234567',
+    recipient_phone: '+237600000000',
+    message_type: 'template',
+    template_name: 'welcome_template',
+    template_params: ['Jean']
+  })
+});
+
+const data = await response.json();
+console.log(data);`,
+
+      python: `import requests
+
+response = requests.post(
+    '${apiUrl}/messages/send',
+    headers={
+        'Authorization': 'Bearer ${credentials?.api_token || 'YOUR_TOKEN'}',
+        'Content-Type': 'application/json'
+    },
+    json={
+        'phoneNumber': '+237691234567',
+        'recipient_phone': '+237600000000',
+        'message_type': 'template',
+        'template_name': 'welcome_template',
+        'template_params': ['Jean']
+    }
+)
+
+print(response.json())`,
+
+      php: `<?php
+$ch = curl_init('${apiUrl}/messages/send');
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+    'phoneNumber' => '+237691234567',
+    'recipient_phone' => '+237600000000',
+    'message_type' => 'template',
+    'template_name' => 'welcome_template',
+    'template_params' => ['Jean']
+]));
+curl_setopt($ch, CURLOPT_HTTPHEADER, [
+    'Authorization: Bearer ${credentials?.api_token || 'YOUR_TOKEN'}',
+    'Content-Type: application/json'
+]);
+
+$response = curl_exec($ch);
+curl_close($ch);
+
+$result = json_decode($response, true);
+print_r($result);
+?>`,
+
+      java: `import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.URI;
+
+public class WhatsAppAPI {
+    public static void main(String[] args) throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        
+        String json = """
+        {
+            "phoneNumber": "+237691234567",
+            "recipient_phone": "+237600000000",
+            "message_type": "template",
+            "template_name": "welcome_template",
+            "template_params": ["Jean"]
+        }
+        """;
+        
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create("${apiUrl}/messages/send"))
+            .header("Authorization", "Bearer ${credentials?.api_token || 'YOUR_TOKEN'}")
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(json))
+            .build();
+            
+        HttpResponse<String> response = client.send(request, 
+            HttpResponse.BodyHandlers.ofString());
+            
+        System.out.println(response.body());
+    }
+}`,
+
+      go: `package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+func main() {
+    apiURL := "${apiUrl}/messages/send"
+    token := "${credentials?.api_token || 'YOUR_TOKEN'}"
+    
+    data := map[string]interface{}{
+        "phoneNumber":     "+237691234567",
+        "recipient_phone": "+237600000000",
+        "message_type":    "template",
+        "template_name":   "welcome_template",
+        "template_params": []string{"Jean"},
+    }
+    
+    jsonData, _ := json.Marshal(data)
+    
+    req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+    req.Header.Set("Authorization", "Bearer "+token)
+    req.Header.Set("Content-Type", "application/json")
+    
+    client := &http.Client{}
+    resp, _ := client.Do(req)
+    defer resp.Body.Close()
+    
+    var result map[string]interface{}
+    json.NewDecoder(resp.Body).Decode(&result)
+    fmt.Println(result)
+}`,
+
+      powershell: `$token = "${credentials?.api_token || 'YOUR_TOKEN'}"
+$url = "${apiUrl}/messages/send"
+
+$body = @{
+    phoneNumber = "+237691234567"
+    recipient_phone = "+237600000000"
+    message_type = "template"
+    template_name = "welcome_template"
+    template_params = @("Jean")
+} | ConvertTo-Json
+
+$headers = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+$response = Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $body
+$response | ConvertTo-Json -Depth 10`
+    };
+
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>💻 Exemples par langage</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Tabs tabs={[
+            { id: 'curl', label: 'cURL', content: <CodeBlock code={examples.curl} language="bash" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'javascript', label: 'JavaScript', content: <CodeBlock code={examples.javascript} language="javascript" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'python', label: 'Python', content: <CodeBlock code={examples.python} language="python" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'php', label: 'PHP', content: <CodeBlock code={examples.php} language="php" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'java', label: 'Java', content: <CodeBlock code={examples.java} language="java" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'go', label: 'Go', content: <CodeBlock code={examples.go} language="go" onCopy={handleCopy} copiedField={copiedField} /> },
+            { id: 'powershell', label: 'PowerShell', content: <CodeBlock code={examples.powershell} language="powershell" onCopy={handleCopy} copiedField={copiedField} /> }
+          ]} />
+        </CardContent>
+      </Card>
+    );
+  };
+
+  const CodeBlock = ({ code, language, onCopy, copiedField }: { code: string; language: string; onCopy: any; copiedField: any }) => (
+    <div className="relative">
+      <Button
+        size="sm"
+        variant="outline"
+        className="absolute top-2 right-2 z-10"
+        onClick={() => onCopy(code, language)}
+      >
+        {copiedField === language ? <FiCheck /> : <FiCopy />}
+      </Button>
+      <pre className="bg-dark text-white p-4 rounded-lg overflow-x-auto text-sm">
+        <code className={`language-${language}`}>{code}</code>
+      </pre>
+    </div>
+  );
+
+  const PricingTab = () => (
+    <Card>
+      <CardHeader>
+        <CardTitle>💰 Tarification</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="border rounded-lg p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <FiSmartphone className="text-2xl text-[#2d7a3e]" />
+                <h3 className="font-bold">Messages WhatsApp</h3>
+              </div>
+              <p className="text-3xl font-bold text-[#2d7a3e] mb-2">À partir de 20 FCFA</p>
+              <p className="text-sm text-gray-500">Par message, selon le volume</p>
+              <ul className="mt-4 space-y-2 text-sm">
+                <li>✓ Conversation initiée par l'entreprise</li>
+                <li>✓ Template approuvé requis</li>
+                <li>✓ 24h de conversation gratuite</li>
+              </ul>
+            </div>
+
+            <div className="border rounded-lg p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <FiMessageSquare className="text-2xl text-[#1976d2]" />
+                <h3 className="font-bold">Messages SMS</h3>
+              </div>
+              <p className="text-3xl font-bold text-[#1976d2] mb-2">À partir de 15 FCFA</p>
+              <p className="text-sm text-gray-500">Par SMS, selon le pays</p>
+              <ul className="mt-4 space-y-2 text-sm">
+                <li>✓ Tous pays supportés</li>
+                <li>✓ Pas de template requis</li>
+                <li>✓ 160 caractères par SMS</li>
+              </ul>
+            </div>
+          </div>
+
+          <div className="bg-[#f0f7f3] p-4 rounded-lg">
+            <p className="text-sm text-[#1e5a2f]">
+              <strong>⚠️ Important :</strong> Les messages marketing (campagnes promotionnelles) 
+              sont facturés à un tarif différent des messages transactionnels (notifications, OTP, etc.). 
+              Utilisez la catégorie appropriée dans vos templates.
+            </p>
+          </div>
+
+          <div className="bg-blue-50 p-4 rounded-lg">
+            <p className="text-sm text-blue-800">
+              <strong>💡 Fallback SMS :</strong> Si un message WhatsApp échoue (destinataire non joignable),
+              il peut être automatiquement envoyé par SMS selon votre configuration. Vous serez facturé
+              au tarif SMS dans ce cas.
+            </p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const tabs = [
+    { id: 'quickstart', label: 'Démarrage rapide', icon: <FiCode />, content: <QuickStartTab /> },
+    { id: 'endpoints', label: 'Endpoints', icon: <FiGlobe />, content: <EndpointsTab /> },
+    { id: 'templates', label: 'Templates', icon: <FiPackage />, content: <TemplatesTab /> },
+    { id: 'webhooks', label: 'Webhooks', icon: <FiLink />, content: <WebhooksTab /> },
+    { id: 'examples', label: 'Exemples', icon: <FiCode />, content: <CodeExamplesTab /> },
+    { id: 'pricing', label: 'Tarifs', icon: <FiMail />, content: <PricingTab /> }
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-dark">Documentation API</h1>
+        <p className="text-gray-500 mt-1">
+          Intégrez facilement l'envoi de messages WhatsApp et SMS dans vos applications
+        </p>
+      </div>
+
+      <Tabs tabs={tabs} defaultTab={activeTab} onTabChange={setActiveTab} />
+    </div>
+  );
+}

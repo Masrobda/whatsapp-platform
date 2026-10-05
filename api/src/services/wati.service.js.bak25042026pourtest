@@ -1,0 +1,397 @@
+// src/services/wati.service.js
+const axios = require('axios');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const watiConfig = require('../config/wati.config');
+
+class WatiService {
+  constructor() {
+    this.apiKey = watiConfig.wati.apiKey;
+    this.apiSecret = watiConfig.wati.apiSecret;
+    this.baseURL = watiConfig.wati.baseURL;
+    this.testMode = watiConfig.testMode;
+  }
+
+  /**
+   * Vérifier si un destinataire peut recevoir un message (cooldown 2 semaines)
+   */
+  async canSendToRecipient(recipientPhone, clientId) {
+    if (!watiConfig.rules.enableCooldown) {
+      return { canSend: true };
+    }
+
+    try {
+      const cooldownDays = watiConfig.rules.messageCooldownDays;
+      
+      // Vérifier le dernier message envoyé à ce destinataire pour ce client
+      const result = await query(
+        `SELECT 
+           MAX(created_at) as last_message_date,
+           COUNT(*) as message_count
+         FROM messages
+         WHERE recipient_phone = $1 
+           AND client_id = $2
+           AND wa_status IN ('sent', 'delivered', 'read')
+         GROUP BY recipient_phone`,
+        [recipientPhone, clientId]
+      );
+
+      if (result.rows.length === 0) {
+        return { canSend: true, messageCount: 0 };
+      }
+
+      const lastMessageDate = new Date(result.rows[0].last_message_date);
+      const now = new Date();
+      const daysSinceLastMessage = (now - lastMessageDate) / (1000 * 60 * 60 * 24);
+
+      if (daysSinceLastMessage < cooldownDays) {
+        const remainingDays = Math.ceil(cooldownDays - daysSinceLastMessage);
+        return {
+          canSend: false,
+          remainingDays,
+          lastMessageDate,
+          reason: `Délai minimum de ${cooldownDays} jours requis. Encore ${remainingDays} jour(s) à attendre.`
+        };
+      }
+
+      return {
+        canSend: true,
+        messageCount: result.rows[0].message_count,
+        daysSinceLastMessage
+      };
+    } catch (error) {
+      logger.error('Erreur vérification cooldown:', error);
+      // En cas d'erreur, on autorise l'envoi pour ne pas bloquer
+      return { canSend: true, error: error.message };
+    }
+  }
+
+  /**
+   * Envoyer un message template via WATI
+   */
+  async sendTemplateMessage(phoneNumber, templateName, templateParams = [], language = 'en') {
+    if (this.testMode) {
+      logger.info('[WATI TEST MODE] Envoi template simulé:', {
+        phone: phoneNumber,
+        template: templateName,
+        params: templateParams
+      });
+      return {
+        success: true,
+        testMode: true,
+        messageId: `test_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        status: 'queued'
+      };
+    }
+
+    try {
+      const payload = {
+        phoneNumber: phoneNumber.replace('+', ''),
+        templateName: templateName,
+        templateParams: templateParams,
+        language: language
+      };
+
+      const response = await axios.post(
+        `${this.baseURL}/api/v1/sendTemplateMessage`,
+        payload,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: watiConfig.wati.timeout
+        }
+      );
+
+      logger.info('Template message sent via WATI:', {
+        phone: phoneNumber,
+        template: templateName,
+        response: response.data
+      });
+
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.messageId,
+        status: response.data.result?.status || 'queued',
+        rawResponse: response.data
+      };
+    } catch (error) {
+      logger.error('Error sending template message via WATI:', {
+        error: error.message,
+        response: error.response?.data
+      });
+      throw this.handleError(error);
+    }
+  }
+
+  /**
+   * Envoyer un message texte via WATI
+   */
+  async sendTextMessage(phoneNumber, text) {
+    if (this.testMode) {
+      logger.info('[WATI TEST MODE] Envoi texte simulé:', {
+        phone: phoneNumber,
+        text: text.substring(0, 100)
+      });
+      return {
+        success: true,
+        testMode: true,
+        messageId: `test_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        status: 'queued'
+      };
+    }
+
+    try {
+      const payload = {
+        phoneNumber: phoneNumber.replace('+', ''),
+        message: text
+      };
+
+      const response = await axios.post(
+        `${this.baseURL}/api/v1/sendMessage`,
+        payload,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: watiConfig.wati.timeout
+        }
+      );
+
+      logger.info('Text message sent via WATI:', {
+        phone: phoneNumber,
+        response: response.data
+      });
+
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.messageId,
+        status: response.data.result?.status || 'queued',
+        rawResponse: response.data
+      };
+    } catch (error) {
+      logger.error('Error sending text message via WATI:', error);
+      throw this.handleError(error);
+    }
+  }
+
+  /**
+   * Envoyer un message média via WATI
+   */
+  async sendMediaMessage(phoneNumber, mediaUrl, mediaType, caption = null) {
+    if (this.testMode) {
+      logger.info('[WATI TEST MODE] Envoi média simulé:', {
+        phone: phoneNumber,
+        mediaUrl,
+        mediaType,
+        caption
+      });
+      return {
+        success: true,
+        testMode: true,
+        messageId: `test_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        status: 'queued'
+      };
+    }
+
+    try {
+      const payload = {
+        phoneNumber: phoneNumber.replace('+', ''),
+        mediaUrl: mediaUrl,
+        mediaType: mediaType, // image, video, document, audio
+        caption: caption
+      };
+
+      const response = await axios.post(
+        `${this.baseURL}/api/v1/sendMediaMessage`,
+        payload,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: watiConfig.wati.timeout
+        }
+      );
+
+      logger.info('Media message sent via WATI:', {
+        phone: phoneNumber,
+        mediaType,
+        response: response.data
+      });
+
+      return {
+        success: true,
+        messageId: response.data.result?.messageId || response.data.messageId,
+        status: response.data.result?.status || 'queued',
+        rawResponse: response.data
+      };
+    } catch (error) {
+      logger.error('Error sending media message via WATI:', error);
+      throw this.handleError(error);
+    }
+  }
+
+  /**
+   * Envoyer un message avec PDF joint (template spécifique pour facture)
+   */
+  async sendInvoiceWithPDF(phoneNumber, invoiceData) {
+    const {
+      name,
+      numeroContrat,
+      numeroFacture,
+      montant,
+      unpaid,
+      deadline,
+      entreprise,
+      pdfUrl
+    } = invoiceData;
+
+    // Utiliser un template WATI pour la facture
+    const templateParams = [
+      name,
+      numeroContrat,
+      numeroFacture,
+      montant,
+      unpaid,
+      deadline,
+      entreprise
+    ];
+
+    // Envoyer d'abord le message template
+    const templateResult = await this.sendTemplateMessage(
+      phoneNumber,
+      'next_envoice_template', // Nom du template dans WATI
+      templateParams
+    );
+
+    // Si PDF disponible, envoyer le document
+    if (pdfUrl && templateResult.success) {
+      const mediaResult = await this.sendMediaMessage(
+        phoneNumber,
+        pdfUrl,
+        'document',
+        `Facture ${numeroFacture}`
+      );
+      
+      return {
+        success: true,
+        templateMessageId: templateResult.messageId,
+        documentMessageId: mediaResult.messageId
+      };
+    }
+
+    return templateResult;
+  }
+
+  /**
+   * Récupérer le statut d'un message
+   */
+  async getMessageStatus(messageId) {
+    if (this.testMode) {
+      return {
+        status: 'delivered',
+        testMode: true
+      };
+    }
+
+    try {
+      const response = await axios.get(
+        `${this.baseURL}/api/v1/getMessageStatus?messageId=${messageId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`
+          }
+        }
+      );
+
+      return {
+        success: true,
+        status: response.data.result?.status || response.data.status,
+        rawResponse: response.data
+      };
+    } catch (error) {
+      logger.error('Error getting message status from WATI:', error);
+      throw this.handleError(error);
+    }
+  }
+
+  /**
+   * Gérer les erreurs WATI
+   */
+  handleError(error) {
+    if (error.response) {
+      const statusCode = error.response.status;
+      const errorData = error.response.data;
+      
+      switch (statusCode) {
+        case 401:
+          return {
+            statusCode: 401,
+            code: 'WATI_AUTH_ERROR',
+            message: 'Erreur d\'authentification WATI. Vérifiez vos clés API.'
+          };
+        case 429:
+          return {
+            statusCode: 429,
+            code: 'WATI_RATE_LIMIT',
+            message: 'Limite de taux WATI atteinte. Veuillez réessayer plus tard.'
+          };
+        case 400:
+          return {
+            statusCode: 400,
+            code: 'WATI_BAD_REQUEST',
+            message: errorData.message || 'Requête WATI invalide'
+          };
+        default:
+          return {
+            statusCode: statusCode,
+            code: 'WATI_ERROR',
+            message: errorData.message || 'Erreur lors de l\'envoi via WATI'
+          };
+      }
+    }
+    
+    return {
+      statusCode: 500,
+      code: 'WATI_CONNECTION_ERROR',
+      message: 'Impossible de communiquer avec l\'API WATI'
+    };
+  }
+
+  /**
+   * Vérifier la configuration WATI
+   */
+  async checkConfiguration() {
+    if (this.testMode) {
+      return {
+        success: true,
+        testMode: true,
+        message: 'WATI en mode test'
+      };
+    }
+
+    if (!this.apiKey || !this.apiSecret) {
+      return {
+        success: false,
+        error: 'Clés API WATI non configurées'
+      };
+    }
+
+    if (!this.baseURL) {
+      return {
+        success: false,
+        error: 'URL API WATI non configurée'
+      };
+    }
+
+    return {
+      success: true,
+      message: 'Configuration WATI valide'
+    };
+  }
+}
+
+module.exports = new WatiService();

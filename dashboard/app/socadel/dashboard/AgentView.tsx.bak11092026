@@ -1,0 +1,492 @@
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+
+import {
+  FiLogOut,
+  FiSearch,
+  FiBarChart2,
+  FiArrowLeft
+} from 'react-icons/fi';
+import StatsTab from './StatsTab';
+
+import {
+  loadQueue,
+  flushOfflineQueue,
+  isProbablyOffline
+} from '../../lib/socadel-offline';
+
+type ContractCard = {
+  service_no: string;
+  meter_no: string | null;
+  noms: string | null;
+  primary_whatsapp: string | null;
+  has_valid_whatsapp: boolean;
+  can_edit: boolean;
+  all_checked: boolean;
+  is_subscribed?: boolean;
+};
+
+function QuickRegisterForm({ token }: { token: string }) {
+  const [q, setQ] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  const [msg, setMsg] = useState('');
+
+  const [contracts, setContracts] = useState<ContractCard[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const [phoneDigits, setPhoneDigits] = useState('');
+  const [smsOnly, setSmsOnly] = useState(false);
+  const [identite, setIdentite] = useState('proprietaire');
+  const [rapport, setRapport] = useState<'MRA' | 'OK'>('MRA');
+
+  const selectedContracts = contracts.filter((c) => selected.includes(c.service_no));
+  const hasValidWa = selectedContracts.some((c) => c.has_valid_whatsapp);
+  const primaryPhones = [
+    ...new Set(
+      selectedContracts.map((c) => c.primary_whatsapp).filter(Boolean) as string[]
+    )
+  ];
+
+  const phoneRequired =
+    !smsOnly && !(confirmExisting && hasValidWa && primaryPhones.length === 1);
+
+  const search = async () => {
+    setErr('');
+    setMsg('');
+    setContracts([]);
+    setSelected([]);
+    setConfirmExisting(false);
+    setPhoneDigits('');
+
+    const term = q.trim();
+    if (term.length < 3) {
+      setErr('Saisissez au moins 3 caractères (contrat ou compteur)');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch(
+        `/api/v1/socadel/quick-lookup?q=${encodeURIComponent(term)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const json = await res.json();
+
+      if (res.status === 409 || json.code === 'ALREADY_CHECKED') {
+        setErr(json.message || 'Client(s) déjà checké(s)');
+        setContracts(json.data?.contracts || json.contracts || []);
+        return;
+      }
+      if (!json.success && !json.found) {
+        setErr(json.message || 'Aucun client trouvé');
+        return;
+      }
+
+      const list: ContractCard[] = json.contracts || [];
+      setContracts(list);
+      const editable = list.filter((c) => c.can_edit);
+      setSelected(editable.map((c) => c.service_no));
+      if (!editable.length) {
+        setErr('Tous les clients trouvés sont déjà checkés.');
+      }
+    } catch {
+      setErr('Erreur réseau');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggle = (sn: string) => {
+    setSelected((prev) =>
+      prev.includes(sn) ? prev.filter((x) => x !== sn) : [...prev, sn]
+    );
+  };
+
+  const submit = async () => {
+    setErr('');
+    setMsg('');
+    if (!selected.length) {
+      setErr('Sélectionnez au moins un contrat');
+      return;
+    }
+
+    const body: Record<string, unknown> = {
+      contracts: selected,
+      confirm_existing_whatsapp:
+        confirmExisting && hasValidWa && primaryPhones.length === 1,
+      sms_only: smsOnly,
+      identite,
+      rapport: smsOnly ? 'OK' : rapport
+    };
+
+    if (phoneRequired || smsOnly || (confirmExisting && primaryPhones.length > 1)) {
+      const digits = phoneDigits.replace(/\D/g, '');
+      if (digits.length !== 9) {
+        setErr('Numéro : 9 chiffres après +237');
+        return;
+      }
+      body.phone = `+237${digits}`;
+      if (primaryPhones.length > 1) {
+        body.confirm_existing_whatsapp = false;
+      }
+    }
+
+    setSaving(true);
+    try {
+      const res = await fetch('/api/v1/socadel/quick-register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+      const json = await res.json();
+      if (!json.success) {
+        setErr(json.message || 'Échec enregistrement');
+        return;
+      }
+      setMsg(
+        json.message ||
+          (json.data?.invoice_queued
+            ? 'Enregistré. Facture en cours d’envoi.'
+            : 'Enregistré avec succès.')
+      );
+      setContracts([]);
+      setSelected([]);
+      setQ('');
+      setPhoneDigits('');
+      setConfirmExisting(false);
+      setSmsOnly(false);
+    } catch {
+      setErr('Erreur réseau');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded-xl border border-blue-100 shadow-sm space-y-3">
+        <label className="text-sm font-semibold text-blue-800">
+          Contrat ou compteur
+        </label>
+        <div className="flex gap-2">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && search()}
+            placeholder="Ex: 201345890"
+            className="flex-1 border border-blue-200 rounded-xl px-4 py-2.5 text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
+          />
+          <button
+            type="button"
+            onClick={search}
+            disabled={loading}
+            className="px-4 py-2.5 bg-blue-700 text-white rounded-xl text-sm font-semibold inline-flex items-center gap-1 disabled:bg-blue-400"
+          >
+            <FiSearch size={14} /> {loading ? '…' : 'OK'}
+          </button>
+        </div>
+      </div>
+
+      {err && (
+        <p className="text-red-600 text-sm bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+          {err}
+        </p>
+      )}
+      {msg && (
+        <p className="text-emerald-700 text-sm bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+          {msg}
+        </p>
+      )}
+
+      {contracts.length > 0 && (
+        <div className="space-y-4">
+          <div className="space-y-2">
+            {contracts.map((c) => (
+              <label
+                key={c.service_no}
+                className={`flex gap-3 p-3 rounded-xl border ${
+                  c.can_edit
+                    ? 'border-blue-100 bg-white'
+                    : 'border-slate-100 bg-slate-50 opacity-70'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  disabled={!c.can_edit}
+                  checked={selected.includes(c.service_no)}
+                  onChange={() => toggle(c.service_no)}
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="font-semibold text-slate-800 truncate">
+                    {c.noms || 'Client'} — {c.service_no}
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Compteur : {c.meter_no || '—'}
+                    {c.is_subscribed ? ' · Abonné digital' : ''}
+                    {c.all_checked ? ' · Déjà checké' : ''}
+                  </p>
+                  {c.primary_whatsapp && (
+                    <p className="text-xs text-emerald-700 mt-0.5">
+                      WhatsApp : {c.primary_whatsapp}
+                    </p>
+                  )}
+                </div>
+              </label>
+            ))}
+          </div>
+
+          {hasValidWa && !smsOnly && (
+            <label className="flex items-start gap-2 p-3 rounded-lg bg-blue-50 border border-blue-100">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={confirmExisting}
+                onChange={(e) => setConfirmExisting(e.target.checked)}
+              />
+              <span className="text-sm text-slate-700">
+                Confirmer le WhatsApp existant pour les factures
+                {primaryPhones.length === 1 && (
+                  <strong className="block text-blue-700 font-mono">
+                    {primaryPhones[0]}
+                  </strong>
+                )}
+                {primaryPhones.length > 1 && (
+                  <span className="block text-amber-700 text-xs mt-1">
+                    Plusieurs numéros : saisissez celui à utiliser ci-dessous.
+                  </span>
+                )}
+              </span>
+            </label>
+          )}
+
+          {(phoneRequired || smsOnly || (confirmExisting && primaryPhones.length > 1)) && (
+            <div className="bg-white p-4 rounded-xl border border-blue-100 space-y-2">
+              <p className="text-sm font-semibold text-blue-800">
+                {smsOnly ? 'Numéro SMS' : 'Numéro WhatsApp'}
+              </p>
+              <div className="flex items-center gap-2 border border-blue-200 rounded-lg px-3 py-2 focus-within:ring-2 focus-within:ring-blue-500">
+                <span className="font-mono text-slate-600 select-none">+237</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={9}
+                  value={phoneDigits}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/\D/g, '');
+                    if (v.length <= 9) setPhoneDigits(v);
+                  }}
+                  placeholder="XXXXXXXXX"
+                  className="flex-1 outline-none font-mono text-base bg-transparent"
+                />
+              </div>
+            </div>
+          )}
+
+          <label className="flex items-center gap-2 px-1">
+            <input
+              type="checkbox"
+              checked={smsOnly}
+              onChange={(e) => {
+                setSmsOnly(e.target.checked);
+                if (e.target.checked) setConfirmExisting(false);
+              }}
+            />
+            <span className="text-sm text-slate-700">
+              SMS uniquement (pas de WhatsApp)
+            </span>
+          </label>
+
+          <div className="bg-white p-4 rounded-xl border border-blue-100 space-y-3">
+            <label className="block">
+              <span className="text-sm font-semibold text-blue-800">Identité</span>
+              <select
+                value={identite}
+                onChange={(e) => setIdentite(e.target.value)}
+                className="mt-1 w-full border border-blue-200 rounded-xl px-4 py-2.5 text-sm"
+              >
+                <option value="proprietaire">Propriétaire</option>
+                <option value="relation">Relation</option>
+                <option value="locataire">Locataire</option>
+                <option value="bailleur">Bailleur</option>
+              </select>
+            </label>
+
+            {!smsOnly && (
+              <label className="block">
+                <span className="text-sm font-semibold text-blue-800">Rapport</span>
+                <select
+                  value={rapport}
+                  onChange={(e) => setRapport(e.target.value as 'MRA' | 'OK')}
+                  className="mt-1 w-full border border-blue-200 rounded-xl px-4 py-2.5 text-sm"
+                >
+                  <option value="MRA">MRA</option>
+                  <option value="OK">OK</option>
+                </select>
+              </label>
+            )}
+
+            <button
+              type="button"
+              onClick={submit}
+              disabled={saving || !selected.length}
+              className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-xl disabled:bg-emerald-400"
+            >
+              {saving ? 'Enregistrement…' : 'Valider l’enregistrement'}
+            </button>
+            <p className="text-xs text-slate-500">
+              Check automatique. Facture WhatsApp envoyée si canal WhatsApp.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function AgentView({
+  token,
+  onLogout
+}: {
+  token: string;
+  onLogout: () => void;
+}) {
+  const agent = useMemo(() => {
+    try {
+      return JSON.parse(localStorage.getItem('socadel_agent') || '{}');
+    } catch {
+      return {};
+    }
+  }, []);
+
+  const [view, setView] = useState<'collect' | 'stats'>('collect');
+
+  const [pendingOffline, setPendingOffline] = useState(0);
+
+useEffect(() => {
+  if (!token) return;
+
+  const sync = async () => {
+    const n = loadQueue().length;
+    setPendingOffline(n);
+    if (!n || isProbablyOffline()) return;
+    const r = await flushOfflineQueue(token);
+    setPendingOffline(r.remaining);
+    if (r.sent > 0) {
+      console.log(`[offline] ${r.sent} envoi(s) synchronisé(s), reste ${r.remaining}`);
+    }
+  };
+
+  sync();
+  window.addEventListener('online', sync);
+  const id = window.setInterval(sync, 60_000);
+  return () => {
+    window.removeEventListener('online', sync);
+    window.clearInterval(id);
+  };
+}, [token]);
+
+useEffect(() => {
+  const tick = () => setPendingOffline(loadQueue().length);
+  tick();
+  const id = setInterval(tick, 5000);
+  return () => clearInterval(id);
+}, []);
+
+  if (view === 'stats') {
+    return (
+      <div className="min-h-screen bg-slate-50">
+        <header className="bg-white border-b border-blue-100 sticky top-0 z-20">
+          <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setView('collect')}
+                className="inline-flex items-center gap-1 text-sm text-blue-700 hover:text-blue-900"
+              >
+                <FiArrowLeft size={16} />
+                Retour collecte
+              </button>
+              <h1 className="text-lg font-bold text-blue-900">Mes statistiques</h1>
+            </div>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="inline-flex items-center gap-1.5 text-sm text-blue-700 font-medium"
+            >
+              <FiLogOut size={15} /> Déconnexion
+            </button>
+          </div>
+         {/* ▼▼▼ Bannière hors-ligne ▼▼▼ */}
+  {pendingOffline > 0 && (
+    <div className="bg-amber-50 text-amber-900 text-xs px-3 py-2 text-center border-b border-amber-100">
+      {pendingOffline} enregistrement(s) en attente de réseau — sync auto à la reconnexion
+    </div>
+  )}
+        </header>
+        <main className="max-w-3xl mx-auto px-4 py-6">
+          <StatsTab
+            token={token}
+            mode="agent"
+            defaultMatricule={agent.matricule || ''}
+          />
+        </main>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-blue-100 sticky top-0 z-20">
+        <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img src="/socad.png" alt="Socadel" className="h-9" />
+            <div>
+              <h1 className="text-lg font-bold text-blue-900">Collecte agent</h1>
+              <p className="text-xs text-blue-600/70">
+                {agent.matricule ? `Matricule ${agent.matricule}` : 'Agent Socadel'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setView('stats')}
+              className="inline-flex items-center gap-1.5 text-sm text-blue-700 hover:text-blue-900 font-medium"
+            >
+              <FiBarChart2 size={15} />
+              Mes stats
+            </button>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="inline-flex items-center gap-1.5 text-sm text-blue-700 font-medium"
+            >
+              <FiLogOut size={15} /> Déconnexion
+            </button>
+          </div>
+        </div>
+        {/* ▼▼▼ Bannière hors-ligne ▼▼▼ */}
+  {pendingOffline > 0 && (
+    <div className="bg-amber-50 text-amber-900 text-xs px-3 py-2 text-center border-b border-amber-100">
+      {pendingOffline} enregistrement(s) en attente de réseau — sync auto à la reconnexion
+    </div>
+  )}
+       </header>
+
+      <main className="max-w-lg mx-auto px-4 py-6">
+        <p className="text-sm text-slate-500 mb-4">
+          Recherche par contrat ou compteur — même parcours que les releveurs.
+        </p>
+        <QuickRegisterForm token={token} />
+      </main>
+    </div>
+  );
+}

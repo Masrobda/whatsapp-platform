@@ -1,0 +1,144 @@
+// api/src/controllers/webhook/hetu-webhook.controller.js
+const { isVideoAlreadySent } = require('../../services/alarm-notification.service');
+const hetuUserService = require('../../services/hetu-user.service');
+const { normalizePhoneNumber } = require('../../utils/phone-validator');
+const logger = require('../../utils/logger');
+const { addAlarmToQueue } = require('../../services/alarm-queue.service');
+
+const alarmLabels = {
+  makeCalls: "faire des appels",
+  fatigueDriving: "Conduite fatiguée",
+  speedingAlarm: "Excès de vitesse",
+  forwardCollision: "Collision frontale",
+  laneDeparture: "Franchissement de ligne",
+  pedestrianCollision: "Risque piéton",
+  emergencyAlarm: "Alerte d'urgence"
+};
+
+function getAlarmLabel(type) {
+  return alarmLabels[type] || type;
+}
+
+/**
+ * Webhook appelé par Hetu lorsqu'une nouvelle alarme est créée.
+ * Payload attendu (exemple) :
+ * {
+ *   "licenseNum": "LT404NK",
+ *   "alarmType": "makeCalls",
+ *   "fileId": 53178398,
+ *   "filePath": "ftp/upload/symbol/.../file.mp4",
+ *   "startTime": "2026-06-22 08:00:00",
+ *   "endTime": "2026-06-22 16:00:00",
+ *   "driverId": 4789,   // ou "recipientPhone": "+237674855790"
+ *   "clientId": "47139571-3042-4469-b92f-06b12eda8433", // ID du client NumericExport
+ *   "channelNum": 1,
+ *   "secret": "votre_secret_partagé"
+ * }
+ */
+async function handleNewAlarm(request, reply) {
+  try {
+    const {
+      licenseNum,
+      alarmType,
+      fileId,
+      filePath,
+      startTime,
+      endTime,
+      driverId,
+      recipientPhone,
+      clientId,
+      channelNum,
+      secret
+    } = request.body;
+
+    // Vérification d'un secret partagé (optionnel mais recommandé)
+    const webhookSecret = process.env.HETU_WEBHOOK_SECRET;
+    if (webhookSecret && secret !== webhookSecret) {
+      return reply.status(403).send({ success: false, message: 'Secret invalide' });
+    }
+
+    // Vérification des champs obligatoires
+    if (!licenseNum || !alarmType || !fileId || !filePath) {
+      return reply.status(400).send({
+        success: false,
+        message: 'Données insuffisantes. licenseNum, alarmType, fileId, filePath requis.'
+      });
+    }
+
+    // Vérifier si déjà envoyée (permet d'éviter les doublons dans la queue)
+    const alreadySent = await isVideoAlreadySent(fileId, filePath);
+    if (alreadySent) {
+      logger.info(`[Webhook] Vidéo déjà envoyée: fileId=${fileId}`);
+      return reply.status(200).send({
+        success: true,
+        message: 'Déjà envoyé',
+        skipped: true
+      });
+    }
+
+    // Déterminer le destinataire
+    let finalRecipient = null;
+    if (recipientPhone) {
+      finalRecipient = normalizePhoneNumber(recipientPhone);
+    } else if (driverId) {
+      try {
+        const userInfo = await hetuUserService.getUserById(driverId);
+        if (userInfo.phone) {
+          finalRecipient = normalizePhoneNumber(userInfo.phone);
+          logger.info(`[Webhook] Téléphone récupéré pour driverId ${driverId}: ${finalRecipient}`);
+        } else {
+          logger.warn(`[Webhook] Aucun téléphone pour driverId ${driverId}`);
+        }
+      } catch (err) {
+        logger.error(`[Webhook] Erreur récupération téléphone driverId ${driverId}:`, err.message);
+      }
+    }
+
+    if (!finalRecipient) {
+      return reply.status(400).send({
+        success: false,
+        message: 'Aucun destinataire valide. Fournissez recipientPhone ou driverId avec téléphone valide.'
+      });
+    }
+
+    // Récupérer le clientId (si non fourni, on utilise un client système)
+    const effectiveClientId = clientId || process.env.SYSTEM_CLIENT_ID;
+    if (!effectiveClientId) {
+      return reply.status(400).send({
+        success: false,
+        message: 'clientId manquant. Fournissez clientId ou définissez SYSTEM_CLIENT_ID.'
+      });
+    }
+
+    // Ajouter l'alarme à la file d'attente pour traitement asynchrone
+    const job = await addAlarmToQueue({
+      licenseNum,
+      alarmType,
+      fileId,
+      filePath,
+      startTime,
+      endTime,
+      driverId,
+      recipientPhone: finalRecipient,  // on passe le numéro normalisé
+      clientId: effectiveClientId,
+      channelNum: channelNum || 1
+    });
+
+    logger.info(`[Webhook] Alarme mise en file d'attente: jobId=${job.id}, fileId=${fileId}, recipient=${finalRecipient}`);
+
+    return reply.send({
+      success: true,
+      message: 'Alarme mise en file d\'attente pour traitement',
+      jobId: job.id
+    });
+
+  } catch (error) {
+    logger.error('[Webhook Hetu] Erreur:', error.message);
+    return reply.status(500).send({
+      success: false,
+      message: error.message
+    });
+  }
+}
+
+module.exports = { handleNewAlarm };

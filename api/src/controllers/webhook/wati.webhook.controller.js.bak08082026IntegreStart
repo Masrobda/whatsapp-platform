@@ -1,0 +1,1370 @@
+// src/controllers/webhook/wati.webhook.controller.js
+// VERSION FINALE — 3 optimisations cumulées :
+//
+//   OPTION 1 : findMessage borne created_at à 7 jours → partition pruning (240→7 partitions)
+//   OPTION 2 : lookup via message_id_index (table plate non partitionnée) → <5ms garanti
+//   OPTION 3 : trigger SQL sync automatique (voir message_id_index.sql)
+//   BATCH    : StatusBatchEngine 300ms → -90% requêtes DB webhook
+//   ASYNC    : réponse 200 immédiate à WATI + traitement setImmediate
+//   DEDUP    : anti-doublon in-memory 10s
+// ============================================================
+
+const { query } = require('../../config/database');
+const logger = require('../../utils/logger');
+const crypto = require('crypto');
+const axios = require('axios');
+const { updateCampaignContactStatus } = require('../../services/campaign.service');
+const inboxService = require('../../services/inbox.service');
+const { triggerWorkflowFromCampaign } = require('../../services/automation.service');
+const sessionService = require('../../services/session.service');
+const watiService = require('../../services/wati.service');
+
+// ============================================================
+// NORMALISATION NUMÉROS
+// ============================================================
+function normalizePhone(phone) {
+  if (!phone) return null;
+  let cleaned = phone.toString().trim().replace(/[\s\-\(\)\.]/g, '');
+  let digits = cleaned.replace(/\D/g, '');
+  let countryCode = '';
+  let localNumber = digits;
+
+  if (digits.startsWith('237'))      { countryCode = '237'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('33'))  { countryCode = '33';  localNumber = digits.substring(2); }
+  else if (digits.startsWith('221')) { countryCode = '221'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('225')) { countryCode = '225'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('234')) { countryCode = '234'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('233')) { countryCode = '233'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('254')) { countryCode = '254'; localNumber = digits.substring(3); }
+  else if (digits.startsWith('27'))  { countryCode = '27';  localNumber = digits.substring(2); }
+  else {
+    if (digits.length === 9) return `+237${digits}`;
+    if (digits.length === 8) return `+2376${digits}`;
+    return `+${digits}`;
+  }
+
+  if (countryCode === '237') {
+    if (localNumber.length === 8) localNumber = '6' + localNumber;
+    if (localNumber.length === 7) localNumber = '60' + localNumber;
+  }
+
+  return `+${countryCode}${localNumber}`;
+}
+
+// ============================================================
+// HELPERS STATUT
+// ============================================================
+function getTimestampField(status) {
+  return { sent: 'sent_at', delivered: 'delivered_at', read: 'read_at', failed: 'failed_at' }[status] || 'updated_at';
+}
+
+function mapWatiStatus(eventType) {
+  if (!eventType) return 'unknown';
+  const u = eventType.toUpperCase();
+  if (u.includes('DELIVERED')) return 'delivered';
+  if (u.includes('READ'))      return 'read';
+  if (u.includes('FAILED'))    return 'failed';
+  if (u.includes('SENT') || u.includes('REPLIED')) return 'sent';
+  return 'unknown';
+}
+
+function isValidStatusTransition(currentStatus, newStatus) {
+  const order = { queued: 0, sent: 1, delivered: 2, read: 3, failed: 4 };
+  const cur = order[currentStatus] ?? -1;
+  const nxt = order[newStatus]     ?? -1;
+  return nxt >= cur || newStatus === 'failed';
+}
+
+// ============================================================
+// BATCH ENGINE — STATUS UPDATES
+// Fenêtre 300ms puis flush groupé WHERE id = ANY($ids)
+// ============================================================
+class StatusBatchEngine {
+  constructor(flushIntervalMs = 300) {
+    this.pending        = new Map();
+    this.orphans        = [];
+    this.flushIntervalMs = flushIntervalMs;
+    this.timer          = null;
+    this.processing     = false;
+  }
+
+  schedule(messageId, clientId, status, timestampDate, waMessageId, failedDetail = null) {
+    const existing = this.pending.get(messageId);
+    if (existing) {
+      const order = { queued: 0, sent: 1, delivered: 2, read: 3, failed: 4 };
+      if ((order[existing.status] || 0) >= (order[status] || 0) && status !== 'failed') return;
+    }
+    this.pending.set(messageId, { status, timestampDate, clientId, waMessageId, failedDetail });
+    if (!this.timer) this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
+  }
+
+  scheduleOrphan(payload) {
+    this.orphans.push(payload);
+    if (!this.timer) this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
+  }
+
+  async flush() {
+    this.timer = null;
+    if (this.processing) return;
+    this.processing = true;
+    const updates      = [...this.pending.entries()];
+    const orphansBatch = [...this.orphans];
+    this.pending.clear();
+    this.orphans    = [];
+    this.processing = false;
+
+    if (updates.length > 0) {
+      await this._flushStatusUpdates(updates).catch(err =>
+        logger.error('[BATCH] Erreur flush status:', err.message)
+      );
+    }
+    if (orphansBatch.length > 0) {
+      await this._flushOrphans(orphansBatch).catch(err =>
+        logger.error('[BATCH] Erreur flush orphans:', err.message)
+      );
+    }
+  }
+
+/**  async _flushStatusUpdates(updates) {
+    // Grouper par (status, clientId)
+    const groups = new Map();
+    for (const [messageId, data] of updates) {
+      const key = `${data.status}|${data.clientId}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          status: data.status,
+          clientId: data.clientId,
+          timestampDate: data.timestampDate,
+          ids: [],
+          waMessageIds: new Map(),
+        });
+      }
+      const g = groups.get(key);
+      g.ids.push(messageId);
+      if (data.waMessageId) g.waMessageIds.set(messageId, data.waMessageId);
+    }
+
+    const allPromises = [];
+    for (const g of groups.values()) {
+      const tsField     = getTimestampField(g.status);
+      const clientTable = `messages_client_${g.clientId.replace(/-/g, '_')}`;
+
+      allPromises.push(
+        query(
+          `UPDATE messages SET wa_status = $1, ${tsField} = $2 WHERE id = ANY($3::uuid[])`,
+          [g.status, g.timestampDate, g.ids]
+        ),
+        query(
+          `UPDATE ${clientTable} SET wa_status = $1, ${tsField} = $2 WHERE id = ANY($3::uuid[])`,
+          [g.status, g.timestampDate, g.ids]
+        )
+      );
+
+      // Aussi mettre à jour message_id_index (table plate)
+      allPromises.push(
+        query(
+          `UPDATE message_id_index SET wa_status = $1 WHERE message_id = ANY($2::uuid[])`,
+          [g.status, g.ids]
+        ).catch(() => {}) // non bloquant si table pas encore créée
+      );
+
+      for (const [msgId, waMsgId] of g.waMessageIds) {
+        allPromises.push(
+          query(
+            `UPDATE messages SET wa_message_id = $1 WHERE id = $2 AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+            [waMsgId, msgId]
+          ),
+          query(
+            `UPDATE ${clientTable} SET wa_message_id = $1 WHERE id = $2 AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+            [waMsgId, msgId]
+          ),
+          query(
+            `UPDATE message_id_index SET wa_message_id = $1 WHERE message_id = $2`,
+            [waMsgId, msgId]
+          ).catch(() => {})
+        );
+      }
+    }
+
+    await Promise.all(allPromises);
+    logger.info(`[BATCH] ✅ ${updates.length} status flushés en ${allPromises.length} requêtes`);
+  }
+
+  async _flushStatusUpdates(updates) {
+  const groups = new Map();
+  for (const [messageId, data] of updates) {
+    const key = `${data.status}|${data.clientId}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        status: data.status,
+        clientId: data.clientId,
+        timestampDate: data.timestampDate,
+        ids: [],
+        waMessageIds: new Map(),
+      });
+    }
+    const g = groups.get(key);
+    g.ids.push(messageId);
+    if (data.waMessageId) g.waMessageIds.set(messageId, data.waMessageId);
+  }
+
+  const allPromises = [];
+  for (const g of groups.values()) {
+    // 1. Mettre à jour message_id_index (table plate)
+    allPromises.push(
+      query(
+        `UPDATE message_id_index
+         SET wa_status = $1
+         WHERE message_id = ANY($2::uuid[])`,
+        [g.status, g.ids]
+      )
+    );
+
+    // 2. Mettre à jour les tables client (si nécessaire)
+    const clientTable = `messages_client_${g.clientId.replace(/-/g, '_')}`;
+    const tsField = getTimestampField(g.status);
+    allPromises.push(
+      query(
+        `UPDATE ${clientTable}
+         SET wa_status = $1, ${tsField} = $2
+         WHERE id = ANY($3::uuid[])`,
+        [g.status, g.timestampDate, g.ids]
+      )
+    );
+
+    // 3. Mettre à jour wa_message_id dans message_id_index (si fourni)
+    for (const [msgId, waMsgId] of g.waMessageIds) {
+      allPromises.push(
+        query(
+          `UPDATE message_id_index
+           SET wa_message_id = $1
+           WHERE message_id = $2
+             AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+          [waMsgId, msgId]
+        )
+      );
+      allPromises.push(
+        query(
+          `UPDATE ${clientTable}
+           SET wa_message_id = $1
+           WHERE id = $2
+             AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+          [waMsgId, msgId]
+        )
+      );
+    }
+  }
+
+  await Promise.all(allPromises);
+  logger.info(`[BATCH] ✅ ${updates.length} status flushés sur message_id_index et clients`);
+}*/
+
+async _flushStatusUpdates(updates) {
+  const groups = new Map();
+  for (const [messageId, data] of updates) {
+    const key = `${data.status}|${data.clientId}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        status: data.status,
+        clientId: data.clientId,
+        timestampDate: data.timestampDate,
+        ids: [],
+        waMessageIds: new Map(),
+        failedDetails: new Map(),
+      });
+    }
+    const g = groups.get(key);
+    g.ids.push(messageId);
+    if (data.waMessageId) g.waMessageIds.set(messageId, data.waMessageId);
+    if (data.failedDetail) g.failedDetails.set(messageId, data.failedDetail);
+  }
+
+  const allPromises = [];
+  for (const g of groups.values()) {
+    const tsField = getTimestampField(g.status);
+
+    // ========== AJOUT 1 : Mise à jour de la table principale "messages" ==========
+    allPromises.push(
+      query(
+        `UPDATE messages
+         SET wa_status = $1, ${tsField} = $2
+         WHERE id = ANY($3::uuid[])`,
+        [g.status, g.timestampDate, g.ids]
+      )
+    );
+
+    // Mise à jour de message_id_index
+    allPromises.push(
+      query(
+        `UPDATE message_id_index
+         SET wa_status = $1
+         WHERE message_id = ANY($2::uuid[])`,
+        [g.status, g.ids]
+      )
+    );
+
+    // Mise à jour de la table client
+    const clientTable = `messages_client_${g.clientId.replace(/-/g, '_')}`;
+    allPromises.push(
+      query(
+        `UPDATE ${clientTable}
+         SET wa_status = $1, ${tsField} = $2
+         WHERE id = ANY($3::uuid[])`,
+        [g.status, g.timestampDate, g.ids]
+      )
+    );
+
+    // Mise à jour de wa_message_id dans les trois tables
+    for (const [msgId, waMsgId] of g.waMessageIds) {
+      allPromises.push(
+        query(
+          `UPDATE message_id_index
+           SET wa_message_id = $1
+           WHERE message_id = $2
+             AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+          [waMsgId, msgId]
+        )
+      );
+      allPromises.push(
+        query(
+          `UPDATE ${clientTable}
+           SET wa_message_id = $1
+           WHERE id = $2
+             AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+          [waMsgId, msgId]
+        )
+      );
+      // ========== AJOUT 2 : Mise à jour de wa_message_id dans "messages" ==========
+      allPromises.push(
+        query(
+          `UPDATE messages
+           SET wa_message_id = $1
+           WHERE id = $2
+             AND (wa_message_id IS NULL OR wa_message_id <> $1)`,
+          [waMsgId, msgId]
+        )
+      );
+    }
+   // wa_error_message : uniquement pour les messages en échec, raison réelle WATI/Meta
+    if (g.status === 'failed') {
+      for (const [msgId, detail] of g.failedDetails) {
+        allPromises.push(
+          query(`UPDATE messages SET wa_error_message = $1 WHERE id = $2`, [detail, msgId]),
+        //  query(`UPDATE message_id_index SET wa_error_message = $1 WHERE message_id = $2`, [detail, msgId]),
+          query(`UPDATE ${clientTable} SET wa_error_message = $1 WHERE id = $2`, [detail, msgId])
+        );
+      }
+    }
+  }
+
+  await Promise.all(allPromises);
+
+logger.info(`[BATCH] ✅ ${updates.length} status flushés sur message_id_index et clients`);
+}
+
+  async _flushOrphans(orphans) {
+    const localIds = orphans.map(o => o.localMessageId).filter(Boolean);
+    if (localIds.length === 0) return;
+
+    const existing = await query(
+      `SELECT local_message_id FROM orphan_webhooks WHERE local_message_id = ANY($1)`,
+      [localIds]
+    );
+    const existingSet = new Set(existing.rows.map(r => r.local_message_id));
+
+    const toInsert = orphans.filter(o => !existingSet.has(o.localMessageId));
+    const toUpdate = orphans.filter(o =>  existingSet.has(o.localMessageId));
+
+    if (toInsert.length > 0) {
+      const values = [];
+      const placeholders = toInsert.map((o, i) => {
+        const base = i * 9;
+        values.push(
+          o.localMessageId, o.whatsappMessageId, o.eventType,
+          JSON.stringify(o.rawPayload),
+          o.sent_at || null, o.delivered_at || null,
+          o.read_at || null, o.failed_at || null,
+          o.eventType
+        );
+        return `($${base+1},$${base+2},$${base+3},$${base+4},NOW(),$${base+5},$${base+6},$${base+7},$${base+8},$${base+9})`;
+      });
+      await query(
+        `INSERT INTO orphan_webhooks
+           (local_message_id, whatsapp_message_id, event_type, payload, created_at,
+            sent_at, delivered_at, read_at, failed_at, last_event_type)
+         VALUES ${placeholders.join(',')}
+         ON CONFLICT (local_message_id) DO NOTHING`,
+        values
+      );
+    }
+
+    for (const o of toUpdate) {
+      const setClause = [];
+      const vals = [];
+      if (o.delivered_at) { setClause.push(`delivered_at = $${vals.length+1}`); vals.push(o.delivered_at); }
+      if (o.read_at)      { setClause.push(`read_at = $${vals.length+1}`);      vals.push(o.read_at); }
+      if (o.sent_at)      { setClause.push(`sent_at = $${vals.length+1}`);      vals.push(o.sent_at); }
+      if (o.failed_at)    { setClause.push(`failed_at = $${vals.length+1}`);    vals.push(o.failed_at); }
+      setClause.push(`last_event_type = $${vals.length+1}`); vals.push(o.eventType);
+      vals.push(o.localMessageId);
+      if (setClause.length > 1) {
+        await query(
+          `UPDATE orphan_webhooks SET ${setClause.join(', ')} WHERE local_message_id = $${vals.length}`,
+          vals
+        ).catch(err => logger.error('[BATCH] orphan update:', err.message));
+      }
+    }
+
+    logger.info(`[BATCH] 🗂 ${toInsert.length} orphans insérés, ${toUpdate.length} mis à jour`);
+  }
+}
+
+const batchEngine = new StatusBatchEngine(300);
+// Flush de sécurité toutes les 2s
+setInterval(() => batchEngine.flush().catch(() => {}), 2000);
+// Cache simple pour éviter les requêtes répétées
+ const webhookIdCache = new Map();
+ const CACHE_TTL = 60000; // 1 minute
+
+
+// ============================================================
+// CONTROLLER
+// ============================================================
+class WatiWebhookController {
+  constructor() {
+    this.secret    = process.env.WATI_WEBHOOK_SECRET || 'your-secret-key';
+    this.apiKey    = process.env.WATI_API_KEY;
+    this.baseURL   = 'https://live-mt-server.wati.io/10144460';
+    this.rateLimit = new Map();
+
+    // Anti-doublon in-memory (TTL 10s)
+    this.recentEvents = new Map();
+    setInterval(() => {
+      const cutoff = Date.now() - 10000;
+      for (const [k, t] of this.recentEvents) {
+        if (t < cutoff) this.recentEvents.delete(k);
+      }
+    }, 10000);
+  }
+
+  isDuplicateEvent(localMessageId, eventType) {
+    const key = `${localMessageId}|${eventType}`;
+    if (this.recentEvents.has(key)) return true;
+    this.recentEvents.set(key, Date.now());
+    return false;
+  }
+
+  checkRateLimit(ip, limit = 10, windowMs = 60000) {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    if (!this.rateLimit.has(ip)) this.rateLimit.set(ip, []);
+    const requests = this.rateLimit.get(ip).filter(t => t > windowStart);
+    requests.push(now);
+    this.rateLimit.set(ip, requests);
+    return requests.length <= limit;
+  }
+
+  isTestPayload(payload) {
+    return [
+      payload.localMessageId    === 'message.LocalMessageId',
+      payload.whatsappMessageId === 'message.WhatsappMessageId',
+      payload.id                === 'message.Id',
+      payload.conversationId    === 'message.ConversationId',
+      payload.ticketId          === 'message.TicketId',
+      payload.timestamp         === 'message.Time',
+    ].some(Boolean);
+  }
+
+  // ============================================================
+  // FIND MESSAGE — 3 niveaux de lookup, du plus rapide au plus lent
+  //
+  //   Niveau 1 : message_id_index (table plate, <5ms)        ← OPTION 2
+  //   Niveau 2 : messages avec created_at > -7j (7 partitions) ← OPTION 1
+  //   Niveau 3 : messages sans borne (240 partitions, fallback rare)
+  // ============================================================
+  async findMessage(localMessageId, whatsappMessageId) {
+    console.log(`🔍 findMessage: localId=${localMessageId}, waId=${whatsappMessageId}`);
+
+    const isPlaceholder = id =>
+      !id || id === 'message.LocalMessageId' || id === 'message.WhatsappMessageId';
+
+    const isUUID = id =>
+      id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+    // ── NIVEAU 1 : message_id_index (table plate non partitionnée) ──
+    // Lookup instantané <5ms quelle que soit la taille de messages
+    try {
+      if (!isPlaceholder(localMessageId) || !isPlaceholder(whatsappMessageId)) {
+        const parts  = [];
+        const values = [];
+
+        if (!isPlaceholder(localMessageId)) {
+          values.push(localMessageId);
+          parts.push(
+            `SELECT message_id AS id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 1 AS prio
+             FROM message_id_index WHERE wati_local_id = $${values.length}`
+          );
+          values.push(localMessageId);
+          parts.push(
+            `SELECT message_id AS id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 2 AS prio
+             FROM message_id_index WHERE wa_message_id = $${values.length}`
+          );
+        }
+
+        if (!isPlaceholder(whatsappMessageId)) {
+          values.push(whatsappMessageId);
+          parts.push(
+            `SELECT message_id AS id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 3 AS prio
+             FROM message_id_index WHERE wa_message_id = $${values.length}`
+          );
+        }
+
+        if (parts.length > 0) {
+          const idxResult = await query(
+            `SELECT * FROM (${parts.join(' UNION ALL ')}) sub ORDER BY prio ASC LIMIT 1`,
+            values
+          );
+
+          if (idxResult.rows.length > 0) {
+            console.log(`✅ [INDEX] Trouvé via message_id_index en <5ms`);
+            return idxResult.rows[0];
+          }
+        }
+      }
+    } catch (idxErr) {
+      // Si message_id_index n'existe pas encore, on tombe sur le niveau 2
+      logger.warn('[findMessage] message_id_index indisponible, fallback partition:', idxErr.message);
+    }
+
+    // ── NIVEAU 2 : table messages bornée à 7 jours (7 partitions max) ──
+    // Partition pruning : PostgreSQL n'inspecte que les partitions de la fenêtre
+    {
+      const parts  = [];
+      const values = [];
+
+      if (!isPlaceholder(localMessageId)) {
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 1 AS prio
+           FROM messages
+           WHERE wati_local_id = $${values.length}
+             AND created_at > NOW() - INTERVAL '7 days'`
+        );
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 2 AS prio
+           FROM messages
+           WHERE wa_message_id = $${values.length}
+             AND created_at > NOW() - INTERVAL '7 days'`
+        );
+      }
+
+      if (!isPlaceholder(whatsappMessageId)) {
+        values.push(whatsappMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 3 AS prio
+           FROM messages
+           WHERE wa_message_id = $${values.length}
+             AND created_at > NOW() - INTERVAL '7 days'`
+        );
+      }
+
+      if (isUUID(localMessageId)) {
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 4 AS prio
+           FROM messages
+           WHERE id::text = $${values.length}
+             AND created_at > NOW() - INTERVAL '7 days'`
+        );
+      }
+
+      if (parts.length > 0) {
+        const result = await query(
+          `SELECT * FROM (${parts.join(' UNION ALL ')}) sub ORDER BY prio ASC LIMIT 1`,
+          values
+        );
+
+        if (result.rows.length > 0) {
+          console.log(`✅ [PARTITION-7J] Trouvé (prio=${result.rows[0].prio}): ${result.rows[0].id}`);
+
+          // Backfill opportuniste dans message_id_index pour les prochains lookups
+          const row = result.rows[0];
+          if (localMessageId && !isPlaceholder(localMessageId)) {
+            query(
+              `INSERT INTO message_id_index
+                 (wati_local_id, wa_message_id, message_id, created_at, client_id, recipient_phone, wa_status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (wati_local_id) DO UPDATE
+                 SET wa_message_id = EXCLUDED.wa_message_id,
+                     wa_status     = EXCLUDED.wa_status`,
+              [localMessageId, row.wa_message_id, row.id, row.created_at, row.client_id, row.recipient_phone, row.wa_status]
+            ).catch(() => {});
+          }
+
+          return row;
+        }
+      }
+    }
+
+    // ── NIVEAU 3 : fallback sans borne temporelle (rare — webhook très tardif) ──
+    // On log pour monitoring : si ce cas est fréquent, augmenter l'INTERVAL du niveau 2
+    logger.warn(`[findMessage] Fallback niveau 3 (scan 240 partitions): localId=${localMessageId}`);
+    {
+      const parts  = [];
+      const values = [];
+
+      if (!isPlaceholder(localMessageId)) {
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 1 AS prio
+           FROM messages WHERE wati_local_id = $${values.length}`
+        );
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 2 AS prio
+           FROM messages WHERE wa_message_id = $${values.length}`
+        );
+      }
+
+      if (!isPlaceholder(whatsappMessageId)) {
+        values.push(whatsappMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 3 AS prio
+           FROM messages WHERE wa_message_id = $${values.length}`
+        );
+      }
+
+      if (isUUID(localMessageId)) {
+        values.push(localMessageId);
+        parts.push(
+          `SELECT id, client_id, wa_status, wa_message_id, recipient_phone, created_at, 4 AS prio
+           FROM messages WHERE id::text = $${values.length}`
+        );
+      }
+
+      if (parts.length === 0) {
+        console.log('❌ Aucun identifiant valide');
+        return null;
+      }
+
+      const result = await query(
+        `SELECT * FROM (${parts.join(' UNION ALL ')}) sub ORDER BY prio ASC LIMIT 1`,
+        values
+      );
+
+      if (result.rows.length > 0) {
+        console.log(`✅ [FALLBACK-FULL] Trouvé: ${result.rows[0].id}`);
+        return result.rows[0];
+      }
+    }
+
+    console.log(`❌ Message introuvable: localId=${localMessageId}, waId=${whatsappMessageId}`);
+    return null;
+  }
+
+  // ============================================================
+  // UPDATE MESSAGE STATUS — via batch engine
+  // ============================================================
+  async updateMessageStatus(whatsappMessageId, status, timestamp, eventType, localMessageId = null, failedDetail = null) {
+    console.log(`📨 WEBHOOK - localId=${localMessageId}, waId=${whatsappMessageId}, event=${eventType}`);
+
+    if (!localMessageId && !whatsappMessageId) return;
+
+    if (localMessageId && this.isDuplicateEvent(localMessageId, eventType)) {
+      logger.debug(`[WEBHOOK] Doublon ignoré: ${localMessageId}|${eventType}`);
+      return;
+    }
+
+    try {
+      const internalStatus = mapWatiStatus(eventType);
+      const timestampDate  = timestamp ? new Date(parseInt(timestamp) * 1000) : new Date();
+      const eventTypeUpper = eventType?.toUpperCase() || '';
+
+      const message = await this.findMessage(localMessageId, whatsappMessageId);
+
+      if (!message) {
+        logger.warn('⚠️ Message non trouvé → orphan_webhooks:', { localMessageId, whatsappMessageId });
+        batchEngine.scheduleOrphan({
+          localMessageId,
+          whatsappMessageId,
+          eventType,
+          rawPayload:   { status, timestamp, failedDetail },
+          sent_at:      eventTypeUpper.includes('SENT')      ? timestampDate : null,
+          delivered_at: eventTypeUpper.includes('DELIVERED') ? timestampDate : null,
+          read_at:      eventTypeUpper.includes('READ')      ? timestampDate : null,
+          failed_at:    eventTypeUpper.includes('FAILED')    ? timestampDate : null,
+        });
+        return;
+      }
+
+      if (!isValidStatusTransition(message.wa_status, internalStatus)) {
+        logger.info('⚠️ Transition invalide:', { current: message.wa_status, new: internalStatus });
+        return;
+      }
+      if (message.wa_status === internalStatus) {
+        logger.debug('⏭️ Statut identique ignoré:', { messageId: message.id });
+        return;
+      }
+
+      batchEngine.schedule(
+        message.id,
+        message.client_id,
+        internalStatus,
+        timestampDate,
+        whatsappMessageId !== message.wa_message_id ? whatsappMessageId : null,
+        failedDetail
+      );
+
+      if (localMessageId) {
+        query(
+          `UPDATE orphan_webhooks SET processed = true WHERE local_message_id = $1`,
+          [localMessageId]
+        ).catch(() => {});
+      }
+
+      setImmediate(() => {
+        this.triggerClientWebhooks(message.id, internalStatus).catch(err =>
+          logger.error('triggerClientWebhooks:', err.message)
+        );
+
+        updateCampaignContactStatus(whatsappMessageId, internalStatus, message.id, message.client_id).catch(err =>
+          logger.error('updateCampaignContactStatus:', err.message)
+        );
+
+        query(
+          `SELECT  campaign_id FROM messages WHERE id = $1 AND created_at = $2 LIMIT 1`,
+          [message.id, message.created_at]  // created_at → accès direct à la partition exacte
+        ).then(r => {
+          const campaignId = r.rows[0]?.campaign_id || null;
+          triggerWorkflowFromCampaign(campaignId, message.recipient_phone, internalStatus)
+            .catch(err => logger.error('Trigger automation:', err.message));
+          if (campaignId) {
+            triggerWorkflowFromCampaign(null, message.recipient_phone, internalStatus)
+              .catch(err => logger.error('Trigger automation (global):', err.message));
+          }
+        }).catch(() => {});
+      });
+
+      logger.info(`✅ Status batché: ${message.id} → ${internalStatus}`);
+
+    } catch (error) {
+      logger.error('❌ Erreur updateMessageStatus:', error.message);
+    }
+  }
+
+  // ============================================================
+  // SAVE INCOMING MESSAGE
+  // ============================================================
+  async saveIncomingMessage(payload) {
+    try {
+      console.log('📨 MESSAGE ENTRANT - eventType:', payload.eventType);
+
+      const {
+        id, whatsappMessageId, conversationId, ticketId,
+        text, type, timestamp, waId, senderName,
+        channelPhoneNumber, data, from, message, body
+      } = payload;
+
+      let messageText = text || data?.text || message?.text || message?.body || body || payload.message_content || '';
+      let fromNumber  = waId || from || payload.phone_number || payload.sender;
+
+      if (fromNumber?.startsWith('whatsapp:')) fromNumber = fromNumber.replace('whatsapp:', '');
+      fromNumber = normalizePhone(fromNumber);
+
+      const sender       = senderName || payload.senderName || payload.name || '';
+      const messageType  = type || data?.type || message?.type || 'text';
+      const msgTimestamp = timestamp || payload.timestamp || Date.now();
+      const receivedAt   = msgTimestamp ? new Date(parseInt(msgTimestamp) * 1000) : new Date();
+
+      console.log(`📥 De: ${fromNumber}, Texte: "${messageText}", Type: ${messageType}`);
+
+      if (!fromNumber) {
+        logger.warn('Message entrant sans numéro expéditeur');
+        return;
+      }
+
+      const CHATBOT_NUMBER = process.env.CHATBOT_WHATSAPP_NUMBER || '+237688359040';
+
+const normalizedChannel = channelPhoneNumber
+  ? (channelPhoneNumber.startsWith('+') ? channelPhoneNumber : '+' + channelPhoneNumber)
+  : null;
+
+if (normalizedChannel === CHATBOT_NUMBER) {
+  const { enqueueIncomingBotMessage } = require('../../workers/chatbot.worker');
+  await enqueueIncomingBotMessage({
+    phone: fromNumber,
+    text: messageText,
+    senderName: sender,
+    botNumber: CHATBOT_NUMBER,
+  });
+  logger.info(`[BOT] Message routé vers bot-messages: ${fromNumber}`);
+  return; // ne pas exécuter la logique B2B (inbox, campagnes, session, webhooks clients)
+}
+
+  // ── Détection STOP ──
+const msgLower = messageText.toLowerCase();
+const optOutKw = ['stop', 'arrêter', 'arréter', 'unsubscribe', 'desabonner',
+                  'désabonner', 'stop@', 'arret', 'stop now', 'stopp'];
+const isStop = optOutKw.some(kw => msgLower.includes(kw) || msgLower === kw);
+if (isStop) {
+  console.log(`🚫 STOP pour ${fromNumber}`);
+  await this.handleOptOut(fromNumber, channelPhoneNumber); // passez le channelNumber
+}
+
+// ── Détection START (réabonnement) ──
+const optInKw = ['start', 'réactiver', 'reprendre', 'reabonner', 'reactivate', 'resume'];
+const isStart = optInKw.some(kw => msgLower.includes(kw) || msgLower === kw);
+if (isStart) {
+  console.log(`🔄 START pour ${fromNumber}`);
+  await this.handleOptIn(fromNumber, channelPhoneNumber);
+}
+
+      // ── Sauvegarde incoming_messages ──
+      try {
+        let existingCheck = null;
+        if (id && id !== 'message.Id') {
+          existingCheck = await query(
+            `SELECT id FROM incoming_messages WHERE message_id = $1`, [id]
+          );
+        }
+        if (!existingCheck || existingCheck.rows.length === 0) {
+          const insertResult = await query(
+            `INSERT INTO incoming_messages (
+               message_id, wa_message_id, conversation_id, ticket_id,
+               message_content, message_type, phone_number, sender_name,
+               channel_phone, received_at, is_stop, raw_payload
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT (message_id) DO NOTHING
+             RETURNING id`,
+            [
+              id || null, whatsappMessageId || null,
+              conversationId || null, ticketId || null,
+              messageText, messageType, fromNumber, sender,
+              channelPhoneNumber || null, receivedAt, isStop,
+              JSON.stringify(payload)
+            ]
+          );
+          console.log(`✅ Message entrant sauvegardé: ${insertResult.rows[0]?.id}`);
+        } else {
+          console.log(`⏭️ Doublon ignoré: ${id}`);
+        }
+      } catch (insertError) {
+        logger.warn('Erreur insertion message entrant:', insertError.message);
+      }
+
+      // ── Résolution client_id (requêtes parallèles) ──
+      let clientId = null;
+      const [lastMsgRes, chanRes] = await Promise.all([
+        query(
+          `SELECT client_id FROM messages
+           WHERE recipient_phone = $1
+             AND wa_status IN ('sent', 'delivered', 'read')
+             AND created_at > NOW() - INTERVAL '30 days'   -- borne pour partition pruning
+           ORDER BY created_at DESC LIMIT 1`,
+          [fromNumber]
+        ),
+        channelPhoneNumber
+          ? query(
+              `SELECT wna.client_id
+               FROM whatsapp_numbers wn
+               JOIN whatsapp_number_assignments wna ON wna.number_id = wn.id
+               WHERE wn.phone_number = $1 AND wn.is_active = true LIMIT 1`,
+              [channelPhoneNumber.startsWith('+') ? channelPhoneNumber : '+' + channelPhoneNumber]
+            )
+          : Promise.resolve({ rows: [] }),
+      ]);
+
+      clientId = lastMsgRes.rows[0]?.client_id || chanRes.rows[0]?.client_id || null;
+
+      if (!clientId) {
+        const defaultRes = await query(`SELECT id FROM clients WHERE is_active = true LIMIT 1`);
+        clientId = defaultRes.rows[0]?.id || null;
+      }
+
+      if (!clientId) {
+        logger.error(`❌ Aucun client pour ${fromNumber}`);
+        return;
+      }
+
+      // ── Ouverture / prolongation de la fenêtre de session 24h ──
+/*  sessionService.openOrExtendSession({
+  clientId,
+  phone: fromNumber,
+  channelNumber: channelPhoneNumber,
+}).catch(err => logger.error('[SESSION] Erreur ouverture session:', err.message));*/
+
+    // ── Ouverture / prolongation de la session 24h ──
+// Récupérer l'état actuel de la session pour savoir si c'est une nouvelle
+const existingSession = await sessionService.getSessionInfo({
+  clientId,
+  phone: fromNumber,
+});
+
+const isNewOrExpired = !existingSession || existingSession.status !== 'active' || new Date(existingSession.window_expires_at) <= new Date();
+
+// Ouvrir/prolonger la session (toujours nécessaire)
+sessionService.openOrExtendSession({
+  clientId,
+  phone: fromNumber,
+  channelNumber: channelPhoneNumber,
+}).catch(err => logger.error('[SESSION] Erreur ouverture session:', err.message));
+
+// Si c'est une nouvelle session (ou expirée), envoyer un template de bienvenue
+if (isNewOrExpired) {
+  setImmediate(async () => {
+    try {
+      const welcomeTemplate = await sessionService.getDefaultWelcomeTemplate(clientId);
+      if (!welcomeTemplate) {
+        logger.warn(`[SESSION] Aucun template de bienvenue configuré pour le client ${clientId}`);
+        return;
+      }
+
+      // Récupérer le nom du contact (si disponible)
+      const contactName = sender || 'Client';
+
+      // Utiliser le service d'envoi de messages pour envoyer le template
+      const { sendMessage } = require('../../services/message.service');
+      await sendMessage(clientId, {
+        phoneNumber: channelPhoneNumber || '+237688359040', // numéro émetteur
+        recipient_phone: fromNumber,
+        message_type: 'template',
+        template_name: welcomeTemplate.templateName,
+        template_language: welcomeTemplate.templateLanguage || 'fr',
+        template_params: { name: contactName },
+      });
+
+      logger.info(`[SESSION] Template de bienvenue envoyé à ${fromNumber} (${contactName})`);
+    } catch (err) {
+      logger.error(`[SESSION] Erreur envoi template bienvenue pour ${fromNumber}:`, err.message);
+    }
+  });
+}
+
+      // ── Anti-doublon Inbox ──
+      if (whatsappMessageId) {
+        const existing = await query(
+          `SELECT id FROM inbox_messages WHERE wa_message_id = $1`, [whatsappMessageId]
+        );
+        if (existing.rows.length > 0) {
+          logger.info(`[INBOX] Doublon ignoré: wa_message_id=${whatsappMessageId}`);
+          return;
+        }
+      }
+
+      await inboxService.processIncomingMessage({
+        fromNumber, messageText, messageType, senderName: sender,
+        channelPhone: channelPhoneNumber, waMessageId: whatsappMessageId, receivedAt,
+      }, clientId);
+
+      // ── Comptabilisation réponse campagne (fire & forget) ──
+      setImmediate(async () => {
+        try {
+          const campaignMatch = await query(
+            `SELECT campaign_id FROM campaign_contacts
+             WHERE phone_number = $1 AND status IN ('delivered', 'read')
+             ORDER BY sent_at DESC LIMIT 1`,
+            [fromNumber]
+          );
+          if (!campaignMatch.rows[0]) return;
+
+          const replyId = whatsappMessageId
+            || (id && id !== 'message.Id' ? id : `reply_${fromNumber}_${Date.now()}`);
+
+          const already = await query(
+            `SELECT 1 FROM campaign_reply_tracking WHERE wa_message_id = $1`, [replyId]
+          );
+          if (!already.rows[0]) {
+            await Promise.all([
+              query(`UPDATE campaigns SET replied_count = replied_count + 1 WHERE id = $1`,
+                    [campaignMatch.rows[0].campaign_id]),
+              query(`INSERT INTO campaign_reply_tracking (wa_message_id, campaign_id) VALUES ($1, $2)`,
+                    [replyId, campaignMatch.rows[0].campaign_id]),
+            ]);
+            logger.info(`Réponse campagne ${campaignMatch.rows[0].campaign_id} comptabilisée`);
+          }
+        } catch (err) {
+          logger.warn('Erreur comptage réponse campagne:', err.message);
+        }
+      });
+
+    } catch (error) {
+      logger.error('❌ Erreur saveIncomingMessage:', error.message);
+    }
+  }
+
+  // ============================================================
+  // HANDLE OPT-OUT
+  // ============================================================
+  async handleOptOut(phoneNumber, channelNumber) {
+  try {
+    const cleanPhone = normalizePhone(phoneNumber);
+    const result = await query(
+      `INSERT INTO opt_out_contacts (phone_number, opt_out_at, source, created_at)
+       VALUES ($1, NOW(), 'wati', NOW())
+       ON CONFLICT (phone_number) DO UPDATE
+         SET opt_out_at = NOW(), source = 'wati', updated_at = NOW()
+       RETURNING *`,
+      [cleanPhone]
+    );
+    logger.info('🚫 Opt-out enregistré:', { phoneNumber: cleanPhone });
+
+    // ── Envoyer le message de confirmation ──
+    const confirmMsg =
+      'Votre demande de désinscription à la réception des factures via WhatsApp a bien été prise en compte.\n' +
+      'Si vous changez d\'avis ou si vous vous êtes désinscrit par erreur, vous pouvez vous réabonner à tout moment.\n' +
+      'Pour réactiver le service envoyez START.';
+
+    const response = await watiService.sendTextMessage(
+      cleanPhone,
+      confirmMsg,
+      channelNumber || null
+    );
+
+    if (!response.success) {
+      logger.warn(`Échec envoi message STOP pour ${cleanPhone}: ${response.error}`);
+    } else {
+      logger.info(`📨 Message STOP envoyé à ${cleanPhone}`);
+    }
+
+    return result.rows[0];
+  } catch (error) {
+    logger.error('Erreur handleOptOut:', error.message);
+  }
+}
+
+  /**
+ * Réactiver un numéro (supprimer l'opt-out) et envoyer un message de confirmation
+ */
+async handleOptIn(phoneNumber, channelNumber) {
+  try {
+    const cleanPhone = normalizePhone(phoneNumber);
+    // Vérifier s'il est bien en opt-out
+    const check = await query(
+      `SELECT phone_number FROM opt_out_contacts WHERE phone_number = $1`,
+      [cleanPhone]
+    );
+
+    if (check.rows.length === 0) {
+      // Déjà actif, on peut informer l'utilisateur
+      await this.sendOptInMessage(cleanPhone, channelNumber, true);
+      logger.info(`ℹ️ ${cleanPhone} déjà abonné – réabonnement inutile`);
+      return;
+    }
+
+    // Supprimer l'opt-out
+    await query(
+      `DELETE FROM opt_out_contacts WHERE phone_number = $1`,
+      [cleanPhone]
+    );
+
+    // Envoyer le message de confirmation de réabonnement
+    await this.sendOptInMessage(cleanPhone, channelNumber, false);
+
+    logger.info(`✅ Réabonnement pour ${cleanPhone} enregistré`);
+  } catch (error) {
+    logger.error('Erreur handleOptIn:', error.message);
+  }
+}
+
+  /**
+ * Envoyer le message de confirmation de réabonnement
+ */
+async sendOptInMessage(phoneNumber, channelNumber, alreadyActive = false) {
+  try {
+    const msg = alreadyActive
+      ? 'Vous êtes déjà abonné à la réception des factures par WhatsApp. Aucune action nécessaire.'
+      : '✅ Votre abonnement a été réactivé. Vous recevrez à nouveau vos factures par WhatsApp.\n\n' +
+        'Si vous souhaitez vous désabonner à tout moment, envoyez STOP.';
+
+    const response = await watiService.sendTextMessage(
+      phoneNumber,
+      msg,
+      channelNumber || null
+    );
+
+    if (!response.success) {
+      logger.warn(`Échec envoi message START pour ${phoneNumber}: ${response.error}`);
+    } else {
+      logger.info(`📨 Message START envoyé à ${phoneNumber}`);
+    }
+  } catch (err) {
+    logger.error(`Erreur envoi message START pour ${phoneNumber}:`, err.message);
+  }
+}
+
+
+  // ============================================================
+  // WEBHOOKS CLIENT (notifications sortantes)
+  // ============================================================
+  async notifyClientIncomingMessage(phoneNumber, message, senderName, clientId) {
+    try {
+      const webhooks = await query(
+        `SELECT * FROM client_webhooks WHERE client_id = $1 AND is_active = true AND $2 = ANY(events)`,
+        [clientId, 'message.incoming']
+      );
+      for (const webhook of webhooks.rows) {
+        const payload = {
+          event: 'message.incoming',
+          timestamp: new Date().toISOString(),
+          data: { from: phoneNumber, sender_name: senderName, message, received_at: new Date().toISOString() }
+        };
+        const signature = crypto.createHmac('sha256', webhook.secret)
+          .update(JSON.stringify(payload)).digest('hex');
+        axios.post(webhook.url, payload, {
+          headers: { 'Content-Type': 'application/json', 'X-Webhook-Signature': signature },
+          timeout: 10000
+        }).catch(err => logger.error('Webhook client:', err.message));
+      }
+    } catch (error) {
+      logger.error('notifyClientIncomingMessage:', error.message);
+    }
+  }
+
+/**  async triggerClientWebhooks(messageId, status) {
+    try {
+      const webhooksResult = await query(
+        `SELECT ch.* FROM client_webhooks ch
+         JOIN messages m ON m.client_id = ch.client_id
+         WHERE m.id = $1 AND ch.is_active = true AND $2 = ANY(ch.events)`,
+        [messageId, `message.${status}`]
+      );
+      for (const webhook of webhooksResult.rows) {
+        this.sendWebhookNotification(webhook, messageId, status)
+          .catch(err => logger.error('sendWebhookNotification:', err.message));
+      }
+    } catch (error) {
+      logger.error('triggerClientWebhooks:', error.message);
+    }
+  }
+
+  async sendWebhookNotification(webhook, messageId, status) {
+    try {
+      const result = await query(`SELECT * FROM messages WHERE id = $1`, [messageId]);
+      if (!result.rows.length) return;
+      const msg = result.rows[0];
+      const payload = {
+        event: `message.${status}`,
+        timestamp: new Date().toISOString(),
+        data: {
+          message_id: messageId, status,
+          recipient: msg.recipient_phone,
+          wa_message_id: msg.wa_message_id,
+          sent_at: msg.sent_at, delivered_at: msg.delivered_at, read_at: msg.read_at
+        }
+      };
+      const signature = crypto.createHmac('sha256', webhook.secret)
+        .update(JSON.stringify(payload)).digest('hex');
+      await axios.post(webhook.url, payload, {
+        headers: { 'Content-Type': 'application/json', 'X-Webhook-Signature': signature },
+        timeout: 10000
+      });
+    } catch (error) {
+      logger.error('sendWebhookNotification:', error.message);
+    }
+  }
+*/
+
+// ── LOGGING DES WEBHOOKS ──────────────────────────────────
+async logWebhook(webhookId, event, payload, status, responseBody = null, durationMs = 0) {
+  try {
+    await query(
+      `INSERT INTO webhook_logs
+       (webhook_id, event, payload, response_status, response_body, duration_ms, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [webhookId || null, event, JSON.stringify(payload), status, responseBody, durationMs]
+    );
+  } catch (err) {
+    logger.error('[logWebhook] Erreur insertion:', err.message);
+  }
+}
+
+async getWebhookIdFromRequest(request) {
+  const protocol = request.protocol || 'https';
+  const host = request.headers.host || request.hostname;
+  const fullUrl = `${protocol}://${host}${request.url}`;
+
+  const cached = webhookIdCache.get(fullUrl);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    return cached.id;
+  }
+
+  const result = await query(
+    `SELECT id FROM client_webhooks WHERE url = $1 AND is_active = true LIMIT 1`,
+    [fullUrl]
+  );
+
+  if (result.rows.length === 0) {
+    logger.warn(`Aucun webhook trouvé pour l'URL: ${fullUrl}`);
+    return null;
+  }
+
+  const webhookId = result.rows[0].id;
+  webhookIdCache.set(fullUrl, { id: webhookId, timestamp: Date.now() });
+  return webhookId;
+}
+
+async triggerClientWebhooks(messageId, status) {
+  try {
+    // Récupérer les infos depuis message_id_index
+    const indexResult = await query(
+      `SELECT client_id, recipient_phone, wa_message_id, wa_status
+       FROM message_id_index
+       WHERE message_id = $1
+       LIMIT 1`,
+      [messageId]
+    );
+    if (indexResult.rows.length === 0) return;
+    const msg = indexResult.rows[0];
+
+    const webhooksResult = await query(
+      `SELECT ch.* FROM client_webhooks ch
+       WHERE ch.client_id = $1 AND ch.is_active = true AND $2 = ANY(ch.events)`,
+      [msg.client_id, `message.${status}`]
+    );
+    for (const webhook of webhooksResult.rows) {
+      this.sendWebhookNotification(webhook, messageId, status, msg).catch(err =>
+        logger.error('sendWebhookNotification:', err.message)
+      );
+    }
+  } catch (error) {
+    logger.error('triggerClientWebhooks:', error.message);
+  }
+}
+
+async sendWebhookNotification(webhook, messageId, status, msgData) {
+  try {
+    const payload = {
+      event: `message.${status}`,
+      timestamp: new Date().toISOString(),
+      data: {
+        message_id: messageId,
+        status,
+        recipient: msgData.recipient_phone,
+        wa_message_id: msgData.wa_message_id,
+        // On peut omettre les dates ou les récupérer depuis l'index si besoin
+        sent_at: null,
+        delivered_at: null,
+        read_at: null
+      }
+    };
+    const signature = crypto.createHmac('sha256', webhook.secret)
+      .update(JSON.stringify(payload)).digest('hex');
+    await axios.post(webhook.url, payload, {
+      headers: { 'Content-Type': 'application/json', 'X-Webhook-Signature': signature },
+      timeout: 10000
+    });
+  } catch (error) {
+    logger.error('sendWebhookNotification:', error.message);
+  }
+}
+
+// ============================================================
+// HANDLE WEBHOOK — Point d'entrée principal
+// Répond 200 immédiatement à WATI puis traite en arrière‑plan
+// ============================================================
+async handleWebhook(request, reply) {
+  const clientIp = request.ip || request.connection?.remoteAddress || 'unknown';
+  const startTime = Date.now();
+
+  try {
+    // Récupérer le webhook_id associé à cette URL
+    let webhookId = await this.getWebhookIdFromRequest(request);
+    if (!webhookId) {
+      // On continue sans ID (on loguera avec NULL)
+      logger.warn('⚠️ Webhook reçu sans ID correspondant (URL inconnue) — logué sans webhook_id');
+    }
+
+    // Rate limiting
+    if (!this.checkRateLimit(clientIp)) {
+      return reply.code(429).send({ error: 'Too many requests' });
+    }
+
+    const payload = request.body;
+    const eventType = payload.eventType || payload.event_type || payload.event || 'unknown';
+
+    // LOG initial (même si webhookId est null)
+    const duration = Date.now() - startTime;
+    await this.logWebhook(webhookId || null, eventType, payload, 200, null, duration);
+
+    // Test payload (message.test du dashboard)
+    if (this.isTestPayload(payload)) {
+      return reply.code(200).send({
+        status: 'received',
+        message: 'Test webhook working',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Log métier
+    logger.info('📨 WATI webhook:', {
+      eventType,
+      localMessageId: payload.localMessageId,
+      whatsappMessageId: payload.whatsappMessageId,
+      ip: clientIp
+    });
+
+    // Réponse immédiate à WATI (évite les retries pour timeout)
+    reply.code(200).send({ status: 'received', timestamp: new Date().toISOString() });
+
+    // ── Traitement asynchrone post‑réponse ──
+    setImmediate(async () => {
+      try {
+        switch (eventType) {
+          case 'sentMessageDELIVERED_v2':
+          case 'sentMessageDELIVERED':
+            await this.updateMessageStatus(
+              payload.whatsappMessageId, 'delivered',
+              payload.timestamp, eventType, payload.localMessageId
+            );
+            break;
+
+          case 'sentMessageREAD_v2':
+          case 'sentMessageREAD':
+            await this.updateMessageStatus(
+              payload.whatsappMessageId, 'read',
+              payload.timestamp, eventType, payload.localMessageId
+            );
+            break;
+
+          case 'sentMessageSENT_v2':
+          case 'sentMessageSENT':
+            await this.updateMessageStatus(
+              payload.whatsappMessageId, 'sent',
+              payload.timestamp, eventType, payload.localMessageId
+            );
+            break;
+
+           case 'templateMessageFailed':
+           case 'templateMessageFailed_v2':
+            await this.updateMessageStatus(
+              payload.whatsappMessageId, 'failed',
+              payload.timestamp, eventType, payload.localMessageId,
+              payload.failedDetail || payload.failed_detail || payload.data?.failedDetail || null
+            );
+            break;
+
+          case 'message':
+          case 'messageReceived':
+            await this.saveIncomingMessage(payload);
+            break;
+
+          default:
+            logger.info(`ℹ️ Webhook non géré: ${eventType}`);
+        }
+      } catch (err) {
+        logger.error('Erreur traitement webhook async:', err.message);
+      }
+    });
+
+  } catch (error) {
+    logger.error('❌ Erreur handleWebhook:', error.message);
+    if (!reply.sent) {
+      return reply.code(200).send({ status: 'error', timestamp: new Date().toISOString() });
+    }
+  }
+}
+
+}
+
+module.exports = new WatiWebhookController();

@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Documentation API - NEXT LTD WhatsApp Business API</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github-dark.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --primary: #10b981;
+            --primary-dark: #059669;
+            --secondary: #3b82f6;
+            --dark: #1f2937;
+            --light: #f9fafb;
+            --gray: #6b7280;
+            --code-bg: #1e1e1e;
+            --border: #e5e7eb;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            line-height: 1.6;
+            color: var(--dark);
+            background-color: var(--light);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        /* Header */
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 2rem 0;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .logo {
+            width: 50px;
+            height: 50px;
+            background: white;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 900;
+            font-size: 24px;
+            color: var(--primary);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .brand h1 {
+            font-size: 1.8rem;
+            margin-bottom: 5px;
+        }
+
+        .brand p {
+            opacity: 0.9;
+            font-size: 0.9rem;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary {
+            background: white;
+            color: var(--primary);
+        }
+
+        .btn-primary:hover {
+            background: var(--light);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+
+        /* Main Content */
+        main {
+            padding: 3rem 0;
+        }
+
+        .content-wrapper {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 40px;
+        }
+
+        @media (max-width: 768px) {
+            .content-wrapper {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Sidebar */
+        .sidebar {
+            position: sticky;
+            top: 20px;
+            height: fit-content;
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--border);
+        }
+
+        .sidebar h3 {
+            color: var(--primary);
+            margin-bottom: 20px;
+            font-size: 1.2rem;
+            padding-bottom: 10px;
+            border-bottom: 2px solid var(--border);
+        }
+
+        .nav-menu {
+            list-style: none;
+        }
+
+        .nav-menu li {
+            margin-bottom: 8px;
+        }
+
+        .nav-menu a {
+            color: var(--dark);
+            text-decoration: none;
+            padding: 10px 15px;
+            border-radius: 8px;
+            display: block;
+            transition: all 0.2s ease;
+            font-weight: 500;
+        }
+
+        .nav-menu a:hover {
+            background: var(--light);
+            color: var(--primary);
+            padding-left: 20px;
+        }
+
+        .nav-menu a.active {
+            background: var(--primary);
+            color: white;
+        }
+
+        /* Documentation Content */
+        .doc-content {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--border);
+        }
+
+        .doc-section {
+            margin-bottom: 3rem;
+            scroll-margin-top: 20px;
+        }
+
+        .doc-section:last-child {
+            margin-bottom: 0;
+        }
+
+        h2 {
+            color: var(--primary);
+            margin-bottom: 1.5rem;
+            padding-bottom: 10px;
+            border-bottom: 2px solid var(--border);
+            font-size: 1.8rem;
+        }
+
+        h3 {
+            color: var(--secondary);
+            margin: 1.5rem 0 1rem;
+            font-size: 1.4rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: var(--dark);
+        }
+
+        ul, ol {
+            margin-left: 2rem;
+            margin-bottom: 1.5rem;
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        /* Code Blocks */
+        pre {
+            background: var(--code-bg);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            border-left: 4px solid var(--primary);
+        }
+
+        code {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+
+        .code-header {
+            background: #2d2d2d;
+            padding: 10px 20px;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: #ccc;
+            font-size: 0.9rem;
+        }
+
+        .copy-btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: background 0.3s;
+        }
+
+        .copy-btn:hover {
+            background: var(--primary-dark);
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+
+        th {
+            background: var(--primary);
+            color: white;
+            padding: 12px 15px;
+            text-align: left;
+            font-weight: 600;
+        }
+
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        tr:hover {
+            background: var(--light);
+        }
+
+        /* Language Badges */
+        .lang-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            background: var(--light);
+            color: var(--gray);
+            border-radius: 4px;
+            font-size: 0.8rem;
+            margin-right: 5px;
+            margin-bottom: 5px;
+            border: 1px solid var(--border);
+        }
+
+        /* Alert */
+        .alert {
+            background: #f0f9ff;
+            border-left: 4px solid var(--secondary);
+            padding: 15px 20px;
+            margin: 1.5rem 0;
+            border-radius: 8px;
+        }
+
+        /* Footer */
+        footer {
+            background: var(--dark);
+            color: white;
+            padding: 3rem 0;
+            margin-top: 4rem;
+        }
+
+        .footer-content {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 40px;
+        }
+
+        .footer-section h4 {
+            color: var(--primary);
+            margin-bottom: 20px;
+            font-size: 1.2rem;
+        }
+
+        .footer-links {
+            list-style: none;
+        }
+
+        .footer-links li {
+            margin-bottom: 10px;
+        }
+
+        .footer-links a {
+            color: #ccc;
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+
+        .footer-links a:hover {
+            color: white;
+        }
+
+        .contact-info {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .contact-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #ccc;
+        }
+
+        .copyright {
+            text-align: center;
+            margin-top: 3rem;
+            padding-top: 2rem;
+            border-top: 1px solid #374151;
+            color: #9ca3af;
+            font-size: 0.9rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header-content {
+                flex-direction: column;
+                text-align: center;
+            }
+
+            .cta-buttons {
+                justify-content: center;
+            }
+
+            .doc-content {
+                padding: 25px;
+            }
+
+            .sidebar {
+                position: static;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="logo-section">
+                    <div class="logo">N</div>
+                    <div class="brand">
+                        <h1>NEXT LTD</h1>
+                        <p>WhatsApp Business API Documentation</p>
+                    </div>
+                </div>
+                <div class="cta-buttons">
+                    <a href="https://dashboard.numericexport.com" class="btn btn-primary">
+                        <i class="fas fa-rocket"></i> Accéder au Dashboard
+                    </a>
+                    <a href="https://dashboard.numericexport.com/dashboard/api-tester" class="btn btn-secondary">
+                        <i class="fas fa-vial"></i> Tester l'API
+                    </a>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="container">
+        <div class="content-wrapper">
+            <!-- Sidebar Navigation -->
+            <aside class="sidebar">
+                <h3>Documentation</h3>
+                <ul class="nav-menu">
+                    <li><a href="#introduction" class="active">🚀 Introduction</a></li>
+                    <li><a href="#authentication">🔐 Authentification</a></li>
+                    <li><a href="#send-messages">📱 Envoyer des Messages</a></li>
+                    <li><a href="#code-examples">📊 Exemples de Code</a></li>
+                    <li><a href="#message-status">📈 Statut des Messages</a></li>
+                    <li><a href="#statistics">📊 Statistiques</a></li>
+                    <li><a href="#export">📥 Export CSV</a></li>
+                    <li><a href="#error-codes">⚠️ Codes d'Erreur</a></li>
+                    <li><a href="#support">📞 Support</a></li>
+                </ul>
+            </aside>
+
+            <!-- Documentation Content -->
+            <article class="doc-content">
+                <section id="introduction" class="doc-section">
+                    <h2>🚀 Introduction</h2>
+                    <p>NEXT LTD (Numeric EXport Technologies) fournit une API REST pour envoyer des messages WhatsApp Business via 360dialog.</p>
+                    
+                    <div class="alert">
+                        <strong>URL de base :</strong> <code>https://api.numericexport.com/api/v1</code>
+                    </div>
+                </section>
+
+                <section id="authentication" class="doc-section">
+                    <h2>🔐 Authentification</h2>
+                    <p>Deux méthodes d'authentification sont disponibles :</p>
+                    
+                    <h3>1. API Token (Pour l'envoi de messages)</h3>
+                    <pre><code>Authorization: Bearer nxt_your_api_token_here</code></pre>
+                    
+                    <h3>2. JWT Token (Pour le dashboard)</h3>
+                    <pre><code>Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...</code></pre>
+                </section>
+
+                <section id="send-messages" class="doc-section">
+                    <h2>📱 Envoyer des Messages</h2>
+                    
+                    <h3>Message Texte Simple</h3>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X POST https://api.numericexport.com/api/v1/messages/send \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipient_phone": "+237600000000",
+    "message_type": "text",
+    "message_content": "Bonjour ! Ceci est un message de test."
+  }'</code></pre>
+
+                    <h3>Message Template</h3>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X POST https://api.numericexport.com/api/v1/messages/send \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "hello_world",
+    "template_language": "fr",
+    "template_params": ["John", "15"]
+  }'</code></pre>
+
+                    <h3>Message avec Média (Image)</h3>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X POST https://api.numericexport.com/api/v1/messages/send \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipient_phone": "+237600000000",
+    "message_type": "media",
+    "media_type": "image",
+    "media_url": "https://example.com/image.jpg",
+    "message_content": "Voici votre image"
+  }'</code></pre>
+                </section>
+
+                <section id="code-examples" class="doc-section">
+                    <h2>📊 Exemples de Code</h2>
+                    
+                    <div class="lang-badges">
+                        <span class="lang-badge">PHP</span>
+                        <span class="lang-badge">Python</span>
+                        <span class="lang-badge">Node.js</span>
+                        <span class="lang-badge">Java</span>
+                        <span class="lang-badge">Go</span>
+                        <span class="lang-badge">C#</span>
+                        <span class="lang-badge">PowerShell</span>
+                    </div>
+
+                    <h3>PHP</h3>
+                    <div class="code-header">
+                        <span>PHP</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="php">&lt;?php
+$apiToken = 'nxt_your_api_token';
+$apiUrl = 'https://api.numericexport.com/api/v1/messages/send';
+
+$data = [
+    'recipient_phone' => '+237600000000',
+    'message_type' => 'text',
+    'message_content' => 'Bonjour depuis PHP!'
+];
+
+$ch = curl_init($apiUrl);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+curl_setopt($ch, CURLOPT_HTTPHEADER, [
+    'Authorization: Bearer ' . $apiToken,
+    'Content-Type: application/json'
+]);
+
+$response = curl_exec($ch);
+curl_close($ch);
+
+$result = json_decode($response, true);
+print_r($result);
+?&gt;</code></pre>
+
+                    <h3>Python</h3>
+                    <div class="code-header">
+                        <span>Python</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="python">import requests
+
+api_token = 'nxt_your_api_token'
+api_url = 'https://api.numericexport.com/api/v1/messages/send'
+
+headers = {
+    'Authorization': f'Bearer {api_token}',
+    'Content-Type': 'application/json'
+}
+
+data = {
+    'recipient_phone': '+237600000000',
+    'message_type': 'text',
+    'message_content': 'Bonjour depuis Python!'
+}
+
+response = requests.post(api_url, json=data, headers=headers)
+result = response.json()
+print(result)</code></pre>
+
+                    <h3>Node.js</h3>
+                    <div class="code-header">
+                        <span>JavaScript</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="javascript">const axios = require('axios');
+
+const apiToken = 'nxt_your_api_token';
+const apiUrl = 'https://api.numericexport.com/api/v1/messages/send';
+
+const data = {
+  recipient_phone: '+237600000000',
+  message_type: 'text',
+  message_content: 'Bonjour depuis Node.js!'
+};
+
+axios.post(apiUrl, data, {
+  headers: {
+    'Authorization': `Bearer ${apiToken}`,
+    'Content-Type': 'application/json'
+  }
+})
+.then(response => {
+  console.log(response.data);
+})
+.catch(error => {
+  console.error(error.response.data);
+});</code></pre>
+
+                    <!-- Ajoutez les autres exemples de code de la même manière -->
+                </section>
+
+                <section id="message-status" class="doc-section">
+                    <h2>📈 Vérifier le Statut d'un Message</h2>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X GET https://api.numericexport.com/api/v1/messages/{message_id} \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"</code></pre>
+                </section>
+
+                <section id="statistics" class="doc-section">
+                    <h2>📊 Statistiques</h2>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X GET "https://api.numericexport.com/api/v1/messages/stats/summary?period=7days" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"</code></pre>
+                </section>
+
+                <section id="export" class="doc-section">
+                    <h2>📥 Exporter les Messages (CSV)</h2>
+                    <div class="code-header">
+                        <span>cURL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                    </div>
+                    <pre><code class="bash">curl -X GET "https://api.numericexport.com/api/v1/messages/export/csv" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -o messages.csv</code></pre>
+                </section>
+
+                <section id="error-codes" class="doc-section">
+                    <h2>⚠️ Codes d'Erreur</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Code</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>200</strong></td>
+                                <td>Succès</td>
+                            </tr>
+                            <tr>
+                                <td><strong>201</strong></td>
+                                <td>Créé avec succès</td>
+                            </tr>
+                            <tr>
+                                <td><strong>400</strong></td>
+                                <td>Requête invalide</td>
+                            </tr>
+                            <tr>
+                                <td><strong>401</strong></td>
+                                <td>Non autorisé (Token invalide)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>403</strong></td>
+                                <td>Quota insuffisant</td>
+                            </tr>
+                            <tr>
+                                <td><strong>404</strong></td>
+                                <td>Ressource non trouvée</td>
+                            </tr>
+                            <tr>
+                                <td><strong>429</strong></td>
+                                <td>Trop de requêtes</td>
+                            </tr>
+                            <tr>
+                                <td><strong>500</strong></td>
+                                <td>Erreur serveur</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </section>
+
+                <section id="support" class="doc-section">
+                    <h2>📞 Support</h2>
+                    <p><strong>Email :</strong> <a href="mailto:team@numericexport.com">team@numericexport.com</a></p>
+                    <p><strong>Site web :</strong> <a href="https://numericexport.com" target="_blank">https://numericexport.com</a></p>
+                    <p><strong>Dashboard :</strong> <a href="https://dashboard.numericexport.com" target="_blank" class="btn btn-primary" style="display: inline-flex; margin-top: 10px;">
+                        <i class="fas fa-external-link-alt"></i> Accéder au Dashboard
+                    </a></p>
+                    
+                    <div class="alert">
+                        <p><strong>Accès direct au testeur API :</strong> 
+                        <a href="https://dashboard.numericexport.com/dashboard/api-tester" target="_blank" style="color: var(--primary); font-weight: 600;">
+                            https://dashboard.numericexport.com/dashboard/api-tester
+                        </a></p>
+                    </div>
+                </section>
+            </article>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>NEXT LTD</h4>
+                    <p>WhatsApp Business API Solution complète pour les entreprises.</p>
+                </div>
+                <div class="footer-section">
+                    <h4>Liens Rapides</h4>
+                    <ul class="footer-links">
+                        <li><a href="https://dashboard.numericexport.com" target="_blank">Dashboard</a></li>
+                        <li><a href="https://dashboard.numericexport.com/dashboard/api-tester" target="_blank">Testeur API</a></li>
+                        <li><a href="https://dashboard.numericexport.com/dashboard/documentation" target="_blank">Documentation</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Contact</h4>
+                    <div class="contact-info">
+                        <div class="contact-item">
+                            <i class="fas fa-envelope"></i>
+                            <span>team@numericexport.com</span>
+                        </div>
+                        <div class="contact-item">
+                            <i class="fas fa-globe"></i>
+                            <span>numericexport.com</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="copyright">
+                <p>© 2026 NEXT LTD - Tous droits réservés</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Scripts -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+    <script>
+        // Initialiser le surligneur de syntaxe
+        hljs.highlightAll();
+        
+        // Navigation active
+        document.addEventListener('DOMContentLoaded', function() {
+            const navLinks = document.querySelectorAll('.nav-menu a');
+            const sections = document.querySelectorAll('.doc-section');
+            
+            function setActiveLink() {
+                let scrollPos = window.scrollY + 100;
+                
+                sections.forEach(section => {
+                    const sectionTop = section.offsetTop;
+                    const sectionHeight = section.clientHeight;
+                    const sectionId = section.getAttribute('id');
+                    
+                    if (scrollPos >= sectionTop && scrollPos < sectionTop + sectionHeight) {
+                        navLinks.forEach(link => {
+                            link.classList.remove('active');
+                            if (link.getAttribute('href') === `#${sectionId}`) {
+                                link.classList.add('active');
+                            }
+                        });
+                    }
+                });
+            }
+            
+            window.addEventListener('scroll', setActiveLink);
+            
+            // Copie de code
+            window.copyCode = function(button) {
+                const codeBlock = button.parentElement.nextElementSibling;
+                const textToCopy = codeBlock.textContent;
+                
+                navigator.clipboard.writeText(textToCopy).then(() => {
+                    button.textContent = 'Copié !';
+                    button.style.background = '#059669';
+                    
+                    setTimeout(() => {
+                        button.textContent = 'Copier';
+                        button.style.background = '';
+                    }, 2000);
+                }).catch(err => {
+                    console.error('Erreur de copie:', err);
+                    button.textContent = 'Erreur';
+                });
+            };
+            
+            // Smooth scroll pour les ancres
+            navLinks.forEach(link => {
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const targetId = this.getAttribute('href');
+                    const targetSection = document.querySelector(targetId);
+                    
+                    if (targetSection) {
+                        window.scrollTo({
+                            top: targetSection.offsetTop - 20,
+                            behavior: 'smooth'
+                        });
+                        
+                        // Mettre à jour l'URL sans recharger la page
+                        history.pushState(null, null, targetId);
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>

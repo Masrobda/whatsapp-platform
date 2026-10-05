@@ -1,0 +1,23 @@
+// src/routes/v1/session.routes.js
+const sessionController = require('../../controllers/session.controller');
+const { authenticateJWT } = require('../../middlewares/auth.middleware'); // adaptez le chemin/nom si différent
+
+async function sessionRoutes(fastify, opts) {
+  // ────────────────────────────────────────────────
+  // CLIENT-FACING : scopé au client authentifié via son token
+  // C'est CETTE route que vous documentez pour vos clients externes.
+  // ────────────────────────────────────────────────
+  fastify.get('/status/:phone', { preHandler: [authenticateJWT] }, sessionController.getMyStatus);
+
+  // ────────────────────────────────────────────────
+  // DASHBOARD INTERNE / ADMIN uniquement — ne JAMAIS documenter
+  // ces routes pour un client externe (client_id explicite en paramètre).
+  // Protégez-les avec un middleware admin si ce n'est pas déjà le cas.
+  // ────────────────────────────────────────────────
+  fastify.get('/stats', sessionController.getStats);
+  fastify.get('/', sessionController.listSessions);
+  fastify.get('/:client_id/:phone', sessionController.checkSession);
+  fastify.post('/:client_id/:phone/reengage', sessionController.reengage);
+}
+
+module.exports = sessionRoutes;

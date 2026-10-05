@@ -1,0 +1,572 @@
+'use client';
+import { useState, useEffect, useCallback } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { CampaignAPI, CAMPAIGN_STATUS, formatNumber, formatCost, formatDate,formatDateTime } from '@/lib/campaigns/api';
+
+// ============================================================
+// ICONS SVG INLINE (conservés du premier code)
+// ============================================================
+const Icon = {
+  Rocket: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/>
+      <path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/>
+      <path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/>
+      <path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>
+    </svg>
+  ),
+  Plus: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+      <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+    </svg>
+  ),
+  Users: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+      <circle cx="9" cy="7" r="4"/>
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+      <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+    </svg>
+  ),
+  Send: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+    </svg>
+  ),
+  CheckCircle: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+      <polyline points="22 4 12 14.01 9 11.01"/>
+    </svg>
+  ),
+  Eye: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+      <circle cx="12" cy="12" r="3"/>
+    </svg>
+  ),
+  AlertCircle: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+    </svg>
+  ),
+  TrendingUp: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>
+    </svg>
+  ),
+  Play: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+  ),
+  Pause: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
+    </svg>
+  ),
+  X: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+      <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  ),
+  BarChart: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>
+    </svg>
+  ),
+  Calendar: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+      <line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+    </svg>
+  ),
+  Refresh: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 4 23 10 17 10"/>
+      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+    </svg>
+  ),
+  Cancel: () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10"/>
+      <line x1="15" y1="9" x2="9" y2="15"/>
+      <line x1="9" y1="9" x2="15" y2="15"/>
+    </svg>
+  ),
+};
+
+// ============================================================
+// COMPOSANT STATUS BADGE
+// ============================================================
+function StatusBadge({ status }) {
+  const cfg = CAMPAIGN_STATUS[status] || CAMPAIGN_STATUS.draft;
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      padding: '3px 10px', borderRadius: 20,
+      backgroundColor: cfg.bg, color: cfg.color,
+      fontSize: 12, fontWeight: 600, letterSpacing: '0.02em'
+    }}>
+      <span style={{
+        width: 6, height: 6, borderRadius: '50%', backgroundColor: cfg.dot, flexShrink: 0,
+        ...(status === 'running' ? { animation: 'pulse 1.5s infinite' } : {})
+      }} />
+      {cfg.label}
+    </span>
+  );
+}
+
+// ============================================================
+// COMPOSANT KPI CARD (avec icônes SVG)
+// ============================================================
+function KPICard({ icon: IconComp, label, value, sub, color, trend }) {
+  return (
+    <div style={{
+      background: 'white', borderRadius: 16, padding: '24px',
+      boxShadow: '0 1px 4px rgba(0,0,0,0.06)', border: '1px solid #e5ebe8',
+      display: 'flex', flexDirection: 'column', gap: 12, position: 'relative', overflow: 'hidden'
+    }}>
+      <div style={{ position: 'absolute', top: 0, right: 0, width: 80, height: 80,
+        background: `${color}10`, borderRadius: '0 0 0 80px' }} />
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ width: 40, height: 40, borderRadius: 12, background: `${color}15`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', color, flexShrink: 0 }}>
+          <div style={{ width: 20, height: 20 }}><IconComp /></div>
+        </div>
+        {trend !== undefined && (
+          <span style={{ fontSize: 12, color: trend >= 0 ? '#2d7a3e' : '#c62828', fontWeight: 600,
+            background: trend >= 0 ? '#e8f5e9' : '#ffebee', padding: '2px 8px', borderRadius: 20 }}>
+            {trend >= 0 ? '↑' : '↓'} {Math.abs(trend)}%
+          </span>
+        )}
+      </div>
+      <div>
+        <div style={{ fontSize: 28, fontWeight: 700, color: '#1a1f1d', lineHeight: 1.2,
+          fontFamily: "'DM Mono', monospace" }}>
+          {value}
+        </div>
+        <div style={{ fontSize: 13, color: '#6b7c74', marginTop: 4, fontWeight: 500 }}>{label}</div>
+        {sub && <div style={{ fontSize: 12, color, marginTop: 2, fontWeight: 600 }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// COMPOSANT PROGRESS BAR
+// ============================================================
+function ProgressBar({ value, max, color = '#2d7a3e', label }) {
+  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {label && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+          <span style={{ color: '#6b7c74' }}>{label}</span>
+          <span style={{ color: '#1a1f1d', fontWeight: 600 }}>{pct.toFixed(1)}%</span>
+        </div>
+      )}
+      <div style={{ height: 6, background: '#f0f7f3', borderRadius: 99, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 99, transition: 'width 0.6s ease' }} />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// COMPOSANT LIGNE DE CAMPAGNE
+// ============================================================
+function CampaignRow({ campaign, onAction, onView, actionLoading }) {
+  // Formater la date planifiée si elle existe
+  const totalDelivered = campaign.delivered_count || 0;
+  const scheduledDateTime = campaign.scheduled_at ? formatDateTime(campaign.scheduled_at) : null;
+  const createdDate = formatDate(campaign.created_at);
+  const displayDate = campaign.scheduled_at ? scheduledDateTime : createdDate;
+  const isScheduled = campaign.status === 'scheduled';
+
+  return (
+    <tr style={{ borderBottom: '1px solid #f0f7f3', transition: 'background 0.15s' }}
+      onMouseEnter={e => e.currentTarget.style.background = '#fafcfb'}
+      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+      <td style={{ padding: '16px 20px', minWidth: 220 }}>
+        <div style={{ fontWeight: 600, color: '#1a1f1d', fontSize: 14, marginBottom: 2 }}>{campaign.name}</div>
+        <div style={{ fontSize: 12, color: '#9eada5' }}>{campaign.template_name || '—'}</div>
+        {campaign.category && (
+          <span style={{ fontSize: 11, color: '#1976d2', background: '#e3f2fd', padding: '1px 6px', borderRadius: 8, marginTop: 4, display: 'inline-block' }}>
+            {campaign.category}
+          </span>
+        )}
+      </td>
+      <td style={{ padding: '16px 12px' }}><StatusBadge status={campaign.status} /></td>
+      <td style={{ padding: '16px 12px', textAlign: 'right' }}>
+        <div style={{ fontSize: 15, fontWeight: 700, color: '#1a1f1d' }}>{formatNumber(campaign.total_contacts)}</div>
+        <div style={{ fontSize: 11, color: '#9eada5' }}>contacts</div>
+      </td>
+      <td style={{ padding: '16px 20px', minWidth: 180 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <ProgressBar value={totalDelivered || 0} max={campaign.total_contacts || 1}
+            color="#2d7a3e" label={`Livrés: ${formatNumber(totalDelivered)}`} />
+          <ProgressBar value={campaign.read_count || 0} max={campaign.total_contacts || 1}
+            color="#8bc34a" label={`Lus: ${formatNumber(campaign.read_count)}`} />
+        </div>
+      </td>
+      <td style={{ padding: '16px 12px', textAlign: 'center' }}>
+        <div style={{ fontSize: 13, color: campaign.failed_count > 0 ? '#c62828' : '#6b7c74', fontWeight: campaign.failed_count > 0 ? 600 : 400 }}>
+          {formatNumber(campaign.failed_count)}
+        </div>
+      </td>
+      <td style={{ padding: '16px 12px', fontSize: 12, color: '#6b7c74' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {isScheduled && campaign.scheduled_at ? (
+            // Pour les campagnes planifiées : affiche la date/heure de planification
+            <span style={{ fontWeight: 500, color: '#f57c00' }}>
+              📅 Planifiée: {formatDateTime(campaign.scheduled_at)}
+            </span>
+          ) : (
+            // Pour les autres : affiche la date de création
+            <span>{formatDate(campaign.created_at)}</span>
+          )}
+          {isScheduled && (
+            <span style={{ fontSize: 10, color: '#9eada5' }}>
+              Créée le {formatDate(campaign.created_at)}
+            </span>
+          )}
+        </div>
+      </td>
+      <td style={{ padding: '16px 20px' }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <button onClick={() => onView(campaign)} style={{
+            width: 32, height: 32, borderRadius: 8, border: '1px solid #e5ebe8',
+            background: 'white', cursor: 'pointer', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', color: '#6b7c74', transition: 'all 0.15s'
+          }} title="Voir">
+            <div style={{ width: 14, height: 14 }}><Icon.BarChart /></div>
+          </button>
+
+          {campaign.status === 'draft' && (
+            <button onClick={() => onAction('launch', campaign.id)} disabled={actionLoading === campaign.id}
+              style={{
+                width: 32, height: 32, borderRadius: 8, border: 'none',
+                background: '#2d7a3e', cursor: actionLoading === campaign.id ? 'wait' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white',
+                opacity: actionLoading === campaign.id ? 0.6 : 1, transition: 'all 0.15s'
+              }} title="Lancer">
+              <div style={{ width: 12, height: 12 }}><Icon.Play /></div>
+            </button>
+          )}
+
+          {campaign.status === 'running' && (
+            <button onClick={() => onAction('pause', campaign.id)} disabled={actionLoading === campaign.id}
+              style={{
+                width: 32, height: 32, borderRadius: 8, border: 'none',
+                background: '#f57c00', cursor: actionLoading === campaign.id ? 'wait' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white',
+                opacity: actionLoading === campaign.id ? 0.6 : 1, transition: 'all 0.15s'
+              }} title="Pause">
+              <div style={{ width: 12, height: 12 }}><Icon.Pause /></div>
+            </button>
+          )}
+
+          {campaign.status === 'paused' && (
+            <button onClick={() => onAction('launch', campaign.id)} disabled={actionLoading === campaign.id}
+              style={{
+                width: 32, height: 32, borderRadius: 8, border: 'none',
+                background: '#2d7a3e', cursor: actionLoading === campaign.id ? 'wait' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white',
+                opacity: actionLoading === campaign.id ? 0.6 : 1, transition: 'all 0.15s'
+              }} title="Reprendre">
+              <div style={{ width: 12, height: 12 }}><Icon.Play /></div>
+            </button>
+          )}
+
+          {/* Bouton Annuler pour les campagnes draft, scheduled ou paused */}
+          {(campaign.status === 'draft' || campaign.status === 'scheduled' || campaign.status === 'paused') && (
+            <button onClick={() => {
+              if (confirm(`Êtes-vous sûr de vouloir annuler la campagne "${campaign.name}" ?`)) {
+                onAction('cancel', campaign.id);
+              }
+            }} disabled={actionLoading === campaign.id}
+              style={{
+                width: 32, height: 32, borderRadius: 8, border: '1px solid #c62828',
+                background: 'white', cursor: actionLoading === campaign.id ? 'wait' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#c62828',
+                opacity: actionLoading === campaign.id ? 0.6 : 1, transition: 'all 0.15s'
+              }} title="Annuler la campagne">
+              <div style={{ width: 12, height: 12 }}><Icon.Cancel /></div>
+            </button>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ============================================================
+// PAGE PRINCIPALE
+// ============================================================
+export default function CampaignsPage() {
+  const router = useRouter();
+  const [stats, setStats] = useState(null);
+  const [campaigns, setCampaigns] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState({ status: '', search: '', page: 1, limit: 20 });
+  const [pagination, setPagination] = useState({});
+  const [actionLoading, setActionLoading] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [error, setError] = useState(null);
+
+  const showToast = (msg, type = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [statsRes, campRes] = await Promise.all([
+        CampaignAPI.globalStats(),
+        CampaignAPI.list({
+          page: filters.page,
+          limit: filters.limit,
+          status: filters.status || undefined,
+          search: filters.search || undefined,
+        })
+      ]);
+      setStats(statsRes.stats);
+      setCampaigns(campRes.campaigns || []);
+      setPagination(campRes.pagination || {});
+    } catch (err) {
+      console.error('Erreur chargement:', err);
+      setError(err.message);
+      setStats({
+        total_campaigns: 0,
+        active_campaigns: 0,
+        completed_campaigns: 0,
+        total_contacts: 0,
+        total_sent: 0,
+        total_delivered: 0,
+        total_read: 0,
+        total_failed: 0,
+        total_cost: 0,
+        avg_delivery_rate: 0,
+        avg_read_rate: 0
+      });
+      setCampaigns([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [filters]);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  const handleAction = async (action, campaignId) => {
+  setActionLoading(campaignId);
+  try {
+    if (action === 'launch') {
+      await CampaignAPI.launch(campaignId);
+      showToast('Campagne lancée avec succès !');
+    } else if (action === 'pause') {
+      await CampaignAPI.pause(campaignId);
+      showToast('Campagne mise en pause');
+    } else if (action === 'cancel') {
+      await CampaignAPI.cancel(campaignId);
+      showToast('Campagne annulée avec succès !');
+    }
+    await fetchData();
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    setActionLoading(null);
+  }
+};
+
+  const handleView = (campaign) => {
+    router.push(`/dashboard/campaigns/${campaign.id}`);
+  };
+
+  const s = stats || {};
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f8faf9', fontFamily: "'Inter', 'DM Sans', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+        @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.3); } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes slideDown { from { transform: translateY(-16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .campaign-row:hover { background: #fafcfb; }
+        .action-btn:hover { opacity: 0.85; transform: scale(1.05); }
+        .filter-tab { padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 500; cursor: pointer; border: 1px solid #e5ebe8; transition: all 0.15s; background: white; color: #6b7c74; }
+        .filter-tab:hover { border-color: #2d7a3e; color: #2d7a3e; }
+        .filter-tab.active { background: #2d7a3e; color: white; border-color: #2d7a3e; }
+      `}</style>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{
+          position: 'fixed', top: 24, right: 24, zIndex: 9999,
+          padding: '12px 20px', borderRadius: 12,
+          background: toast.type === 'error' ? '#c62828' : '#2d7a3e',
+          color: 'white', fontSize: 14, fontWeight: 500,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
+          animation: 'slideDown 0.3s ease'
+        }}>
+          {toast.type === 'error' ? '❌ ' : '✅ '}{toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ background: 'white', borderBottom: '1px solid #e5ebe8', padding: '0 32px' }}>
+        <div style={{ maxWidth: 1400, margin: '0 auto', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 64 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ width: 36, height: 36, background: 'linear-gradient(135deg, #2d7a3e, #8bc34a)', borderRadius: 10,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white' }}>
+              <div style={{ width: 20, height: 20 }}><Icon.Rocket /></div>
+            </div>
+            <div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#1a1f1d' }}>Campagnes WhatsApp</div>
+              <div style={{ fontSize: 12, color: '#9eada5' }}>Gérez vos campagnes de masse</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button onClick={fetchData} style={{
+              display: 'flex', alignItems: 'center', gap: 6, padding: '8px 14px',
+              border: '1px solid #e5ebe8', borderRadius: 10, background: 'white',
+              cursor: 'pointer', fontSize: 13, color: '#6b7c74', fontWeight: 500
+            }}>
+              <div style={{ width: 14, height: 14 }}><Icon.Refresh /></div>
+              Actualiser
+            </button>
+            <Link href="/dashboard/campaigns/create" style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '8px 18px',
+              background: 'linear-gradient(135deg, #2d7a3e, #3a9950)',
+              color: 'white', borderRadius: 10, textDecoration: 'none',
+              fontSize: 13, fontWeight: 600, boxShadow: '0 2px 8px rgba(45,122,62,0.3)'
+            }}>
+              <div style={{ width: 14, height: 14 }}><Icon.Plus /></div>
+              Nouvelle campagne
+            </Link>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1400, margin: '0 auto', padding: '32px' }}>
+
+        {/* Erreur */}
+        {error && (
+          <div style={{
+            background: '#ffebee', color: '#c62828', padding: '12px 20px',
+            borderRadius: 12, marginBottom: 24, fontSize: 13, border: '1px solid #ffcdd2'
+          }}>
+            ⚠️ {error}
+          </div>
+        )}
+
+        {/* KPIs */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 32 }}>
+          <KPICard icon={Icon.Rocket} label="Campagnes actives" value={formatNumber(s.active_campaigns)} color="#2d7a3e"
+            sub={`${formatNumber(s.total_campaigns)} au total`} />
+          <KPICard icon={Icon.Users} label="Contacts touchés" value={formatNumber(s.total_contacts)} color="#1976d2"
+            sub={`${formatNumber(s.total_sent)} envois`} />
+          <KPICard icon={Icon.TrendingUp} label="Taux de livraison" value={`${s.avg_delivery_rate || 0}%`} color="#8bc34a"
+            sub={`${s.avg_read_rate || 0}% lus`} />
+          <KPICard icon={Icon.BarChart} label="Coût total" value={formatCost(s.total_cost || 0)} color="#f57c00"
+            sub={formatCost(s.total_cost || 0, 'FCFA')} />
+        </div>
+
+        {/* Filtres */}
+        <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', marginBottom: 24,
+          padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 13, color: '#6b7c74', fontWeight: 500, marginRight: 4 }}>Statut :</div>
+          {['', 'draft', 'scheduled', 'running', 'paused', 'completed', 'cancelled'].map(st => (
+            <button key={st} className={`filter-tab ${filters.status === st ? 'active' : ''}`}
+              onClick={() => setFilters(f => ({ ...f, status: st, page: 1 }))}>
+              {st === '' ? 'Tous' : (CAMPAIGN_STATUS[st]?.label || st)}
+            </button>
+          ))}
+
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <input
+              type="text"
+              placeholder="🔍 Rechercher une campagne..."
+              value={filters.search}
+              onChange={e => setFilters(f => ({ ...f, search: e.target.value, page: 1 }))}
+              style={{ width: '100%', padding: '7px 14px', borderRadius: 10, border: '1px solid #e5ebe8',
+                fontSize: 13, color: '#1a1f1d', background: '#f8faf9', outline: 'none' }}
+            />
+          </div>
+        </div>
+
+        {/* Table */}
+        <div style={{ background: 'white', borderRadius: 16, border: '1px solid #e5ebe8', overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}>
+          {loading ? (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 200, gap: 12, color: '#6b7c74' }}>
+              <div style={{ width: 24, height: 24, border: '3px solid #e5ebe8', borderTopColor: '#2d7a3e',
+                borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+              Chargement des campagnes...
+            </div>
+          ) : campaigns.length === 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              height: 240, gap: 16, color: '#9eada5' }}>
+              <div style={{ width: 48, height: 48, opacity: 0.4 }}><Icon.Rocket /></div>
+              <div style={{ fontSize: 16, fontWeight: 600, color: '#6b7c74' }}>Aucune campagne trouvée</div>
+              <Link href="/dashboard/campaigns/create" style={{
+                padding: '10px 20px', background: '#2d7a3e', color: 'white',
+                borderRadius: 10, textDecoration: 'none', fontSize: 14, fontWeight: 600
+              }}>
+                Créer ma première campagne
+              </Link>
+            </div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ background: '#f8faf9', borderBottom: '1px solid #e5ebe8' }}>
+                  {['Campagne', 'Statut', 'Contacts', 'Performance', 'Échecs', 'Date', 'Actions'].map(h => (
+                    <th key={h} style={{ padding: '12px 20px', textAlign: h === 'Contacts' || h === 'Échecs' ? 'right' : 'left',
+                      fontSize: 12, fontWeight: 600, color: '#6b7c74', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {campaigns.map(camp => (
+                  <CampaignRow
+                    key={camp.id}
+                    campaign={camp}
+                    onAction={handleAction}
+                    onView={handleView}
+                    actionLoading={actionLoading}
+                  />
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Pagination */}
+        {pagination.totalPages > 1 && (
+          <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 24 }}>
+            <button onClick={() => setFilters(f => ({ ...f, page: f.page - 1 }))}
+              disabled={filters.page <= 1} style={{
+                padding: '8px 16px', borderRadius: 10, border: '1px solid #e5ebe8',
+                background: 'white', cursor: filters.page > 1 ? 'pointer' : 'not-allowed',
+                opacity: filters.page <= 1 ? 0.5 : 1, fontSize: 13, color: '#6b7c74'
+              }}>← Précédent</button>
+            <span style={{ padding: '8px 16px', fontSize: 13, color: '#6b7c74', display: 'flex', alignItems: 'center' }}>
+              Page {filters.page} / {pagination.totalPages}
+            </span>
+            <button onClick={() => setFilters(f => ({ ...f, page: f.page + 1 }))}
+              disabled={filters.page >= pagination.totalPages} style={{
+                padding: '8px 16px', borderRadius: 10, border: '1px solid #e5ebe8',
+                background: 'white', cursor: filters.page < pagination.totalPages ? 'pointer' : 'not-allowed',
+                opacity: filters.page >= pagination.totalPages ? 0.5 : 1, fontSize: 13, color: '#6b7c74'
+              }}>Suivant →</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

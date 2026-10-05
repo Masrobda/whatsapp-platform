@@ -1,0 +1,152 @@
+// src/workers/whatsapp.worker.js
+// Lancez avec : node src/workers/whatsapp.worker.js --phone=+237691234567
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const whatsappService = require('../services/whatsapp.service');
+const logger = require('../utils/logger');
+
+const phoneArg = process.argv.find(arg => arg.startsWith('--phone='));
+const phoneNumber = phoneArg ? phoneArg.split('=')[1] : null;
+
+if (!phoneNumber) {
+  logger.error('Argument obligatoire : --phone=+237xxxxxxxxx');
+  process.exit(1);
+}
+
+const normalized = phoneNumber.replace(/[^0-9+]/g, '');
+const queueName = `whatsapp-messages-${normalized}`;
+
+logger.info(`Worker démarré pour numéro ${phoneNumber} (queue: ${queueName})`);
+
+const worker = new Worker(
+  queueName,
+  async (job) => {
+    const {
+      messageId,
+      client_id,
+      recipient_phone,
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type = 'image',
+    } = job.data;
+
+    try {
+      // Vérification quota (par client)
+      const quotaCheck = await query(
+        'SELECT quota_remaining, is_active FROM clients WHERE id = $1',
+        [client_id]
+      );
+
+      if (quotaCheck.rows.length === 0 || !quotaCheck.rows[0].is_active) {
+        throw new Error('Client inactif ou non trouvé');
+      }
+
+      if (quotaCheck.rows[0].quota_remaining <= 0) {
+        throw new Error('Quota insuffisant');
+      }
+
+      let result;
+      switch (message_type) {
+        case 'text':
+          result = await whatsappService.sendTextMessage(recipient_phone, message_content);
+          break;
+        case 'template':
+          result = await whatsappService.sendTemplateMessage(
+            recipient_phone,
+            template_name,
+            template_language || 'fr',
+            template_params || []
+          );
+          break;
+        case 'media':
+          result = await whatsappService.sendMediaMessage(
+            recipient_phone,
+            media_type,
+            media_url,
+            message_content || ''
+          );
+          break;
+        default:
+          throw new Error(`Type non supporté: ${message_type}`);
+      }
+
+      if (!result.success) {
+        await query(
+          `UPDATE messages 
+           SET wa_status = 'failed', 
+               wa_error_code = $1, 
+               wa_error_message = $2,
+               failed_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [result.errorCode || 'UNKNOWN', result.error || 'Échec inconnu', messageId]
+        );
+        throw new Error(result.error);
+      }
+
+      await query(
+        `UPDATE messages 
+         SET wa_message_id = $1, 
+             wa_status = 'sent',
+             sent_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [result.messageId, messageId]
+      );
+
+      logger.info('Message envoyé avec succès', { messageId, waMessageId: result.messageId });
+
+      await job.updateProgress(100);
+
+      return { success: true, waMessageId: result.messageId };
+    } catch (error) {
+      logger.error('Erreur traitement message', {
+        messageId,
+        attempt: job.attemptsMade + 1,
+        error: error.message,
+      });
+
+      await query(
+        `UPDATE messages 
+         SET wa_status = 'failed', 
+             wa_error_message = $1,
+             failed_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND wa_status != 'failed'`,
+        [error.message.slice(0, 500), messageId]
+      );
+
+      throw error;
+    }
+  },
+  {
+    connection: redisConnection,
+    concurrency: 1,
+    stalledInterval: 120000,
+    limiter: { max: 5, duration: 1000, bounceBack: true },
+    attempts: 8,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7200, count: 2000 },
+    removeOnFail: { age: 172800, count: 5000 },
+  }
+);
+
+// Gestion des événements (réduite en prod)
+worker.on('failed', (job, err) => {
+  logger.error('Job échoué définitivement', { jobId: job?.id, error: err.message });
+});
+worker.on('error', (err) => logger.error('Erreur worker', err));
+
+// Shutdown gracieux
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt worker');
+  await worker.close();
+  process.exit(0);
+});
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt worker');
+  await worker.close();
+  process.exit(0);
+});

@@ -1,0 +1,1160 @@
+'use client';
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import * as XLSX from 'xlsx';
+import Cookies from 'js-cookie';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+
+async function apiFetch(path: string, options: RequestInit = {}) {
+  const token = Cookies.get('token');
+
+  if (!token) {
+    if (typeof window !== 'undefined') {
+      window.location.href = '/login';
+    }
+    throw new Error('Non authentifié');
+  }
+
+  // Construire les headers sans Content-Type par défaut
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${token}`,
+  };
+
+  // Ajouter Content-Type uniquement si on a un body à envoyer
+  const hasBody = options.body !== undefined && options.body !== null;
+  if (hasBody) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: options.method || 'GET',
+    headers: {
+      ...headers,
+      ...options.headers as Record<string, string>,
+    },
+    body: options.body || undefined,
+  });
+
+  if (res.status === 401) {
+    Cookies.remove('token');
+    Cookies.remove('user');
+    window.location.href = '/login?session=expired';
+    throw new Error('Session expirée');
+  }
+
+  // Pour les réponses sans contenu (204 No Content)
+  if (res.status === 204) {
+    return { success: true };
+  }
+
+  const text = await res.text();
+  if (!text) return { success: true };
+
+  if (!res.ok) {
+    try {
+      const err = JSON.parse(text);
+      throw new Error(err.message || `HTTP ${res.status}`);
+    } catch {
+      throw new Error(`HTTP ${res.status}`);
+    }
+  }
+
+  return JSON.parse(text);
+}
+
+// ============================================================
+// TYPES
+// ============================================================
+type SendMode = 'instant' | 'batch' | 'scheduled' | 'smart';
+type CampaignType = 'broadcast' | 'drip' | 'trigger';
+
+interface Contact {
+  phone_number: string;
+  name: string;
+  variables: Record<string, string>;
+  _ordered_values?: string[];
+}
+
+interface TemplateParam {
+  name: string;
+  label: string;
+  params: string[];
+  body_content?: string;
+  header_content?: string;
+  footer_content?: string;
+}
+
+interface FormData {
+  name: string;
+  description: string;
+  campaign_type: CampaignType;
+  category: string;
+  priority: number;
+  phone_number: string;
+  template_name: string;
+  template_language: string;
+  template_params: Record<string, string>;
+  send_mode: SendMode;
+  batch_size: number;
+  batch_interval_seconds: number;
+  daily_limit: number;
+  rate_per_minute: number;
+  scheduled_at: string;
+  contacts: Contact[];
+  tags: string[];
+}
+
+interface Step {
+  id: number;
+  label: string;
+  icon: string;
+  desc: string;
+}
+
+interface Toast {
+  msg: string;
+  type: string;
+}
+
+// ============================================================
+// WIZARD STEPS
+// ============================================================
+const STEPS: Step[] = [
+  { id: 1, label: 'Configuration', icon: '⚙️', desc: 'Nom, type et priorité' },
+  { id: 2, label: 'Template', icon: '📝', desc: 'Message WhatsApp' },
+  { id: 3, label: 'Contacts', icon: '👥', desc: 'Destinataires' },
+  { id: 4, label: 'Planification', icon: '🗓️', desc: 'Mode et timing' },
+  { id: 5, label: 'Récapitulatif', icon: '✅', desc: 'Revue finale' },
+];
+
+const SEND_MODES: { value: SendMode; label: string; icon: string; desc: string }[] = [
+  { value: 'instant', label: 'Instantané', icon: '⚡', desc: 'Envoi immédiat dès le lancement' },
+  { value: 'batch', label: 'Par lots', icon: '📦', desc: 'Envoi par groupes espacés dans le temps' },
+  { value: 'scheduled', label: 'Planifié', icon: '📅', desc: 'Départ à une date/heure précise' },
+  { value: 'smart', label: 'Intelligent', icon: '🧠', desc: 'Optimisé par IA selon les heures d\'ouverture' },
+];
+
+const CATEGORIES: string[] = ['Facturation', 'Marketing', 'Recouvrement', 'Onboarding', 'Alertes', 'Promotions', 'Notifications', 'Rapport'];
+
+const PHONE_NUMBERS: { value: string; label: string }[] = [
+  { value: '+237689588347', label: '+237 689 588 347 (Principal)' },
+  { value: '+237698765432', label: '+237 688 356 291 (Secondaire)' },
+];
+
+// Exemple de templates (en prod, charger depuis l'API)
+const DEMO_TEMPLATES: TemplateParam[] = [
+  { name: 'next_001_facture_en_01', label: 'Facture avec PDF', params: ['entreprise', 'name', 'numero_contrat', 'numero_facture', 'montant', 'unpaid', 'deadline'] },
+  { name: 'next_new_chat_v1', label: 'Message de bienvenue', params: ['name'] },
+  { name: 'relance_impaye_v1', label: 'Relance impayé', params: ['name', 'montant', 'deadline'] },
+  { name: 'promo_produit_v1', label: 'Promotion produit', params: ['name', 'produit', 'remise'] },
+];
+
+// ============================================================
+// COMPOSANTS
+// ============================================================
+function StepIndicator({ current, steps }: { current: number; steps: Step[] }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 0, marginBottom: 40 }}>
+      {steps.map((step, i) => (
+        <div key={step.id} style={{ display: 'flex', alignItems: 'center', flex: i < steps.length - 1 ? 1 : 0 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, minWidth: 80 }}>
+            <div style={{
+              width: 40, height: 40, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 16, fontWeight: 700, transition: 'all 0.3s',
+              background: step.id < current ? '#2d7a3e' : step.id === current ? 'linear-gradient(135deg, #2d7a3e, #3a9950)' : 'white',
+              color: step.id <= current ? 'white' : '#9eada5',
+              border: step.id <= current ? 'none' : '2px solid #e5ebe8',
+              boxShadow: step.id === current ? '0 4px 12px rgba(45,122,62,0.3)' : 'none',
+            }}>
+              {step.id < current ? '✓' : step.icon}
+            </div>
+            <div style={{ fontSize: 11, fontWeight: step.id === current ? 700 : 500,
+              color: step.id === current ? '#2d7a3e' : step.id < current ? '#1a1f1d' : '#9eada5',
+              textAlign: 'center', whiteSpace: 'nowrap' }}>
+              {step.label}
+            </div>
+          </div>
+          {i < steps.length - 1 && (
+            <div style={{ flex: 1, height: 2, background: step.id < current ? '#2d7a3e' : '#e5ebe8',
+              margin: '-18px 4px 0', transition: 'background 0.3s' }} />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FormField({ label, required, hint, children, error }: {
+  label: string;
+  required?: boolean;
+  hint?: string;
+  children: React.ReactNode;
+  error?: string | null;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <label style={{ fontSize: 13, fontWeight: 600, color: '#1a1f1d' }}>
+        {label} {required && <span style={{ color: '#c62828' }}>*</span>}
+      </label>
+      {children}
+      {hint && <div style={{ fontSize: 12, color: '#9eada5' }}>{hint}</div>}
+      {error && <div style={{ fontSize: 12, color: '#c62828' }}>⚠️ {error}</div>}
+    </div>
+  );
+}
+
+const inputStyle: React.CSSProperties = {
+  padding: '10px 14px', borderRadius: 10, border: '1px solid #e5ebe8',
+  fontSize: 14, color: '#1a1f1d', background: 'white', width: '100%',
+  outline: 'none', transition: 'border-color 0.15s', boxSizing: 'border-box'
+};
+
+function PhonePreview({ template, params }: { template: TemplateParam | null; params: Record<string, string> }) {
+  const formatMessage = (text: string, vars: Record<string, string>) => {
+    if (!text) return 'Aucun contenu pour ce template.';
+    // Remplacer {{variable}} par la valeur correspondante ou laisser [variable] si non définie
+    return text.replace(/{{(\w+)}}/g, (_, key) => vars?.[key] || `[${key}]`);
+  };
+
+  const headerContent = template?.header_content || '';
+  const bodyContent = template?.body_content || '';
+  const footerContent = template?.footer_content || '';
+
+  const formattedHeader = formatMessage(headerContent, params);
+  const formattedBody = formatMessage(bodyContent, params);
+  const formattedFooter = formatMessage(footerContent, params);
+
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center' }}>
+      <div style={{ width: 280, background: '#1a1a1a', borderRadius: 32, padding: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
+        {/* En-tête de la bulle (comme le numéro / expéditeur) */}
+        <div style={{ background: '#128C7E', borderRadius: 20, padding: '8px 12px', marginBottom: 8,
+          display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 32, height: 32, background: 'white', borderRadius: '50%',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16 }}>📱</div>
+          <div>
+            <div style={{ color: 'white', fontSize: 12, fontWeight: 600 }}>NumericExport</div>
+            <div style={{ color: '#a8d5d0', fontSize: 10 }}>en ligne</div>
+          </div>
+        </div>
+
+        {/* Zone du message : défilement si contenu long */}
+        <div style={{ background: '#ECE5DD', borderRadius: 16, padding: 12, minHeight: 120, maxHeight: 400, overflowY: 'auto' }}>
+          <div style={{
+            background: 'white',
+            borderRadius: '4px 12px 12px 12px',
+            padding: '8px 12px',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
+            maxWidth: '100%',
+            wordBreak: 'break-word'
+          }}>
+            {formattedHeader && (
+              <div style={{ fontWeight: 'bold', marginBottom: 4 }}>{formattedHeader}</div>
+            )}
+            <div style={{ fontSize: 12, color: '#1a1a1a', lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
+              {formattedBody}
+            </div>
+            {formattedFooter && (
+              <div style={{ fontSize: 10, color: '#6b7c74', marginTop: 8, borderTop: '1px solid #e5ebe8', paddingTop: 4 }}>
+                {formattedFooter}
+              </div>
+            )}
+            <div style={{ fontSize: 10, color: '#9eada5', textAlign: 'right', marginTop: 4 }}>
+              {new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })} ✓✓
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ function ContactUploader({ contacts, onContactsChange }: {
+  contacts: Contact[];
+  onContactsChange: (contacts: Contact[]) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  // app/dashboard/campaigns/create/page.tsx - ContactUploader
+
+const parseCSV = (text: string): Contact[] => {
+  console.log('📊 Début parseCSV');
+
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const firstLine = lines[0];
+  let delimiter = ',';
+  if (firstLine.includes('\t')) delimiter = '\t';
+  else if (firstLine.includes(';')) delimiter = ';';
+
+  const headers = firstLine.split(delimiter).map(h => h.trim().toLowerCase().replace(/"/g, ''));
+  console.log('📊 En-têtes:', headers);
+
+  const results: Contact[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const values = line.split(delimiter).map(v => v.trim().replace(/"/g, ''));
+
+    // Récupérer le téléphone (première colonne)
+    let phone = values[0] || '';
+    phone = phone.replace(/[\s\-\(\)\.]/g, '');
+
+    // 🔥 Garder le numéro tel quel (l'utilisateur doit fournir le format international)
+    if (phone && !phone.startsWith('+')) {
+      phone = '+' + phone;
+    }
+
+    if (phone && phone.length > 5) {
+      const orderedVariables: string[] = [];
+      const variablesObj: Record<string, string> = {};
+      let contactName = '';
+
+      for (let j = 1; j < values.length; j++) {
+        const value = values[j] || '';
+        const header = headers[j] || `col_${j}`;
+
+        if (value) {
+          orderedVariables.push(value);
+          variablesObj[header] = value;
+
+          if (header === 'name' || header === 'nom') {
+            contactName = value;
+          }
+          console.log(`📝 Variable ${j} (${header}) = "${value}"`);
+        }
+      }
+
+      results.push({
+        phone_number: phone,
+        name: contactName,
+        variables: variablesObj,
+        _ordered_values: orderedVariables
+      });
+      console.log(`✅ Contact ${i}: ${phone} - ${orderedVariables.length} variables`);
+    }
+  }
+
+  return results;
+};
+
+const handleFile = (file: File) => {
+  console.log('📁 Fichier sélectionné:', file.name, file.type, file.size);
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+        const data = new Uint8Array(e.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+        const jsonData = XLSX.utils.sheet_to_json(firstSheet, { header: 1 }) as any[][];
+
+        console.log('📊 Données Excel (brut):', jsonData);
+
+        if (!jsonData || jsonData.length < 2) return;
+
+        // Première ligne = en-têtes
+        const headers = (jsonData[0] || []).map((h: any) => String(h || '').toLowerCase().trim());
+        console.log('📊 En-têtes Excel:', headers);
+
+        const contacts: Contact[] = [];
+
+        // Parcourir les lignes de données (à partir de l'index 1)
+        for (let i = 1; i < jsonData.length; i++) {
+          const row = jsonData[i];
+          if (!row || row.length === 0) continue;
+
+          // Première colonne = phone_number
+          let phone = String(row[0] || '');
+          phone = phone.replace(/[\s\-\(\)\.]/g, '');
+
+          // 🔥 NE PAS forcer +237, garder le numéro tel quel
+          // L'utilisateur doit fournir le numéro au format international (ex: +237..., +33..., +1...)
+          if (phone && !phone.startsWith('+')) {
+            // Si pas de +, on ajoute + par défaut mais on laisse le code pays
+            phone = '+' + phone;
+          }
+
+          if (phone && phone.length > 5) {
+            const orderedVariables: string[] = [];
+            const variablesObj: Record<string, string> = {};
+            let contactName = '';
+
+            // Parcourir les autres colonnes (à partir de l'index 1)
+            for (let j = 1; j < row.length && j < headers.length; j++) {
+              const value = row[j];
+              if (value && String(value).trim()) {
+                const strValue = String(value).trim();
+                const header = headers[j];
+
+                orderedVariables.push(strValue);
+                variablesObj[header] = strValue;
+
+                if (header === 'name' || header === 'nom' || header === 'prénom') {
+                  contactName = strValue;
+                }
+              }
+            }
+
+            contacts.push({
+              phone_number: phone,
+              name: contactName,
+              variables: variablesObj,
+              _ordered_values: orderedVariables
+            });
+            console.log(`✅ Contact ${i}: ${phone} - ${orderedVariables.length} variables`);
+          }
+        }
+
+        console.log('📊 Contacts Excel importés:', contacts);
+        onContactsChange(contacts);
+      }
+    } catch (err) {
+      console.error('❌ Erreur parse fichier:', err);
+    }
+  };
+
+  if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.readAsText(file, 'UTF-8');
+  }
+};
+
+  const handleManualAdd = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const text = e.target.value;
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+    const parsed: Contact[] = lines.map(line => {
+      let phone = line;
+      let name = '';
+
+      if (line.includes(',') || line.includes('\t')) {
+        const parts = line.includes(',') ? line.split(',') : line.split('\t');
+        phone = parts[0].trim();
+        name = parts[1]?.trim() || '';
+      }
+
+      const variables: Record<string, string> = {};
+      if (name) variables.name = name;
+
+      return {
+        phone_number: phone,
+        name: name || '',
+        variables: variables
+      };
+    }).filter(c => c.phone_number);
+
+    console.log('📊 Contacts importés manuellement:', parsed);
+    onContactsChange(parsed);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {/* Drop zone */}
+      <div
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
+        onClick={() => fileRef.current?.click()}
+        style={{
+          border: `2px dashed ${dragOver ? '#2d7a3e' : '#e5ebe8'}`,
+          borderRadius: 12, padding: '32px 24px', textAlign: 'center', cursor: 'pointer',
+          background: dragOver ? '#f0f7f3' : '#fafcfb', transition: 'all 0.2s'
+        }}>
+        <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{ display: 'none' }}
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+        <div style={{ fontSize: 32, marginBottom: 8 }}>📂</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: '#1a1f1d', marginBottom: 4 }}>
+          Glissez votre fichier CSV/Excel ici
+        </div>
+        <div style={{ fontSize: 12, color: '#9eada5' }}>
+          Colonnes supportées : phone_number, name, et variables personnalisées
+        </div>
+        <div style={{ marginTop: 12, display: 'inline-block', padding: '6px 16px', background: '#2d7a3e',
+          color: 'white', borderRadius: 8, fontSize: 13, fontWeight: 600 }}>
+          Parcourir
+        </div>
+      </div>
+
+      {/* Ou saisie manuelle */}
+      <div style={{ position: 'relative' }}>
+        <div style={{ fontSize: 12, color: '#9eada5', textAlign: 'center', marginBottom: 12 }}>— ou —</div>
+        <textarea
+          placeholder={"+237674855790\n+237656939193\n+237693546523"}
+          onChange={handleManualAdd}
+          rows={5}
+          style={{ ...inputStyle, resize: 'vertical', fontFamily: 'monospace', fontSize: 13 }}
+        />
+        <div style={{ fontSize: 12, color: '#9eada5', marginTop: 4 }}>
+          Un numéro par ligne (format E.164 ou local camerounais accepté)
+        </div>
+      </div>
+
+      {/* Stats */}
+      {contacts.length > 0 && (
+        <div style={{ background: '#f0f7f3', borderRadius: 10, padding: '12px 16px',
+          display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 20 }}>✅</span>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#2d7a3e' }}>
+              {contacts.length.toLocaleString('fr-FR')} contacts importés
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7c74' }}>
+              Avec noms : {contacts.filter(c => c.name).length} | Sans nom : {contacts.filter(c => !c.name).length}
+            </div>
+          </div>
+          <button onClick={() => onContactsChange([])} style={{
+            marginLeft: 'auto', width: 28, height: 28, borderRadius: '50%',
+            border: 'none', background: '#ffebee', color: '#c62828', cursor: 'pointer', fontSize: 14
+          }}>×</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// PAGE PRINCIPALE - WIZARD
+// ============================================================
+export default function CreateCampaignPage() {
+  const router = useRouter();
+  const [step, setStep] = useState<number>(1);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [errors, setErrors] = useState<Record<string, string | null>>({});
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [previewParams, setPreviewParams] = useState<Record<string, string>>({});
+  const [selectedTemplate, setSelectedTemplate] = useState<TemplateParam | null>(null);
+  const [templates, setTemplates] = useState<TemplateParam[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [clientCost, setClientCost] = useState<number>(20); // valeur par défaut
+
+
+  const [form, setForm] = useState<FormData>({
+  name: '',
+  description: '',
+  campaign_type: 'broadcast',
+  category: '',
+  priority: 5,
+  phone_number: '+237689588347',
+  template_name: '',
+  template_language: 'fr',
+  template_params: {},
+  send_mode: 'instant',
+  batch_size: 50,
+  batch_interval_seconds: 60,
+  daily_limit: 1000,
+  rate_per_minute: 30,
+  scheduled_at: '',  // ← Peut rester vide, mais ne sera pas envoyé
+  contacts: [],
+  tags: [],
+});
+
+// 🔥 NOUVEAU : Charger les templates du client
+  const loadClientTemplates = useCallback(async () => {
+  setTemplatesLoading(true);
+  try {
+    const result = await apiFetch('/templates/client');
+    if (result.templates && result.templates.length > 0) {
+      const formattedTemplates: TemplateParam[] = result.templates.map((t: any) => ({
+        name: t.name,
+        label: t.name.replace(/[_-]/g, ' ').replace(/(next|en|fr|v1|v2|v3)/gi, '').trim() || t.name,
+        params: Array.isArray(t.variables) ? t.variables : (t.variables ? JSON.parse(t.variables) : []),
+        body_content: t.body_content || '',
+        header_content: t.header_content || '',
+        footer_content: t.footer_content || '',
+      }));
+      setTemplates(formattedTemplates);
+    } else {
+      setTemplates([
+        { name: 'next_new_chat_v1', label: 'Message de bienvenue', params: ['name'], body_content: 'Bonjour {{name}} 👋,\n\nBienvenue chez nous !' }
+      ]);
+    }
+  } catch (err) {
+    console.error('Erreur chargement templates:', err);
+    setTemplates([
+      { name: 'next_new_chat_v1', label: 'Message de bienvenue', params: ['name'], body_content: 'Bonjour {{name}} 👋,\n\nBienvenue chez nous !' }
+    ]);
+  } finally {
+    setTemplatesLoading(false);
+  }
+}, []);
+
+  // Charger les templates au montage
+  useEffect(() => {
+    loadClientTemplates();
+  }, [loadClientTemplates]);
+
+  useEffect(() => {
+  const loadClientInfo = async () => {
+    try {
+      const data = await apiFetch('/client/dashboard');
+      if (data?.client?.pricing?.message_cost) {
+        setClientCost(data.client.pricing.message_cost);
+      }
+    } catch (e) {
+      console.error('Erreur chargement coût client:', e);
+      // on garde 20 par défaut
+    }
+  };
+  loadClientInfo();
+}, []);
+
+  const showToast = (msg: string, type: string = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  const update = <K extends keyof FormData>(key: K, val: FormData[K]) => {
+    setForm(f => ({ ...f, [key]: val }));
+    if (errors[key as string]) setErrors(e => ({ ...e, [key]: null }));
+  };
+
+  const validate = (): boolean => {
+    const err: Record<string, string> = {};
+    if (step === 1) {
+      if (!form.name.trim()) err.name = 'Nom requis';
+      if (!form.phone_number) err.phone_number = 'Numéro émetteur requis';
+    }
+    if (step === 2) {
+      if (!form.template_name) err.template_name = 'Template requis';
+    }
+    if (step === 3) {
+      if (form.contacts.length === 0) err.contacts = 'Au moins un contact requis';
+    }
+    setErrors(err);
+    return Object.keys(err).length === 0;
+  };
+
+  const next = () => {
+    if (validate()) setStep(s => Math.min(s + 1, 5));
+  };
+
+  const prev = () => setStep(s => Math.max(s - 1, 1));
+
+const handleSubmit = async (launchNow: boolean = false) => {
+  setLoading(true);
+  try {
+    // Vérifier qu'il y a des contacts
+    if (form.contacts.length === 0) {
+      showToast('Ajoutez au moins un contact avant de créer la campagne', 'error');
+      setStep(3);
+      setLoading(false);
+      return;
+    }
+
+    // Construire le payload en excluant les champs null/undefined
+    const payload: any = {
+      name: form.name.trim(),
+      campaign_type: form.campaign_type,
+      priority: form.priority,
+      phone_number: form.phone_number,
+      template_name: form.template_name,
+      template_language: form.template_language,
+      send_mode: form.send_mode,
+      batch_size: form.batch_size,
+      batch_interval_seconds: form.batch_interval_seconds,
+      daily_limit: form.daily_limit,
+      rate_per_minute: form.rate_per_minute,
+      contacts: form.contacts.map(contact => ({
+        phone_number: contact.phone_number,
+        name: contact.name || '',
+        variables: contact.variables,
+        variables_order: contact._ordered_values || Object.values(contact.variables)
+      }))
+    };
+
+    // Ajouter seulement les champs qui ont des valeurs non-null
+    if (form.description && form.description.trim()) payload.description = form.description.trim();
+    if (form.category && form.category.trim()) payload.category = form.category.trim();
+
+    // 🔥 CORRECTION : Ne pas envoyer scheduled_at si ce n'est pas le mode 'scheduled'
+    if (form.send_mode === 'scheduled' && form.scheduled_at && form.scheduled_at.trim()) {
+      // Convertir datetime-local (YYYY-MM-DDThh:mm) en format ISO
+      const scheduledDate = new Date(form.scheduled_at);
+      if (!isNaN(scheduledDate.getTime())) {
+        payload.scheduled_at = scheduledDate.toISOString();
+      }
+    }
+
+    // Filtrer les paramètres vides
+    const cleanTemplateParams = Object.fromEntries(
+      Object.entries(form.template_params).filter(([_, v]) => v !== "" && v !== null && v !== undefined)
+    );
+    if (Object.keys(cleanTemplateParams).length > 0) {
+      payload.template_params = cleanTemplateParams;
+    }
+
+    console.log('📤 Envoi payload:', JSON.stringify(payload, null, 2));
+    console.log('📊 Nombre de contacts:', form.contacts.length);
+
+    const result = await apiFetch('/campaigns', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    console.log('✅ Réponse:', result);
+
+    if (!result || !result.campaign) {
+      throw new Error('Réponse invalide du serveur');
+    }
+
+    showToast('Campagne créée avec succès !');
+
+    if (launchNow && result.campaign?.id) {
+      await apiFetch(`/campaigns/${result.campaign.id}/launch`, { method: 'POST' });
+      showToast('Campagne lancée !');
+    }
+
+    setTimeout(() => router.push('/dashboard/campaigns'), 1500);
+  } catch (err: any) {
+    console.error('❌ Erreur détaillée:', err);
+    showToast(err.message, 'error');
+  } finally {
+    setLoading(false);
+  }
+};
+
+  const estimatedTime = (): string => {
+    const n = form.contacts.length;
+    if (!n) return '—';
+    const ratePerMin = form.rate_per_minute || 30;
+    const mins = Math.ceil(n / ratePerMin);
+    if (mins < 60) return `~${mins} min`;
+    return `~${(mins / 60).toFixed(1)} h`;
+  };
+
+  // ---- RENDER STEPS ----
+
+  const renderStep1 = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      <FormField label="Nom de la campagne" required error={errors.name}>
+        <input value={form.name} onChange={e => update('name', e.target.value)}
+          placeholder="Ex: Relance Factures Avril 2026" style={inputStyle} />
+      </FormField>
+
+      <FormField label="Description" hint="Optionnelle — aide à distinguer les campagnes">
+        <textarea value={form.description} onChange={e => update('description', e.target.value)}
+          placeholder="Décrivez l'objectif de cette campagne..." rows={3}
+          style={{ ...inputStyle, resize: 'vertical' }} />
+      </FormField>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <FormField label="Numéro émetteur" required error={errors.phone_number}>
+          <select value={form.phone_number} onChange={e => update('phone_number', e.target.value)} style={inputStyle}>
+            {PHONE_NUMBERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+          </select>
+        </FormField>
+
+        <FormField label="Catégorie">
+          <select value={form.category} onChange={e => update('category', e.target.value)} style={inputStyle}>
+            <option value="">Sans catégorie</option>
+            {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </FormField>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <FormField label="Type de campagne">
+          <select value={form.campaign_type} onChange={e => update('campaign_type', e.target.value as CampaignType)} style={inputStyle}>
+            <option value="broadcast">📡 Broadcast (masse)</option>
+            <option value="drip">💧 Drip (séquence)</option>
+            <option value="trigger">⚡ Déclenchée</option>
+          </select>
+        </FormField>
+
+        <FormField label={`Priorité : ${form.priority}/10`} hint="1 = basse, 10 = critique">
+          <input type="range" min="1" max="10" value={form.priority}
+            onChange={e => update('priority', parseInt(e.target.value))}
+            style={{ width: '100%', accentColor: '#2d7a3e' }} />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#9eada5', marginTop: 2 }}>
+            <span>Basse</span><span style={{ fontWeight: 700, color: '#2d7a3e' }}>{form.priority}</span><span>Critique</span>
+          </div>
+        </FormField>
+      </div>
+    </div>
+  );
+
+  const renderStep2 = () => (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 32 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+        <FormField label="Template WhatsApp" required error={errors.template_name}>
+          <select
+            value={form.template_name}
+            onChange={e => {
+              const t = templates.find(t => t.name === e.target.value) || null;
+              update('template_name', e.target.value);
+              setSelectedTemplate(t);
+              if (t) {
+                const initialParams = Object.fromEntries(t.params.map(p => [p, '']));
+                update('template_params', initialParams);
+                setPreviewParams(initialParams);
+              }
+            }}
+            style={inputStyle}
+            disabled={templatesLoading}
+          >
+            <option value="">
+              {templatesLoading ? 'Chargement des templates...' : 'Choisir un template...'}
+            </option>
+            {templates.map(t => (
+              <option key={t.name} value={t.name}>
+                {t.label} ({t.name})
+              </option>
+            ))}
+          </select>
+          {templates.length === 0 && !templatesLoading && (
+            <div style={{ fontSize: 12, color: '#f57c00', marginTop: 4 }}>
+              ⚠️ Aucun template disponible. Contactez votre administrateur.
+            </div>
+          )}
+        </FormField>
+
+        {selectedTemplate && (
+          <div style={{ background: '#f8faf9', borderRadius: 12, padding: 16, border: '1px solid #e5ebe8' }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1f1d', marginBottom: 12 }}>
+              🔧 Variables du template
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {selectedTemplate.params.map(param => (
+                <div key={param} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <span style={{ fontSize: 12, color: '#6b7c74', minWidth: 100, fontFamily: 'monospace',
+                    background: '#f0f7f3', padding: '3px 8px', borderRadius: 6 }}>
+                    {`{{${param}}}`}
+                  </span>
+                  <input
+                    placeholder={`Valeur de ${param}`}
+                    value={form.template_params?.[param] || ''}
+                    onChange={e => {
+                      const params = { ...form.template_params, [param]: e.target.value };
+                      update('template_params', params);
+                      setPreviewParams(params);
+                    }}
+                    style={{ ...inputStyle, flex: 1, padding: '6px 10px', fontSize: 13 }}
+                  />
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: '#9eada5', marginTop: 8 }}>
+              💡 Ces valeurs sont les valeurs par défaut. Chaque contact peut avoir ses propres variables.
+            </div>
+          </div>
+        )}
+
+        <FormField label="Langue">
+          <select value={form.template_language} onChange={e => update('template_language', e.target.value)} style={inputStyle}>
+            <option value="fr">🇫🇷 Français</option>
+            <option value="en">🇬🇧 Anglais</option>
+            <option value="ar">🇸🇦 Arabe</option>
+          </select>
+        </FormField>
+      </div>
+
+      {/* Prévisualisation phone */}
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1f1d', marginBottom: 16 }}>
+          📱 Aperçu WhatsApp
+        </div>
+        <PhonePreview template={selectedTemplate} params={previewParams} />
+      </div>
+    </div>
+  );
+
+  const renderStep3 = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      <div style={{ background: '#f0f7f3', borderRadius: 10, padding: '12px 16px', fontSize: 13, color: '#2d7a3e', fontWeight: 500 }}>
+        💡 <strong>Formats acceptés :</strong> CSV ou Excel avec colonnes <code>phone_number</code>, <code>name</code> (optionnel), et vos variables personnalisées.
+      </div>
+
+      {errors.contacts && (
+        <div style={{ background: '#ffebee', borderRadius: 10, padding: '10px 16px', fontSize: 13, color: '#c62828', fontWeight: 500 }}>
+          ⚠️ {errors.contacts}
+        </div>
+      )}
+
+      <ContactUploader contacts={form.contacts} onContactsChange={c => update('contacts', c)} />
+
+      {form.contacts.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+          {[
+            { label: 'Total contacts', value: form.contacts.length, color: '#2d7a3e' },
+            { label: 'Avec nom', value: form.contacts.filter(c => c.name).length, color: '#1976d2' },
+            { label: 'Temps estimé', value: estimatedTime(), color: '#f57c00' },
+          ].map(item => (
+            <div key={item.label} style={{ background: 'white', border: '1px solid #e5ebe8', borderRadius: 12, padding: '16px', textAlign: 'center' }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: item.color }}>{typeof item.value === 'number' ? item.value.toLocaleString('fr-FR') : item.value}</div>
+              <div style={{ fontSize: 12, color: '#9eada5', marginTop: 2 }}>{item.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderStep4 = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      {/* Mode d'envoi */}
+      <FormField label="Mode d'envoi">
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          {SEND_MODES.map(mode => (
+            <div key={mode.value} onClick={() => update('send_mode', mode.value)}
+              style={{
+                padding: '16px', borderRadius: 12, cursor: 'pointer', transition: 'all 0.2s',
+                border: `2px solid ${form.send_mode === mode.value ? '#2d7a3e' : '#e5ebe8'}`,
+                background: form.send_mode === mode.value ? '#f0f7f3' : 'white',
+              }}>
+              <div style={{ fontSize: 20, marginBottom: 6 }}>{mode.icon}</div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#1a1f1d' }}>{mode.label}</div>
+              <div style={{ fontSize: 12, color: '#9eada5', marginTop: 2 }}>{mode.desc}</div>
+            </div>
+          ))}
+        </div>
+      </FormField>
+
+      {/* Config selon le mode */}
+       {form.send_mode === 'scheduled' && (
+  <FormField label="Date et heure de lancement" hint="Heure locale de Douala (UTC+1)">
+    <input
+      type="datetime-local"
+      value={form.scheduled_at || ''}
+      onChange={e => update('scheduled_at', e.target.value)}
+      style={inputStyle}
+    />
+  </FormField>
+)}
+
+      {['batch', 'smart'].includes(form.send_mode) && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <FormField label="Taille des lots" hint="Messages par batch">
+            <input type="number" value={form.batch_size} min="1" max="500"
+              onChange={e => update('batch_size', parseInt(e.target.value))} style={inputStyle} />
+          </FormField>
+          <FormField label="Pause entre lots (sec.)" hint="Délai entre chaque batch">
+            <input type="number" value={form.batch_interval_seconds} min="10" max="3600"
+              onChange={e => update('batch_interval_seconds', parseInt(e.target.value))} style={inputStyle} />
+          </FormField>
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <FormField label="Limite journalière" hint="Max messages/jour">
+          <input type="number" value={form.daily_limit} min="1" max="10000"
+            onChange={e => update('daily_limit', parseInt(e.target.value))} style={inputStyle} />
+        </FormField>
+        <FormField label="Vitesse (msg/min)" hint="Débit d'envoi">
+          <input type="number" value={form.rate_per_minute} min="1" max="100"
+            onChange={e => update('rate_per_minute', parseInt(e.target.value))} style={inputStyle} />
+        </FormField>
+      </div>
+
+      <div style={{ background: '#fff3e0', borderRadius: 10, padding: '12px 16px', fontSize: 13, color: '#f57c00' }}>
+        ⚡ <strong>Estimation :</strong> {form.contacts.length} contacts × {(1 / form.rate_per_minute * 60).toFixed(1)}s/msg = <strong>{estimatedTime()}</strong> d'envoi total
+      </div>
+    </div>
+  );
+
+    const renderStep5 = () => {
+    const totalContacts = form.contacts.length;   // ← AJOUT OBLIGATOIRE
+
+    const unitPriceHT = clientCost;
+    const unitPriceTTC = unitPriceHT * (1 + 0.1925);
+    const costHT = totalContacts * unitPriceHT;
+    const costTTC = totalContacts * unitPriceTTC;
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+        <div style={{ fontSize: 16, fontWeight: 700, color: '#1a1f1d', marginBottom: 4 }}>
+          ✅ Récapitulatif de la campagne
+        </div>
+
+        {[
+          { section: '📋 Configuration', items: [
+            ['Nom', form.name || '—'],
+            ['Type', form.campaign_type],
+            ['Catégorie', form.category || 'Sans catégorie'],
+            ['Numéro émetteur', form.phone_number],
+            ['Priorité', `${form.priority}/10`],
+          ]},
+          { section: '📝 Template', items: [
+            ['Template', form.template_name || '—'],
+            ['Langue', form.template_language],
+            ['Variables', Object.keys(form.template_params || {}).join(', ') || 'Aucune'],
+          ]},
+          { section: '👥 Contacts', items: [
+            ['Total contacts', totalContacts.toLocaleString('fr-FR')],
+            ['Avec nom', form.contacts.filter(c => c.name).length],
+          ]},
+          { section: '🗓️ Envoi', items: [
+            ['Mode', form.send_mode],
+            ['Vitesse', `${form.rate_per_minute} msg/min`],
+            ['Limite/jour', `${form.daily_limit} messages`],
+            ...(form.scheduled_at ? [['Planifié le', new Date(form.scheduled_at).toLocaleString('fr-FR')]] : []),
+            ['Durée estimée', estimatedTime()],
+          ]},
+        ].map(({ section, items }) => (
+          <div key={section} style={{ background: '#f8faf9', borderRadius: 12, padding: '16px', border: '1px solid #e5ebe8' }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#1a1f1d', marginBottom: 12 }}>{section}</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {items.map(([label, val]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
+                  <span style={{ color: '#6b7c74' }}>{label}</span>
+                  <span style={{ color: '#1a1f1d', fontWeight: 500 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        {/* Bloc Coût Professionnel - Aligné */}
+        <div style={{
+          background: '#e8f5e9',
+          borderRadius: 12,
+          padding: '20px',
+          border: '1px solid #a5d6a7',
+        }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: '#1e5a2f', marginBottom: 16 }}>
+            💰 Estimation du coût
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14 }}>
+              <span>Prix unitaire HT</span>
+              <span style={{ fontWeight: 600 }}>{unitPriceHT.toFixed(2)} FCFA</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14 }}>
+              <span>Prix unitaire TTC (19.25%)</span>
+              <span style={{ fontWeight: 600 }}>{unitPriceTTC.toFixed(2)} FCFA</span>
+            </div>
+
+            <div style={{ height: 1, background: '#a5d6a7', margin: '8px 0' }} />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 15, fontWeight: 600 }}>
+              <span>Messages à envoyer</span>
+              <span>{totalContacts.toLocaleString('fr-FR')}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 15, fontWeight: 600 }}>
+              <span>Coût total HT</span>
+              <span>{costHT.toLocaleString('fr-FR')} FCFA</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 16, fontWeight: 700, color: '#2d7a3e' }}>
+              <span>Total TTC</span>
+              <span>{costTTC.toLocaleString('fr-FR')} FCFA</span>
+            </div>
+          </div>
+
+          <div style={{ fontSize: 11, color: '#6b7c74', marginTop: 12, textAlign: 'center' }}>
+            Tarif négocié : {unitPriceHT} FCFA / message • TVA 19.25% incluse
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const stepContent = [null, renderStep1, renderStep2, renderStep3, renderStep4, renderStep5][step];
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f8faf9', fontFamily: "'Inter', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+        @keyframes slideDown { from { transform: translateY(-10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
+
+      {toast && (
+        <div style={{
+          position: 'fixed', top: 24, right: 24, zIndex: 9999,
+          padding: '12px 20px', borderRadius: 12, animation: 'slideDown 0.3s ease',
+          background: toast.type === 'error' ? '#c62828' : '#2d7a3e',
+          color: 'white', fontSize: 14, fontWeight: 500, boxShadow: '0 8px 24px rgba(0,0,0,0.2)'
+        }}>
+          {toast.type === 'error' ? '❌ ' : '✅ '}{toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ background: 'white', borderBottom: '1px solid #e5ebe8', padding: '0 32px' }}>
+        <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', alignItems: 'center', height: 64, gap: 16 }}>
+          <button onClick={() => router.push('/dashboard/campaigns')} style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            border: '1px solid #e5ebe8', borderRadius: 8, background: 'white',
+            cursor: 'pointer', fontSize: 13, color: '#6b7c74'
+          }}>← Retour</button>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#1a1f1d' }}>Nouvelle campagne WhatsApp</div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 32px' }}>
+        <StepIndicator current={step} steps={STEPS} />
+
+        {/* Card */}
+        <div style={{ background: 'white', borderRadius: 20, border: '1px solid #e5ebe8',
+          boxShadow: '0 4px 20px rgba(0,0,0,0.06)', overflow: 'hidden' }}>
+
+          <div style={{ padding: '32px', borderBottom: '1px solid #f0f7f3' }}>
+            <div style={{ fontSize: 13, color: '#9eada5', marginBottom: 4 }}>Étape {step}/{STEPS.length}</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: '#1a1f1d' }}>{STEPS[step-1].label}</div>
+            <div style={{ fontSize: 14, color: '#6b7c74' }}>{STEPS[step-1].desc}</div>
+          </div>
+
+          <div style={{ padding: '32px' }}>
+            {stepContent?.()}
+          </div>
+
+          {/* Navigation */}
+          <div style={{ padding: '20px 32px', borderTop: '1px solid #f0f7f3',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#fafcfb' }}>
+            <button onClick={prev} disabled={step === 1} style={{
+              padding: '10px 20px', borderRadius: 10, border: '1px solid #e5ebe8',
+              background: 'white', cursor: step === 1 ? 'not-allowed' : 'pointer',
+              opacity: step === 1 ? 0.5 : 1, fontSize: 14, color: '#6b7c74', fontWeight: 500
+            }}>← Précédent</button>
+
+            <div style={{ display: 'flex', gap: 3 }}>
+              {STEPS.map(s => (
+                <div key={s.id} style={{
+                  width: step === s.id ? 24 : 6, height: 6, borderRadius: 99,
+                  background: s.id <= step ? '#2d7a3e' : '#e5ebe8', transition: 'all 0.3s'
+                }} />
+              ))}
+            </div>
+
+            {step < 5 ? (
+              <button onClick={next} style={{
+                padding: '10px 24px', borderRadius: 10, border: 'none',
+                background: 'linear-gradient(135deg, #2d7a3e, #3a9950)',
+                color: 'white', cursor: 'pointer', fontSize: 14, fontWeight: 600,
+                boxShadow: '0 2px 8px rgba(45,122,62,0.3)'
+              }}>Suivant →</button>
+            ) : (
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button onClick={() => handleSubmit(false)} disabled={loading} style={{
+                  padding: '10px 20px', borderRadius: 10, border: '1px solid #2d7a3e',
+                  background: 'white', color: '#2d7a3e', cursor: 'pointer', fontSize: 14, fontWeight: 600
+                }}>
+                  Enregistrer en brouillon
+                </button>
+                <button onClick={() => handleSubmit(true)} disabled={loading} style={{
+                  padding: '10px 24px', borderRadius: 10, border: 'none',
+                  background: 'linear-gradient(135deg, #2d7a3e, #3a9950)',
+                  color: 'white', cursor: loading ? 'not-allowed' : 'pointer',
+                  fontSize: 14, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8,
+                  boxShadow: '0 2px 8px rgba(45,122,62,0.3)', opacity: loading ? 0.7 : 1
+                }}>
+                  {loading && <div style={{ width: 16, height: 16, border: '2px solid rgba(255,255,255,0.4)',
+                    borderTopColor: 'white', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />}
+                  🚀 Lancer la campagne
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

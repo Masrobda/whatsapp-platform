@@ -1,0 +1,597 @@
+'use client';
+import { useState, useEffect, useCallback } from 'react';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+async function api(path, opts = {}) {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...opts, headers: { 'Content-Type':'application/json', ...(token?{Authorization:`Bearer ${token}`}:{}), ...opts.headers }
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message||`HTTP ${res.status}`);
+  return data;
+}
+
+// ── DEMO DATA ─────────────────────────────────────────────────
+const DEMO_CAMPAIGNS = [
+  { id:'camp-1', name:'Factures Avril 2026', status:'completed', total_contacts:8420, sent_count:8420, delivered_count:7820, read_count:4950, failed_count:180, actual_cost:42.1, completed_at: new Date(Date.now()-86400000).toISOString() },
+  { id:'camp-2', name:'Promotion Ramadan', status:'running', total_contacts:15200, sent_count:9800, delivered_count:9100, read_count:5800, failed_count:320, actual_cost:49.0 },
+  { id:'camp-3', name:'Relance Impayés Q1', status:'paused', total_contacts:2340, sent_count:1200, delivered_count:1100, read_count:680, failed_count:45, actual_cost:6.0 },
+];
+
+const DEMO_EXPORTS = [
+  { id:'e1', campaign_id:'camp-1', export_type:'pdf', status:'ready', file_url:'https://api.numericexport.com/reports/campaign_abc123.pdf', file_size:284320, created_at: new Date(Date.now()-3600000).toISOString(), completed_at: new Date(Date.now()-3540000).toISOString() },
+  { id:'e2', campaign_id:'camp-2', export_type:'csv', status:'ready', file_url:'https://api.numericexport.com/reports/campaign_def456.csv', file_size:98240, created_at: new Date(Date.now()-7200000).toISOString(), completed_at: new Date(Date.now()-7180000).toISOString() },
+  { id:'e3', campaign_id:'camp-1', export_type:'pdf', status:'processing', file_url:null, file_size:null, created_at: new Date(Date.now()-120000).toISOString(), completed_at:null },
+];
+
+const DEMO_GLOBAL_STATS = {
+  period: '30days',
+  by_campaign: DEMO_CAMPAIGNS,
+  totals: {
+    total_campaigns: 12,
+    total_messages: 28940,
+    total_delivered: 26810,
+    total_read: 15640,
+    total_failed: 740,
+    total_cost_usd: 144.7,
+    avg_delivery_rate: 92.6,
+    avg_read_rate: 58.3,
+  },
+  by_day: Array.from({ length: 30 }, (_, i) => ({
+    date: new Date(Date.now() - (29 - i) * 86400000).toISOString().split('T')[0],
+    sent: Math.floor(Math.random() * 600 + 200),
+    delivered: Math.floor(Math.random() * 560 + 180),
+    read: Math.floor(Math.random() * 300 + 100),
+    failed: Math.floor(Math.random() * 25 + 3),
+    cost: +(Math.random() * 3 + 0.5).toFixed(2),
+  })),
+};
+
+// ── STYLES ────────────────────────────────────────────────────
+const inp = { padding:'9px 12px', borderRadius:10, border:'1px solid #e5ebe8', fontSize:13, color:'#1a1f1d', background:'white', outline:'none', boxSizing:'border-box' };
+
+// ── COMPOSANTS ───────────────────────────────────────────────
+
+function KpiCard({ icon, label, value, sub, color }) {
+  return (
+    <div style={{ background:'white', borderRadius:14, border:'1px solid #e5ebe8', padding:'20px',
+      display:'flex', flexDirection:'column', gap:10 }}>
+      <div style={{ width:40, height:40, borderRadius:12, background:`${color}15`,
+        display:'flex', alignItems:'center', justifyContent:'center', fontSize:20 }}>{icon}</div>
+      <div>
+        <div style={{ fontSize:26, fontWeight:700, color, lineHeight:1.1, fontVariantNumeric:'tabular-nums' }}>{value}</div>
+        <div style={{ fontSize:12, color:'#6b7c74', marginTop:3, fontWeight:500 }}>{label}</div>
+        {sub && <div style={{ fontSize:11, color, marginTop:2, fontWeight:600 }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+function MiniBar({ data, maxVal, color = '#2d7a3e' }) {
+  const max = maxVal || Math.max(...data.map(d => d.value), 1);
+  return (
+    <div style={{ display:'flex', alignItems:'flex-end', gap:2, height:60 }}>
+      {data.map((d, i) => (
+        <div key={i} style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:2 }}>
+          <div title={`${d.label}: ${d.value}`} style={{
+            flex:1, width:'100%', background:color, borderRadius:'2px 2px 0 0',
+            height:`${Math.max((d.value / max) * 100, 3)}%`,
+            opacity: 0.6 + (i / data.length) * 0.4, minHeight:2,
+          }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExportStatusBadge({ status }) {
+  const cfg = {
+    ready:      { label:'Prêt',        color:'#2d7a3e', bg:'#e8f5e9', icon:'✅' },
+    processing: { label:'En cours...',  color:'#f57c00', bg:'#fff3e0', icon:'⏳' },
+    pending:    { label:'En attente',   color:'#1976d2', bg:'#e3f2fd', icon:'🕐' },
+    failed:     { label:'Échoué',       color:'#c62828', bg:'#ffebee', icon:'❌' },
+  }[status] || { label:status, color:'#6b7c74', bg:'#f8faf9', icon:'—' };
+
+  return (
+    <span style={{ display:'inline-flex', alignItems:'center', gap:5, padding:'3px 10px',
+      borderRadius:12, fontSize:11, fontWeight:600, background:cfg.bg, color:cfg.color }}>
+      {cfg.icon} {cfg.label}
+    </span>
+  );
+}
+
+function CampaignReportRow({ campaign, onExportPDF, onExportCSV, exporting }) {
+  const pct = (a, b) => b > 0 ? `${((a / b) * 100).toFixed(1)}%` : '0%';
+  const isExporting = exporting === campaign.id;
+
+  return (
+    <tr style={{ borderBottom:'1px solid #f0f7f3' }}
+      onMouseEnter={e=>e.currentTarget.style.background='#fafcfb'}
+      onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+      <td style={{ padding:'14px 20px' }}>
+        <div style={{ fontSize:13, fontWeight:600, color:'#1a1f1d' }}>{campaign.name}</div>
+        <div style={{ fontSize:11, color:'#9eada5', marginTop:2 }}>
+          {campaign.status === 'completed' ? `✅ Terminée` :
+           campaign.status === 'running' ? `🔄 En cours` : `⏸️ ${campaign.status}`}
+        </div>
+      </td>
+      <td style={{ padding:'14px 12px', textAlign:'right', fontSize:13, fontWeight:600, color:'#1a1f1d' }}>
+        {(campaign.total_contacts||0).toLocaleString('fr-FR')}
+      </td>
+      <td style={{ padding:'14px 12px', textAlign:'center' }}>
+        <div style={{ fontSize:13, fontWeight:700, color:'#2d7a3e' }}>{pct(campaign.delivered_count||0, campaign.sent_count||1)}</div>
+        <div style={{ fontSize:10, color:'#9eada5' }}>livraison</div>
+      </td>
+      <td style={{ padding:'14px 12px', textAlign:'center' }}>
+        <div style={{ fontSize:13, fontWeight:700, color:'#8bc34a' }}>{pct(campaign.read_count||0, campaign.delivered_count||1)}</div>
+        <div style={{ fontSize:10, color:'#9eada5' }}>lecture</div>
+      </td>
+      <td style={{ padding:'14px 12px', textAlign:'center', fontSize:13, color:'#c62828', fontWeight:600 }}>
+        {(campaign.failed_count||0).toLocaleString('fr-FR')}
+      </td>
+      <td style={{ padding:'14px 12px', textAlign:'center', fontSize:13, color:'#f57c00', fontWeight:600 }}>
+        ${(campaign.actual_cost||0).toFixed(2)}
+      </td>
+      <td style={{ padding:'14px 20px' }}>
+        <div style={{ display:'flex', gap:6 }}>
+          <button onClick={()=>onExportPDF(campaign)} disabled={isExporting}
+            style={{ padding:'6px 12px', borderRadius:8, border:'none', background:'#c62828', color:'white',
+              cursor:isExporting?'not-allowed':'pointer', fontSize:12, fontWeight:600, opacity:isExporting?0.6:1,
+              display:'flex', alignItems:'center', gap:4 }}>
+            {isExporting ? '⏳' : '📄'} PDF
+          </button>
+          <button onClick={()=>onExportCSV(campaign)}
+            style={{ padding:'6px 12px', borderRadius:8, border:'1px solid #2d7a3e', background:'white', color:'#2d7a3e',
+              cursor:'pointer', fontSize:12, fontWeight:600, display:'flex', alignItems:'center', gap:4 }}>
+            📊 CSV
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function GlobalChart({ data }) {
+  if (!data || data.length === 0) return null;
+  const recent = data.slice(-14);
+  const maxVal = Math.max(...recent.map(d => d.sent), 1);
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+      {/* Légende */}
+      <div style={{ display:'flex', gap:16 }}>
+        {[['#2d7a3e','Livrés'],['#8bc34a','Lus'],['#ef5350','Échecs']].map(([c,l])=>(
+          <div key={l} style={{ display:'flex', alignItems:'center', gap:6, fontSize:12 }}>
+            <div style={{ width:10, height:10, borderRadius:3, background:c }} />
+            <span style={{ color:'#6b7c74' }}>{l}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Barres */}
+      <div style={{ display:'flex', alignItems:'flex-end', gap:4, height:120, paddingBottom:20, position:'relative' }}>
+        {[25,50,75,100].map(pct=>(
+          <div key={pct} style={{ position:'absolute', left:0, right:0,
+            bottom:`calc(${pct}% + 20px)`, borderTop:'1px dashed #f0f7f3', zIndex:0 }} />
+        ))}
+        {recent.map((day, i) => {
+          const delivered = parseInt(day.delivered)||0;
+          const read = parseInt(day.read)||0;
+          const failed = parseInt(day.failed)||0;
+          return (
+            <div key={i} title={day.date} style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', position:'relative', zIndex:1 }}>
+              <div style={{ display:'flex', alignItems:'flex-end', gap:1, height:100, width:'100%' }}>
+                {[[delivered,'#2d7a3e'],[read,'#8bc34a'],[failed,'#ef5350']].map(([v,c],j)=>(
+                  <div key={j} style={{ flex:1, background:c, borderRadius:'2px 2px 0 0',
+                    height:`${Math.max((v/maxVal)*100,2)}%`, opacity:0.85, minHeight:2 }} />
+                ))}
+              </div>
+              <div style={{ position:'absolute', bottom:-18, fontSize:9, color:'#9eada5',
+                width:'100%', textAlign:'center', transform:'rotate(-30deg)', transformOrigin:'center top' }}>
+                {new Date(day.date).toLocaleDateString('fr-FR',{day:'2-digit',month:'2-digit'})}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── PAGE PRINCIPALE ──────────────────────────────────────────
+export default function ReportsPage() {
+  const [campaigns, setCampaigns] = useState([]);
+  const [exports, setExports] = useState([]);
+  const [globalStats, setGlobalStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [period, setPeriod] = useState('30days');
+  const [exporting, setExporting] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [tab, setTab] = useState('overview'); // overview | campaigns | exports
+
+  const showToast = (msg, type='success') => { setToast({msg,type}); setTimeout(()=>setToast(null),4000); };
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [campRes, expRes] = await Promise.all([
+        api(`/campaigns?limit=50`),
+        api(`/exports`),
+      ]);
+      setCampaigns(campRes.campaigns||[]);
+      setExports(expRes.exports||[]);
+      setGlobalStats(DEMO_GLOBAL_STATS); // En prod: api(`/campaigns/global-report?period=${period}`)
+    } catch {
+      setCampaigns(DEMO_CAMPAIGNS);
+      setExports(DEMO_EXPORTS);
+      setGlobalStats(DEMO_GLOBAL_STATS);
+    } finally { setLoading(false); }
+  }, [period]);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  // Polling des exports "processing"
+  useEffect(() => {
+    const hasProcessing = exports.some(e => e.status === 'processing' || e.status === 'pending');
+    if (!hasProcessing) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await api('/exports');
+        setExports(res.exports||[]);
+      } catch {}
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [exports]);
+
+  const handleExportPDF = async (campaign) => {
+    setExporting(campaign.id);
+    try {
+      const res = await api(`/campaigns/${campaign.id}/export/pdf`, { method:'POST' });
+      showToast(`Génération PDF en cours (ID: ${res.exportId?.substring(0,8)}...)`);
+      setTimeout(fetchData, 3000);
+    } catch {
+      // Mode démo
+      const newExport = {
+        id: `e-${Date.now()}`, campaign_id: campaign.id, export_type:'pdf',
+        status:'processing', file_url:null, file_size:null,
+        created_at: new Date().toISOString(), completed_at:null
+      };
+      setExports(e=>[newExport,...e]);
+      showToast('Génération PDF lancée (mode démo)');
+      // Simuler la complétion après 4s
+      setTimeout(() => {
+        setExports(e=>e.map(ex=>ex.id===newExport.id?{
+          ...ex, status:'ready',
+          file_url:`https://api.numericexport.com/reports/campaign_${campaign.id.substring(0,8)}.pdf`,
+          file_size:284320, completed_at:new Date().toISOString()
+        }:ex));
+        showToast('📄 Rapport PDF prêt !');
+      }, 4000);
+    } finally {
+      setTimeout(()=>setExporting(null), 1000);
+    }
+  };
+
+  const handleExportCSV = async (campaign) => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch(`${API_BASE}/campaigns/${campaign.id}/export/csv`, {
+        headers: { ...(token?{Authorization:`Bearer ${token}`}:{}) }
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `campagne_${campaign.name.replace(/\s+/g,'_')}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('📊 Export CSV téléchargé !');
+      } else { throw new Error('Export échoué'); }
+    } catch {
+      // Mode démo: générer un CSV minimal
+      const headers = 'Téléphone,Nom,Statut,Envoyé,Livré,Lu,Erreur';
+      const rows = ['+237674855790,Patrick Biyong,read,oui,oui,oui,', '+237656939193,Marie Ateba,delivered,oui,oui,non,'];
+      const csv = '\uFEFF' + [headers,...rows].join('\n');
+      const blob = new Blob([csv],{type:'text/csv;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href=url; a.download=`campagne_${campaign.name.replace(/\s+/g,'_')}.csv`;
+      a.click(); URL.revokeObjectURL(url);
+      showToast('📊 Export CSV (démo) téléchargé !');
+    }
+  };
+
+  const handleDownload = (exp) => {
+    if (!exp.file_url) return;
+    window.open(exp.file_url, '_blank');
+  };
+
+  const g = globalStats?.totals || {};
+
+  const TABS = [
+    { id:'overview',  label:'Vue d\'ensemble', icon:'📊' },
+    { id:'campaigns', label:`Campagnes (${campaigns.length})`, icon:'📋' },
+    { id:'exports',   label:`Exports (${exports.length})`, icon:'📁' },
+  ];
+
+  return (
+    <div style={{ minHeight:'100vh', background:'#f8faf9', fontFamily:"'Inter',sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+        @keyframes slideDown{from{transform:translateY(-10px);opacity:0}to{transform:translateY(0);opacity:1}}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes pulse-proc{0%,100%{opacity:1}50%{opacity:0.4}}
+        .tab-btn{padding:10px 18px;border:none;background:none;cursor:pointer;font-size:14px;font-weight:500;color:#6b7c74;border-bottom:2px solid transparent;transition:all 0.2s;white-space:nowrap;font-family:inherit}
+        .tab-btn.active{color:#2d7a3e;border-bottom-color:#2d7a3e;font-weight:600}
+        .tab-btn:hover{color:#2d7a3e}
+        .export-row:hover{background:#fafcfb}
+      `}</style>
+
+      {toast && (
+        <div style={{ position:'fixed', top:24, right:24, zIndex:9999, padding:'12px 20px', borderRadius:12,
+          background:toast.type==='error'?'#c62828':'#2d7a3e', color:'white', fontSize:14, fontWeight:500,
+          boxShadow:'0 8px 24px rgba(0,0,0,0.2)', animation:'slideDown 0.3s ease' }}>
+          {toast.type==='error'?'❌ ':'✅ '}{toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ background:'white', borderBottom:'1px solid #e5ebe8', position:'sticky', top:0, zIndex:100 }}>
+        <div style={{ maxWidth:1300, margin:'0 auto' }}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', height:64, padding:'0 32px' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+              <div style={{ width:36, height:36, borderRadius:10,
+                background:'linear-gradient(135deg,#c62828,#ef5350)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:18 }}>📈</div>
+              <div>
+                <div style={{ fontSize:18, fontWeight:700, color:'#1a1f1d' }}>Rapports & Exports</div>
+                <div style={{ fontSize:12, color:'#9eada5' }}>Analyses et téléchargements PDF/CSV</div>
+              </div>
+            </div>
+            <div style={{ display:'flex', gap:10, alignItems:'center' }}>
+              {/* Filtre période */}
+              <div style={{ display:'flex', gap:4, background:'#f8faf9', padding:4, borderRadius:10, border:'1px solid #e5ebe8' }}>
+                {['7days','30days','90days','all'].map(p=>(
+                  <button key={p} onClick={()=>setPeriod(p)} style={{
+                    padding:'5px 12px', borderRadius:8, border:'none', cursor:'pointer', fontSize:12, fontWeight:500, transition:'all 0.15s',
+                    background:period===p?'#2d7a3e':'transparent',
+                    color:period===p?'white':'#6b7c74' }}>
+                    {p==='7days'?'7j':p==='30days'?'30j':p==='90days'?'90j':'Tout'}
+                  </button>
+                ))}
+              </div>
+              <button onClick={fetchData} style={{ padding:'7px 14px', borderRadius:10, border:'1px solid #e5ebe8',
+                background:'white', color:'#6b7c74', cursor:'pointer', fontSize:13, fontWeight:500,
+                display:'flex', alignItems:'center', gap:6 }}>
+                🔄 Actualiser
+              </button>
+            </div>
+          </div>
+
+          {/* Tabs */}
+          <div style={{ display:'flex', borderTop:'1px solid #f0f7f3', padding:'0 32px' }}>
+            {TABS.map(t=>(
+              <button key={t.id} className={`tab-btn ${tab===t.id?'active':''}`} onClick={()=>setTab(t.id)}>
+                {t.icon} {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth:1300, margin:'0 auto', padding:'32px' }}>
+
+        {/* ── OVERVIEW ── */}
+        {tab === 'overview' && (
+          <div style={{ display:'flex', flexDirection:'column', gap:24 }}>
+
+            {/* KPIs */}
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16 }}>
+              <KpiCard icon="📤" label="Messages envoyés" value={(g.total_messages||0).toLocaleString('fr-FR')} color="#1976d2"
+                sub={`${campaigns.length} campagnes`} />
+              <KpiCard icon="✓✓" label="Livrés" value={(g.total_delivered||0).toLocaleString('fr-FR')} color="#2d7a3e"
+                sub={`${g.avg_delivery_rate||0}% de taux`} />
+              <KpiCard icon="👁️" label="Lus" value={(g.total_read||0).toLocaleString('fr-FR')} color="#8bc34a"
+                sub={`${g.avg_read_rate||0}% de taux`} />
+              <KpiCard icon="💰" label="Coût total" value={`$${(g.total_cost_usd||0).toFixed(2)}`} color="#f57c00"
+                sub={`≈ ${Math.round((g.total_cost_usd||0)*620).toLocaleString('fr-FR')} FCFA`} />
+            </div>
+
+            {/* Graphique 30j + Top campagnes */}
+            <div style={{ display:'grid', gridTemplateColumns:'2fr 1fr', gap:20 }}>
+              <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', padding:'24px' }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:20 }}>
+                  <div style={{ fontSize:14, fontWeight:700, color:'#1a1f1d' }}>📈 Évolution sur {period==='7days'?'7':period==='30days'?'30':period==='90days'?'90':'toute la période'} jours</div>
+                </div>
+                <GlobalChart data={globalStats?.by_day||[]} />
+              </div>
+
+              <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', padding:'24px' }}>
+                <div style={{ fontSize:14, fontWeight:700, color:'#1a1f1d', marginBottom:16 }}>🏆 Top campagnes</div>
+                <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+                  {campaigns.slice(0,4).map((c,i)=>{
+                    const rate = c.sent_count>0?Math.round((c.delivered_count/c.sent_count)*100):0;
+                    return (
+                      <div key={c.id} style={{ display:'flex', flexDirection:'column', gap:4 }}>
+                        <div style={{ display:'flex', justifyContent:'space-between', fontSize:12 }}>
+                          <span style={{ color:'#1a1f1d', fontWeight:500, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth:160 }}>
+                            {i+1}. {c.name}
+                          </span>
+                          <span style={{ color:'#2d7a3e', fontWeight:600 }}>{rate}%</span>
+                        </div>
+                        <div style={{ height:5, background:'#f0f7f3', borderRadius:99, overflow:'hidden' }}>
+                          <div style={{ height:'100%', width:`${rate}%`, background:`hsl(${120+i*15},50%,${40+i*5}%)`, borderRadius:99 }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Résumé financier */}
+            <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', padding:'24px' }}>
+              <div style={{ fontSize:14, fontWeight:700, color:'#1a1f1d', marginBottom:16 }}>💰 Résumé financier ({period})</div>
+              <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:12 }}>
+                {[
+                  { l:'Coût total', v:`$${(g.total_cost_usd||0).toFixed(2)}`, c:'#1a1f1d' },
+                  { l:'Coût/message', v:`$${g.total_messages>0?((g.total_cost_usd||0)/g.total_messages).toFixed(4):'0.0000'}`, c:'#1976d2' },
+                  { l:'Coût/livré', v:`$${g.total_delivered>0?((g.total_cost_usd||0)/g.total_delivered).toFixed(4):'0.0000'}`, c:'#2d7a3e' },
+                  { l:'Coût/lu', v:`$${g.total_read>0?((g.total_cost_usd||0)/g.total_read).toFixed(4):'0.0000'}`, c:'#8bc34a' },
+                  { l:'En FCFA', v:`${Math.round((g.total_cost_usd||0)*620).toLocaleString('fr-FR')} F`, c:'#f57c00' },
+                ].map(item=>(
+                  <div key={item.l} style={{ textAlign:'center', padding:'14px', background:'#f8faf9', borderRadius:12 }}>
+                    <div style={{ fontSize:18, fontWeight:700, color:item.c, fontFamily:"'DM Mono',monospace" }}>{item.v}</div>
+                    <div style={{ fontSize:11, color:'#9eada5', marginTop:4 }}>{item.l}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── CAMPAGNES ── */}
+        {tab === 'campaigns' && (
+          <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', overflow:'hidden' }}>
+            <div style={{ padding:'20px 24px', borderBottom:'1px solid #f0f7f3', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              <div style={{ fontSize:15, fontWeight:700, color:'#1a1f1d' }}>Rapport par campagne</div>
+              <div style={{ fontSize:12, color:'#9eada5' }}>{campaigns.length} campagnes · Cliquez PDF ou CSV pour exporter</div>
+            </div>
+            {loading ? (
+              <div style={{ display:'flex', justifyContent:'center', padding:60 }}>
+                <div style={{ width:32, height:32, border:'3px solid #e5ebe8', borderTopColor:'#c62828', borderRadius:'50%', animation:'spin 0.8s linear infinite' }} />
+              </div>
+            ) : (
+              <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                <thead>
+                  <tr style={{ background:'#f8faf9', borderBottom:'1px solid #e5ebe8' }}>
+                    {['Campagne','Contacts','Livraison','Lecture','Échecs','Coût','Exporter'].map((h,i)=>(
+                      <th key={h} style={{ padding:'11px 20px', textAlign:i>0&&i<6?'center':'left',
+                        fontSize:11, fontWeight:600, color:'#6b7c74', letterSpacing:'0.04em', textTransform:'uppercase' }}>
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {campaigns.map(c=>(
+                    <CampaignReportRow key={c.id} campaign={c}
+                      onExportPDF={handleExportPDF}
+                      onExportCSV={handleExportCSV}
+                      exporting={exporting} />
+                  ))}
+                </tbody>
+                {/* Ligne totaux */}
+                <tfoot>
+                  <tr style={{ background:'#f0f7f3', borderTop:'2px solid #e5ebe8' }}>
+                    <td style={{ padding:'12px 20px', fontSize:13, fontWeight:700, color:'#1e5a2f' }}>Total</td>
+                    <td style={{ padding:'12px', textAlign:'right', fontSize:13, fontWeight:700, color:'#1e5a2f' }}>
+                      {campaigns.reduce((a,c)=>a+(c.total_contacts||0),0).toLocaleString('fr-FR')}
+                    </td>
+                    <td style={{ padding:'12px', textAlign:'center', fontSize:13, fontWeight:700, color:'#2d7a3e' }}>
+                      {campaigns.reduce((a,c)=>a+(c.sent_count||0),0)>0 ?
+                        `${(campaigns.reduce((a,c)=>a+(c.delivered_count||0),0)/campaigns.reduce((a,c)=>a+(c.sent_count||0),1)*100).toFixed(1)}%` : '—'}
+                    </td>
+                    <td style={{ padding:'12px', textAlign:'center', fontSize:13, fontWeight:700, color:'#8bc34a' }}>
+                      {campaigns.reduce((a,c)=>a+(c.delivered_count||0),0)>0 ?
+                        `${(campaigns.reduce((a,c)=>a+(c.read_count||0),0)/campaigns.reduce((a,c)=>a+(c.delivered_count||0),1)*100).toFixed(1)}%` : '—'}
+                    </td>
+                    <td style={{ padding:'12px', textAlign:'center', fontSize:13, fontWeight:700, color:'#c62828' }}>
+                      {campaigns.reduce((a,c)=>a+(c.failed_count||0),0).toLocaleString('fr-FR')}
+                    </td>
+                    <td style={{ padding:'12px', textAlign:'center', fontSize:13, fontWeight:700, color:'#f57c00' }}>
+                      ${campaigns.reduce((a,c)=>a+(c.actual_cost||0),0).toFixed(2)}
+                    </td>
+                    <td />
+                  </tr>
+                </tfoot>
+              </table>
+            )}
+          </div>
+        )}
+
+        {/* ── EXPORTS ── */}
+        {tab === 'exports' && (
+          <div style={{ display:'flex', flexDirection:'column', gap:20 }}>
+            {/* Infos */}
+            <div style={{ background:'#e3f2fd', borderRadius:12, padding:'14px 20px', fontSize:13, color:'#1976d2', display:'flex', alignItems:'center', gap:10 }}>
+              <span style={{ fontSize:18 }}>ℹ️</span>
+              <div>
+                Les rapports PDF sont générés via <strong>ReportLab</strong> et disponibles pendant <strong>7 jours</strong>.
+                Les exports CSV sont téléchargés instantanément avec encodage UTF-8 + BOM pour Excel.
+              </div>
+            </div>
+
+            {exports.length === 0 ? (
+              <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', padding:60, textAlign:'center', color:'#9eada5' }}>
+                <div style={{ fontSize:40, marginBottom:12 }}>📁</div>
+                <div style={{ fontSize:16, fontWeight:600, color:'#6b7c74', marginBottom:4 }}>Aucun export</div>
+                <div style={{ fontSize:13 }}>Allez dans l'onglet "Campagnes" pour générer des exports</div>
+              </div>
+            ) : (
+              <div style={{ background:'white', borderRadius:16, border:'1px solid #e5ebe8', overflow:'hidden' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead>
+                    <tr style={{ background:'#f8faf9', borderBottom:'1px solid #e5ebe8' }}>
+                      {['Campagne','Type','Statut','Taille','Demandé','Complété','Action'].map(h=>(
+                        <th key={h} style={{ padding:'11px 20px', textAlign:'left',
+                          fontSize:11, fontWeight:600, color:'#6b7c74', letterSpacing:'0.04em', textTransform:'uppercase' }}>
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {exports.map(exp => {
+                      const camp = campaigns.find(c=>c.id===exp.campaign_id);
+                      const fmt = d => d ? new Date(d).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+                      const fmtSize = s => s ? (s>1024*1024?`${(s/1024/1024).toFixed(1)} Mo`:`${Math.round(s/1024)} Ko`) : '—';
+                      return (
+                        <tr key={exp.id} className="export-row" style={{ borderBottom:'1px solid #f8faf9' }}>
+                          <td style={{ padding:'13px 20px', fontSize:13, fontWeight:500, color:'#1a1f1d' }}>
+                            {camp?.name || exp.campaign_id?.substring(0,8)||'—'}
+                          </td>
+                          <td style={{ padding:'13px 20px' }}>
+                            <span style={{ padding:'3px 10px', borderRadius:8, fontSize:12, fontWeight:600,
+                              background: exp.export_type==='pdf'?'#ffebee':exp.export_type==='csv'?'#e8f5e9':'#e3f2fd',
+                              color: exp.export_type==='pdf'?'#c62828':exp.export_type==='csv'?'#2d7a3e':'#1976d2' }}>
+                              {exp.export_type==='pdf'?'📄 PDF':exp.export_type==='csv'?'📊 CSV':'📈 Excel'}
+                            </span>
+                          </td>
+                          <td style={{ padding:'13px 20px' }}>
+                            <ExportStatusBadge status={exp.status} />
+                          </td>
+                          <td style={{ padding:'13px 20px', fontSize:12, color:'#6b7c74', fontFamily:"'DM Mono',monospace" }}>
+                            {fmtSize(exp.file_size)}
+                          </td>
+                          <td style={{ padding:'13px 20px', fontSize:12, color:'#6b7c74' }}>{fmt(exp.created_at)}</td>
+                          <td style={{ padding:'13px 20px', fontSize:12, color:'#6b7c74' }}>
+                            {exp.status==='processing'?<span style={{ animation:'pulse-proc 1.5s infinite', color:'#f57c00', fontSize:12 }}>⏳ En cours...</span>:fmt(exp.completed_at)}
+                          </td>
+                          <td style={{ padding:'13px 20px' }}>
+                            {exp.status==='ready' && exp.file_url ? (
+                              <button onClick={()=>handleDownload(exp)} style={{ padding:'6px 14px', borderRadius:8, border:'none',
+                                background:'#2d7a3e', color:'white', cursor:'pointer', fontSize:12, fontWeight:600,
+                                display:'flex', alignItems:'center', gap:5 }}>
+                                ⬇️ Télécharger
+                              </button>
+                            ) : exp.status==='failed' ? (
+                              <span style={{ fontSize:12, color:'#c62828' }}>Échec</span>
+                            ) : (
+                              <span style={{ fontSize:12, color:'#9eada5' }}>—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

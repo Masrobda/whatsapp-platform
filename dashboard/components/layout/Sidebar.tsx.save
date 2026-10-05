@@ -1,0 +1,94 @@
+'use client';
+
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { cn } from '@/lib/utils';
+import {
+  FiHome, FiShoppingCart, FiFileText, FiSend, FiBook, FiSettings, 
+  FiUsers, FiBarChart2, FiClipboard, FiCheckCircle, FiDollarSign, 
+  FiMessageSquare, FiUserPlus, FiRefreshCw
+} from 'react-icons/fi';
+
+interface SidebarProps {
+  userType: 'client' | 'user';
+  userRole?: string;
+}
+
+export default function Sidebar({ userType, userRole }: SidebarProps) {
+  const pathname = usePathname();
+  const role = userRole?.toLowerCase() || '';
+
+  const menuItems = [
+    { label: 'Tableau de bord', href: '/dashboard', icon: <FiHome /> },
+    { label: 'Mes commandes', href: '/dashboard/orders', icon: <FiShoppingCart /> },
+    { label: 'Mes factures', href: '/dashboard/invoices', icon: <FiFileText /> },
+    { label: 'Messages envoyés', href: '/dashboard/messages', icon: <FiSend /> },
+    { label: 'Documentation API', href: '/dashboard/documentation', icon: <FiBook /> },
+    { label: 'Testeur API', href: '/dashboard/api-tester', icon: <FiClipboard /> },
+    { label: 'Paramètres', href: '/dashboard/settings', icon: <FiSettings /> },
+    // Items restreints
+    { label: 'Gestion clients', href: '/dashboard/clients', icon: <FiUsers />, roles: ['admin', 'commercial', 'secretaire'] },
+    { label: 'Validation commandes', href: '/dashboard/orders/validation', icon: <FiCheckCircle />, roles: ['admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+    { label: 'Factures & Décaissements', href: '/dashboard/invoices/admin', icon: <FiDollarSign />, roles: ['admin', 'responsable_financier', 'responsable_achat'] },
+    { label: 'Templates WhatsApp', href: '/dashboard/templates', icon: <FiMessageSquare />, roles: ['admin', 'commercial'] },
+    { label: 'Statistiques globales', href: '/dashboard/stats', icon: <FiBarChart2 />, roles: ['admin'] },
+    { label: 'Invitations équipe', href: '/dashboard/invitations', icon: <FiUserPlus />, roles: ['admin'] },
+    { label: 'Réconciliation 360dialog', href: '/dashboard/reconciliation', icon: <FiRefreshCw />, roles: ['admin', 'responsable_financier'] },
+  ];
+
+  const filteredItems = menuItems.filter(item => {
+    if (role === 'admin') return true;
+    if (!item.roles) return true;
+    if (userType === 'client') return false;
+    return item.roles.includes(role);
+  });
+
+  return (
+    <aside className="w-64 bg-white border-r border-gray-200 min-h-screen flex flex-col shadow-sm shrink-0">
+      <div className="p-6 border-b border-gray-200 bg-gray-50/50">
+        <Link href="/dashboard" className="flex items-center gap-2 group">
+          <div className="w-10 h-10 bg-gradient-primary rounded-xl flex items-center justify-center shadow-md">
+            <span className="text-white font-black text-xl">N</span>
+          </div>
+          <div>
+            <h1 className="text-lg font-black text-dark tracking-tight">NEXT LTD</h1>
+            <p className="text-[10px] font-bold text-primary uppercase tracking-widest">Workspace</p>
+          </div>
+        </Link>
+      </div>
+
+      <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+        {filteredItems.map((item) => {
+          const isActive = pathname === item.href || (item.href !== '/dashboard' && pathname.startsWith(item.href));
+          return (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={cn(
+                'flex items-center gap-3 px-4 py-2.5 rounded-xl transition-all duration-200',
+                isActive
+                  ? 'bg-gradient-primary text-white shadow-lg'
+                  : 'text-gray-500 hover:bg-gray-50 hover:text-primary'
+              )}
+            >
+              <span className={cn('text-xl', isActive ? 'text-white' : 'text-gray-400')}>
+                {item.icon}
+              </span>
+              <span className="font-semibold text-sm">{item.label}</span>
+            </Link>
+          );
+        })}
+      </nav>
+
+      {/* Footer Role Info */}
+      <div className="p-4 border-t border-gray-100 bg-gray-50/50">
+        <div className="flex flex-col">
+          <span className="text-[10px] text-gray-400 font-bold uppercase">Rôle détecté</span>
+          <span className="text-xs font-bold text-primary">
+            {role ? role.toUpperCase() : (userType === 'client' ? 'CLIENT' : 'INCONNU')}
+          </span>
+        </div>
+      </div>
+    </aside>
+  );
+}

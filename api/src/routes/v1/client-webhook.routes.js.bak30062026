@@ -1,0 +1,301 @@
+// src/routes/v1/client-webhook.routes.js
+const { query } = require('../../config/database');
+const crypto = require('crypto');
+const axios = require('axios');
+const logger = require('../../utils/logger');
+const { authenticateJWT } = require('../../middlewares/auth.middleware');
+
+async function clientWebhookRoutes(fastify, options) {
+
+  // GET - Liste des webhooks du client
+  fastify.get('/client', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const result = await query(
+        `SELECT * FROM client_webhooks WHERE client_id = $1 ORDER BY created_at DESC`,
+        [clientId]
+      );
+      return reply.send({ success: true, webhooks: result.rows });
+    } catch (error) {
+      logger.error('Erreur récupération webhooks:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+  // POST - Créer un webhook
+  // 🔥 FIX: events est text[] en base → passer le tableau JS directement (PAS JSON.stringify)
+  fastify.post('/client', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { url, secret, events } = request.body;
+
+      if (!url) {
+        return reply.code(400).send({ success: false, message: 'URL requise' });
+      }
+
+      // Valider l'URL
+      try { new URL(url); } catch {
+        return reply.code(400).send({ success: false, message: 'URL invalide' });
+      }
+
+      const webhookSecret = secret || crypto.randomBytes(32).toString('hex');
+
+      // 🔥 FIX CRITIQUE: events est text[] → PAS JSON.stringify, passer le tableau brut
+      const eventsArray = Array.isArray(events) && events.length > 0
+        ? events
+        : ['message.delivered', 'message.read'];
+
+      const result = await query(
+        `INSERT INTO client_webhooks (client_id, url, secret, events, is_active)
+         VALUES ($1, $2, $3, $4, true)
+         RETURNING *`,
+        [clientId, url, webhookSecret, eventsArray]
+      );
+
+      logger.info(`Webhook créé pour client ${clientId}: ${url}`);
+      return reply.send({ success: true, webhook: result.rows[0] });
+    } catch (error) {
+      logger.error('Erreur création webhook:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+  // PUT - Mettre à jour un webhook
+  // 🔥 FIX: events est text[] → PAS JSON.stringify
+  fastify.put('/client/:id', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { id } = request.params;
+      const { url, secret, events, is_active } = request.body;
+
+      const updateFields = [];
+      const values = [];
+      let paramIndex = 1;
+
+      if (url !== undefined) {
+        updateFields.push(`url = $${paramIndex++}`);
+        values.push(url);
+      }
+      if (secret !== undefined && secret !== '') {
+        updateFields.push(`secret = $${paramIndex++}`);
+        values.push(secret);
+      }
+      if (events !== undefined) {
+        // 🔥 FIX CRITIQUE: text[] → passer le tableau directement
+        updateFields.push(`events = $${paramIndex++}`);
+        values.push(Array.isArray(events) ? events : ['message.delivered', 'message.read']);
+      }
+      if (is_active !== undefined) {
+        updateFields.push(`is_active = $${paramIndex++}`);
+        values.push(is_active);
+      }
+
+      if (updateFields.length === 0) {
+        return reply.code(400).send({ success: false, message: 'Aucun champ à mettre à jour' });
+      }
+
+      updateFields.push(`updated_at = NOW()`);
+
+      const result = await query(
+        `UPDATE client_webhooks 
+         SET ${updateFields.join(', ')}
+         WHERE id = $${paramIndex++} AND client_id = $${paramIndex}
+         RETURNING *`,
+        [...values, id, clientId]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({ success: false, message: 'Webhook non trouvé' });
+      }
+
+      return reply.send({ success: true, webhook: result.rows[0] });
+    } catch (error) {
+      logger.error('Erreur mise à jour webhook:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+  // DELETE - Supprimer un webhook
+  fastify.delete('/client/:id', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { id } = request.params;
+
+      const result = await query(
+        `DELETE FROM client_webhooks WHERE id = $1 AND client_id = $2 RETURNING id`,
+        [id, clientId]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({ success: false, message: 'Webhook non trouvé' });
+      }
+
+      return reply.send({ success: true });
+    } catch (error) {
+      logger.error('Erreur suppression webhook:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+  // POST - Tester un webhook
+  fastify.post('/client/:id/test', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { id } = request.params;
+
+      const result = await query(
+        `SELECT * FROM client_webhooks WHERE id = $1 AND client_id = $2`,
+        [id, clientId]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({ success: false, message: 'Webhook non trouvé' });
+      }
+
+      const webhook = result.rows[0];
+      const testPayload = {
+        event: 'message.test',
+        timestamp: new Date().toISOString(),
+        data: {
+          message: 'Ceci est un message de test depuis Numeric Export',
+          webhook_id: id,
+          client_id: clientId
+        }
+      };
+
+      const signature = crypto
+        .createHmac('sha256', webhook.secret)
+        .update(JSON.stringify(testPayload))
+        .digest('hex');
+
+      const startTime = Date.now();
+      try {
+        const response = await axios.post(webhook.url, testPayload, {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Webhook-Signature': signature
+          },
+          timeout: 10000
+        });
+        const duration = Date.now() - startTime;
+
+        await query(
+          `INSERT INTO webhook_logs (webhook_id, event, payload, response_status, duration_ms, created_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())`,
+          [id, 'message.test', JSON.stringify(testPayload), response.status, duration]
+        ).catch(() => {});
+
+        return reply.send({
+          success: response.status >= 200 && response.status < 300,
+          status: response.status,
+          duration,
+          message: `Webhook testé avec succès (HTTP ${response.status})`
+        });
+      } catch (err) {
+        const duration = Date.now() - startTime;
+
+        await query(
+          `INSERT INTO webhook_logs (webhook_id, event, payload, response_status, response_body, duration_ms, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+          [id, 'message.test', JSON.stringify(testPayload), err.response?.status || 0, err.message, duration]
+        ).catch(() => {});
+
+        return reply.send({
+          success: false,
+          status: err.response?.status || 0,
+          duration,
+          message: err.code === 'ECONNREFUSED'
+            ? 'Connexion refusée — votre endpoint est-il en ligne ?'
+            : err.message
+        });
+      }
+    } catch (error) {
+      logger.error('Erreur test webhook:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+  //**  GET - Logs des webhooks du client
+  fastify.get('/client/logs', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { page = 1, limit = 20 } = request.query;
+      const offset = (parseInt(page) - 1) * parseInt(limit);
+
+      const webhooksResult = await query(
+        `SELECT id FROM client_webhooks WHERE client_id = $1`,
+        [clientId]
+      );
+      const webhookIds = webhooksResult.rows.map(w => w.id);
+
+      if (webhookIds.length === 0) {
+        return reply.send({ success: true, logs: [], total: 0 });
+      }
+
+      const [totalResult, logsResult] = await Promise.all([
+        query(`SELECT COUNT(*) FROM webhook_logs WHERE webhook_id = ANY($1)`, [webhookIds]),
+        query(
+          `SELECT l.*, w.url 
+           FROM webhook_logs l
+           JOIN client_webhooks w ON w.id = l.webhook_id
+           WHERE l.webhook_id = ANY($1)
+           ORDER BY l.created_at DESC
+           LIMIT $2 OFFSET $3`,
+          [webhookIds, parseInt(limit), offset]
+        )
+      ]);
+
+      return reply.send({
+        success: true,
+        logs: logsResult.rows,
+        total: parseInt(totalResult.rows[0].count)
+      });
+    } catch (error) {
+      logger.error('Erreur récupération logs:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+
+    // GET - Statistiques des logs webhook
+  fastify.get('/client/logs/stats', { preHandler: [authenticateJWT] }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+
+      // Récupérer les IDs des webhooks du client
+      const webhooksResult = await query(
+        `SELECT id FROM client_webhooks WHERE client_id = $1`,
+        [clientId]
+      );
+      const webhookIds = webhooksResult.rows.map(w => w.id);
+
+      if (webhookIds.length === 0) {
+        return reply.send({ success: true, total: 0, by_event: {} });
+      }
+
+      const result = await query(
+        `SELECT
+           COUNT(*) as total,
+           jsonb_object_agg(event, count) as by_event
+         FROM (
+           SELECT event, COUNT(*)
+           FROM webhook_logs
+           WHERE webhook_id = ANY($1)
+           GROUP BY event
+         ) sub`,
+        [webhookIds]
+      );
+
+      return reply.send({
+        success: true,
+        total: parseInt(result.rows[0]?.total || 0),
+        by_event: result.rows[0]?.by_event || {}
+      });
+    } catch (error) {
+      logger.error('Erreur statistiques logs:', error);
+      return reply.code(500).send({ success: false, message: error.message });
+    }
+  });
+*/
+}
+
+module.exports = clientWebhookRoutes;

@@ -1,0 +1,31 @@
+// lib/api/message-stock.ts
+
+// Importe apiClient depuis le fichier principal api.ts
+import apiClient from '@/lib/api';
+
+export const messageStock = {
+  getStock: () => apiClient.get('/message-stock'),
+
+  purchase: (data: {
+    bsp_id: string;
+    messages_count: number;
+    unit_cost: number;
+    total_cost?: number;
+    reference?: string;
+    notes?: string;
+  }) => apiClient.post('/message-stock/purchase', data),
+
+  getHistory: (params?: {
+    page?: number;
+    limit?: number;
+    type?: 'purchase' | 'consumption';
+    bsp_id?: string;
+    start_date?: string;
+    end_date?: string;
+  }) => apiClient.get('/message-stock/history', { params }),
+
+  getStats: () => apiClient.get('/message-stock/stats'),
+
+  checkAvailability: (required?: number) =>
+    apiClient.get('/message-stock/check', { params: { required } })
+};

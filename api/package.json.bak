@@ -1,0 +1,61 @@
+{
+  "name": "nextltd-api",
+  "version": "1.0.0",
+  "description": "NEXT LTD WhatsApp Business API Gateway",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "worker": "node src/workers/start.js",
+    "worker:dev": "nodemon src/workers/start.js",
+    "migrate": "node src/database/migrate.js",
+    "seed": "node src/database/seed.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "api",
+    "gateway"
+  ],
+  "author": "NEXT LTD",
+  "license": "PROPRIETARY",
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/multipart": "^9.4.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/static": "^9.0.0",
+    "@fastify/websocket": "^11.2.0",
+    "@prelude.so/sdk": "^0.10.0",
+    "axios": "^1.6.2",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.1.0",
+    "csv-parse": "^6.2.1",
+    "diskusage": "^1.2.0",
+    "dotenv": "^16.3.1",
+    "fastify": "^5.7.2",
+    "fastify-multer": "^2.0.3",
+    "fastify-plugin": "^5.1.0",
+    "fs-extra": "^11.3.3",
+    "html-pdf": "^3.0.1",
+    "ioredis": "^5.3.2",
+    "joi": "^17.11.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^7.0.13",
+    "pdf-lib": "^1.17.1",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.11.3",
+    "puppeteer": "^21.11.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.3",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

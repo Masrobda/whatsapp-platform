@@ -1,0 +1,324 @@
+  const topAgents = await fetchTopAgents(10);
+  const topPartenaires = await fetchTopPartenaires(10);
+
+  log('région…');
+  const byRegion = await safeBreakdown('region');
+  log('division…');
+  const byDivision = await safeBreakdown('division');
+  log('mrc…');
+  const byMrc = await safeBreakdown('mrc');
+  log('agence…');
+  const byAgence = await safeBreakdown('agence');
+
+  log(`terminé en ${Date.now() - t0}ms`);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    bounds,
+    global,
+    byRegion,
+    byDivision,
+    byMrc,
+    byAgence,
+    trend,
+    topAgents,
+    topPartenaires,
+  };
+}
+
+function buildReportHtml(data) {
+  const g = data.global;
+  const dateLabel = new Date(data.bounds.today).toLocaleDateString('fr-FR', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+
+  const th = `style="padding:6px 8px;border:1px solid #d0d7de;background:#f3f4f6;font-size:10px;text-align:left;color:#1f2937;font-family:Segoe UI,Arial,sans-serif;white-space:nowrap;"`;
+  const td = `style="padding:6px 8px;border:1px solid #e5e7eb;font-size:11px;color:#111827;font-family:Segoe UI,Arial,sans-serif;"`;
+  const tdR = `style="padding:6px 8px;border:1px solid #e5e7eb;font-size:11px;color:#111827;text-align:right;font-family:Segoe UI,Arial,sans-serif;"`;
+  const tdBold = `style="padding:6px 8px;border:1px solid #e5e7eb;font-size:11px;font-weight:700;background:#f3f4f6;font-family:Segoe UI,Arial,sans-serif;"`;
+  const tdRBold = `style="padding:6px 8px;border:1px solid #e5e7eb;font-size:11px;font-weight:700;text-align:right;background:#f3f4f6;font-family:Segoe UI,Arial,sans-serif;"`;
+
+  function kpiCard(label, value, sub) {
+    return `
+      <td width="25%" valign="top" style="padding:5px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e5e7eb;background:#fff;">
+          <tr><td style="padding:10px 12px;font-family:Segoe UI,Arial,sans-serif;">
+            <div style="font-size:10px;color:#6b7280;text-transform:uppercase;">${label}</div>
+            <div style="font-size:20px;font-weight:700;color:#111827;margin-top:3px;">${value}</div>
+            ${sub ? `<div style="font-size:10px;color:#6b7280;margin-top:2px;">${sub}</div>` : ''}
+          </td></tr>
+        </table>
+      </td>`;
+  }
+
+  function kpiRow(cards) {
+    // cards: array of [label, value, sub?]
+    let html = '';
+    for (let i = 0; i < cards.length; i += 4) {
+      const slice = cards.slice(i, i + 4);
+      while (slice.length < 4) slice.push(null);
+      html += `<tr><td style="padding:0 14px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        ${slice.map((c) => (c ? kpiCard(c[0], c[1], c[2]) : '<td width="25%"></td>')).join('')}
+      </tr></table></td></tr>`;
+    }
+    return html;
+  }
+
+  function breakdownTable(title, rows) {
+    if (!rows?.length) return '';
+
+    const sum = rows.reduce(
+      (a, r) => ({
+        total: a.total + r.total,
+        collectes: a.collectes + r.collectes,
+        checked: a.checked + r.checked,
+        whatsapp_ok: a.whatsapp_ok + r.whatsapp_ok,
+        sms: a.sms + r.sms,
+        abonne_digital: a.abonne_digital + r.abonne_digital,
+      }),
+      { total: 0, collectes: 0, checked: 0, whatsapp_ok: 0, sms: 0, abonne_digital: 0 }
+    );
+
+    const body = rows
+      .map(
+        (r) => `
+      <tr>
+        <td ${tdR}>${r.rang}</td>
+        <td ${td}>${r.label}</td>
+        <td ${tdR}>${fmt(r.total)}</td>
+        <td ${tdR}>${fmt(r.collectes)}</td>
+        <td ${tdR}>${fmt(r.abonne_digital)}</td>
+        <td ${tdR}>${fmt(r.whatsapp_ok)}</td>
+        <td ${tdR}>${fmt(r.sms)}</td>
+        <td ${tdR}>${fmtPct(r.taux_collecte)}</td>
+        <td ${tdR}>${fmtPct(r.taux_abonne_digital)}</td>
+        <td ${tdR}>${fmtPct(r.taux_whatsapp)}</td>
+        <td ${tdR}>${fmtPct(r.taux_sms)}</td>
+        <td ${tdR}>${fmt(r.montant)}</td>
+      </tr>`
+      )
+      .join('');
+
+    const footer = `
+      <tr>
+        <td ${tdBold}></td>
+        <td ${tdBold}>TOTAL</td>
+        <td ${tdRBold}>${fmt(sum.total)}</td>
+        <td ${tdRBold}>${fmt(sum.collectes)}</td>
+        <td ${tdRBold}>${fmt(sum.abonne_digital)}</td>
+        <td ${tdRBold}>${fmt(sum.whatsapp_ok)}</td>
+        <td ${tdRBold}>${fmt(sum.sms)}</td>
+        <td ${tdRBold}>${fmtPct(pct(sum.checked, sum.total))}</td>
+        <td ${tdRBold}>${fmtPct(pct(sum.abonne_digital, sum.collectes))}</td>
+        <td ${tdRBold}>${fmtPct(pct(sum.whatsapp_ok, sum.collectes))}</td>
+        <td ${tdRBold}>${fmtPct(pct(sum.sms, sum.collectes))}</td>
+        <td ${tdRBold}>${fmt(sum.abonne_digital * WHATSAPP_UNIT_VALUE)}</td>
+      </tr>`;
+
+    return `
+    <h2 style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111827;margin:24px 0 8px 0;border-bottom:2px solid #1a6fb5;padding-bottom:5px;">${title}</h2>
+    <p style="font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#6b7280;margin:0 0 6px 0;">Classement par taux abonné digital</p>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+      <thead>
+        <tr>
+          <th ${th}>Rang</th>
+          <th ${th}>Libellé</th>
+          <th ${th}>Total à migrer</th>
+          <th ${th}>N° collectés</th>
+          <th ${th}>Abonné digital</th>
+          <th ${th}>WhatsApp OK</th>
+          <th ${th}>SMS</th>
+          <th ${th}>Taux collecte</th>
+          <th ${th}>Taux ab. digital</th>
+          <th ${th}>Taux WhatsApp</th>
+          <th ${th}>Taux SMS</th>
+          <th ${th}>Montant</th>
+        </tr>
+      </thead>
+      <tbody>${body}${footer}</tbody>
+    </table>`;
+  }
+
+  function topTable(title, rows, isAgent) {
+    if (!rows?.length) return '';
+    const body = rows
+      .map(
+        (r, i) => `
+      <tr>
+        <td ${tdR}>${i + 1}</td>
+        <td ${td}>${r.nom || '—'}</td>
+        <td ${td}>${isAgent ? r.matricule || '—' : r.phone || '—'}</td>
+        <td ${td}>${isAgent ? r.email || '—' : r.entreprise || '—'}</td>
+        <td ${tdR}>${fmt(r.checked)}</td>
+        <td ${tdR}>${fmt(r.abonne)}</td>
+      </tr>`
+      )
+      .join('');
+    return `
+    <h2 style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111827;margin:24px 0 8px 0;border-bottom:2px solid #1a6fb5;padding-bottom:5px;">${title}</h2>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+      <thead>
+        <tr>
+          <th ${th}>#</th>
+          <th ${th}>Nom</th>
+          <th ${th}>${isAgent ? 'Matricule' : 'Téléphone'}</th>
+          <th ${th}>${isAgent ? 'Email' : 'Entreprise'}</th>
+          <th ${th}>N° Checker</th>
+          <th ${th}>WhatsApp OK</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+    </table>`;
+  }
+
+  // Suivi 30 j — jours en colonnes (horizontal)
+  const trend = data.trend || [];
+  const dayHeaders = trend
+    .map((t) => {
+      const d = new Date(t.jour);
+      return `<th ${th}>${d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' })}</th>`;
+    })
+    .join('');
+  const rowChecked = trend.map((t) => `<td ${tdR}>${fmt(t.checked)}</td>`).join('');
+  const rowAbonne = trend.map((t) => `<td ${tdR}>${fmt(t.abonne)}</td>`).join('');
+
+  const cards = [
+    ['Total à migrer', fmt(g.total)],
+    ['N° collectés', fmt(g.collectes)],
+    ['Abonné digital', fmt(g.abonne_digital), `WA ${fmt(g.whatsapp_ok)} + SMS ${fmt(g.sms)}`],
+    ['N° WhatsApp OK', fmt(g.whatsapp_ok)],
+    ['SMS', fmt(g.sms)],
+    ['Taux collecte', fmtPct(g.taux_collecte)],
+    ['Taux abonné digital', fmtPct(g.taux_abonne_digital), 'Ab. digital / collectés'],
+    ['Taux WhatsApp', fmtPct(g.taux_whatsapp), 'WA OK / collectés'],
+    ['Taux SMS', fmtPct(g.taux_sms), 'SMS / collectés'],
+    ['En attente Meta', fmt(g.en_attente_meta)],
+    ['Non délivrées', fmt(g.non_delivrees)],
+    ['Montant', fmt(g.montant), `Ab. digital × ${WHATSAPP_UNIT_VALUE}`],
+    [
+      'Itinéraires',
+      fmt(g.n_itineraires),
+      `≥95 % : ${fmt(g.iti_ge_95)} · <95 % : ${fmt(g.iti_lt_95)}`,
+    ],
+  ];
+
+  return `<!DOCTYPE html>
+<html lang="fr"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<title>Rapport Collecte WhatsApp — ${dateLabel}</title>
+<!--[if mso]><style>table{border-collapse:collapse;}td,th{font-family:Arial,sans-serif;}</style><![endif]-->
+</head>
+<body style="margin:0;padding:0;background:#f8fafc;">
+<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;">
+<tr><td align="center" style="padding:20px 8px;">
+<table width="900" cellpadding="0" cellspacing="0" border="0" style="width:900px;max-width:900px;background:#ffffff;border:1px solid #e5e7eb;">
+<tr><td style="padding:18px 22px;border-bottom:3px solid #1a6fb5;font-family:Segoe UI,Arial,sans-serif;">
+  <div style="font-size:11px;color:#6b7280;">SOCADEL · COLLECTE WHATSAPP</div>
+  <div style="font-size:18px;font-weight:700;color:#111827;margin-top:4px;">Rapport journalier</div>
+  <div style="font-size:12px;color:#4b5563;margin-top:3px;">${dateLabel}</div>
+</td></tr>
+
+${kpiRow(cards)}
+
+<tr><td style="padding:12px 22px 22px 22px;">
+  <h2 style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111827;margin:8px 0 8px 0;border-bottom:2px solid #1a6fb5;padding-bottom:5px;">
+    Suivi journalier (30 jours)
+  </h2>
+  <p style="font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#6b7280;margin:0 0 6px 0;">
+    Collectes (check) et abonnés WhatsApp par jour
+  </p>
+  <div style="overflow-x:auto;">
+  <table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;min-width:100%;">
+    <thead>
+      <tr>
+        <th ${th}>Indicateur</th>
+        ${dayHeaders}
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td ${tdBold}>Collectes</td>
+        ${rowChecked}
+      </tr>
+      <tr>
+        <td ${tdBold}>Abonnés WA</td>
+        ${rowAbonne}
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  ${breakdownTable('Par région', data.byRegion)}
+  ${breakdownTable('Par division', data.byDivision)}
+  ${breakdownTable('Par MRC', data.byMrc)}
+  ${breakdownTable('Par agence', data.byAgence)}
+  ${topTable('Top 10 agents Socadel', data.topAgents, true)}
+  ${topTable('Top 10 partenaires terrain', data.topPartenaires, false)}
+
+  <p style="font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#9ca3af;margin:28px 0 0 0;border-top:1px solid #e5e7eb;padding-top:10px;">
+    Rapport auto · ${new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Douala' })} (Douala).
+    Abonné digital = WhatsApp OK + SMS · Montant = Abonné digital × ${WHATSAPP_UNIT_VALUE}.
+    Qualité itinéraires (≥95 %) : global uniquement.
+  </p>
+</td></tr>
+</table></td></tr></table>
+</body></html>`;
+}
+
+async function sendDailyReportEmail({ to, cc } = {}) {
+  const fs = require('fs');
+  const recipients =
+    to ||
+    process.env.SOCADEL_REPORT_EMAIL_TO ||
+    process.env.REPORT_EMAIL_TO ||
+    'patrick.tondjou@camlight.cm';
+
+  logger.info('[SOCADEL-REPORT] buildReportData…');
+  const data = await buildReportData();
+  logger.info('[SOCADEL-REPORT] buildReportData OK');
+
+  logger.info('[SOCADEL-REPORT] buildReportHtml…');
+  const html = buildReportHtml(data);
+  logger.info(`[SOCADEL-REPORT] HTML length=${html.length}`);
+
+  const outPath = '/tmp/socadel-report.html';
+  fs.writeFileSync(outPath, html, 'utf8');
+  logger.info(`[SOCADEL-REPORT] HTML écrit: ${outPath}`);
+
+  const subject = `Socadel — Rapport collecte WhatsApp — ${data.bounds.today}`;
+  const text =
+    `Rapport ${data.bounds.today}\n` +
+    `Total ${data.global.total}\n` +
+    `Collectés ${data.global.collectes}\n` +
+    `Ab. digital ${data.global.abonne_digital}\n` +
+    `Montant ${data.global.montant}`;
+
+  const emailService = require('./email.service');
+  const from =
+    process.env.EMAIL_FROM ||
+    process.env.SMTP_FROM ||
+    process.env.SMTP_USER;
+
+  logger.info(`[SOCADEL-REPORT] Envoi email → ${recipients}`);
+  const info = await emailService.transporter.sendMail({
+    from,
+    to: recipients,
+    cc: cc || process.env.SOCADEL_REPORT_EMAIL_CC || undefined,
+    subject,
+    html,
+    text,
+  });
+  logger.info(`[SOCADEL-REPORT] Email OK id=${info.messageId}`);
+
+  return { success: true, to: recipients, date: data.bounds.today, messageId: info.messageId };
+}
+
+module.exports = {
+  buildReportData,
+  buildReportHtml,
+  sendDailyReportEmail,
+  WHATSAPP_UNIT_VALUE,
+};

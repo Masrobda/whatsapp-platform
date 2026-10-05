@@ -1,0 +1,179 @@
+const {
+  getProfileHandler,
+  updateProfileHandler,
+  getCredentialsHandler,
+  getDashboardHandler,
+  getAllClientsHandler,
+  updatePricingHandler,
+  rechargeQuotaHandler,
+} = require('../../controllers/client.controller');
+
+const { authenticateJWT } = require('../../middlewares/auth.middleware');
+const { requireRole, requireClient, ROLES } = require('../../middlewares/role.middleware');
+
+/**
+ * Routes de gestion des clients
+ */
+async function clientRoutes(fastify, options) {
+
+  // ============================================
+  // ROUTES CLIENT
+  // ============================================
+
+  // Récupérer le profil
+  fastify.get('/profile', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer le profil du client',
+      tags: ['Client'],
+      security: [{ bearerAuth: [] }]
+    }
+  }, getProfileHandler);
+
+  // Mettre à jour le profil
+  fastify.put('/profile', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Mettre à jour le profil',
+      tags: ['Client'],
+      security: [{ bearerAuth: [] }],
+      body: {
+        type: 'object',
+        properties: {
+          company_name: { type: 'string' },
+          phone: { type: 'string' },
+          address: { type: 'string' },
+          city: { type: 'string' },
+          country: { type: 'string' },
+          tax_id: { type: 'string' }
+        }
+      }
+    }
+  }, updateProfileHandler);
+
+  // Récupérer les credentials API
+  fastify.get('/credentials', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer les identifiants API (Token & Instance)',
+      tags: ['Client'],
+      security: [{ bearerAuth: [] }]
+    }
+  }, getCredentialsHandler);
+
+  // Récupérer le dashboard
+  fastify.get('/dashboard', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer le résumé du dashboard',
+      tags: ['Client'],
+      security: [{ bearerAuth: [] }]
+    }
+  }, getDashboardHandler);
+
+  // ============================================
+  // ROUTES ADMIN
+  // ============================================
+
+  // Récupérer tous les clients
+  fastify.get('/all', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Récupérer tous les clients (Admin)',
+      tags: ['Client - Admin'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          page: { type: 'integer', default: 1 },
+          limit: { type: 'integer', default: 10 },
+          search: { type: 'string' },
+          is_active: { type: 'boolean' }
+        }
+      }
+    }
+  }, getAllClientsHandler);
+
+  // Mettre à jour le tarif d'un client
+  fastify.put('/:id/pricing', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.FINANCIAL_MANAGER)],
+    schema: {
+      description: 'Mettre à jour le tarif d\'un client',
+      tags: ['Client - Admin'],
+      security: [{ bearerAuth: [] }],
+      params: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' }
+        }
+      },
+      body: {
+        type: 'object',
+        required: ['message_cost'],
+        properties: {
+          message_cost: { type: 'number', minimum: 0 }
+        }
+      }
+    }
+  }, updatePricingHandler);
+
+  // Recharger le quota manuellement
+  fastify.post('/:id/recharge', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Recharger manuellement le quota d\'un client',
+      tags: ['Client - Admin'],
+      security: [{ bearerAuth: [] }],
+      params: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' }
+        }
+      },
+      body: {
+        type: 'object',
+        required: ['quantity'],
+        properties: {
+          quantity: { type: 'integer', minimum: 1 },
+          notes: { type: 'string' }
+        }
+      }
+    }
+  }, rechargeQuotaHandler);
+
+// GET /api/v1/client/whatsapp-performance
+fastify.get('/whatsapp-performance', {
+  preHandler: [authenticateJWT],
+}, async (request, reply) => {
+  try {
+    const clientId = request.user.id;
+
+    const numbers = await query(
+      `SELECT 
+         wn.phone_number, wn.display_name, wn.client_id,
+         wn.quality_rating, wn.tier_current,
+         wn.messages_sent_24h, wn.daily_conversation_limit,
+         COUNT(m.id) FILTER (WHERE m.wa_status = 'sent') as total_sent,
+         COUNT(m.id) FILTER (WHERE m.wa_status = 'failed') as total_failed
+       FROM whatsapp_numbers wn
+       LEFT JOIN messages m ON m.client_id = wn.client_id 
+                           AND m.created_at >= NOW() - INTERVAL '30 days'
+       WHERE wn.client_id = $1 OR wn.client_id IS NULL  -- numéros du client ou partagés
+       GROUP BY wn.id
+       ORDER BY wn.phone_number`,
+      [clientId]
+    );
+
+    return reply.send({
+      success: true,
+      performance: numbers.rows
+    });
+  } catch (err) {
+    logger.error('Erreur dashboard whatsapp perf', err);
+    return reply.code(500).send({ success: false, message: 'Erreur serveur' });
+  }
+});
+
+}
+
+module.exports = clientRoutes;

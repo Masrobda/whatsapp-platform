@@ -1,0 +1,244 @@
+// src/services/queue.service.js - VERSION FINALE COMPLÈTE ET COHÉRENTE
+const { Queue } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const queues = new Map(); // normalized phone → Queue
+
+function normalizePhone(phone) {
+  return phone.replace(/[^0-9]/g, '');
+}
+
+function getQueue(phoneNumber) {
+  if (!phoneNumber) throw new Error('phoneNumber requis');
+  const norm = normalizePhone(phoneNumber);
+  const name = `whatsapp-messages-${norm}`;
+
+  if (!queues.has(norm)) {
+    const q = new Queue(name, {
+      connection: redisConnection,
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: { age: 3600, count: 1000 },
+        removeOnFail: { age: 86400, count: 2000 },
+      }
+    });
+    queues.set(norm, q);
+    logger.info(`Queue créée : ${name}`);
+  }
+
+  return queues.get(norm);
+}
+
+/**
+ * Ajoute un message dans la queue du numéro émetteur
+ */
+async function addMessageToQueue({ phoneNumber, messageId, ...data }) {
+  if (!phoneNumber || !messageId) throw new Error('phoneNumber + messageId requis');
+  const queue = getQueue(phoneNumber);
+  const job = await queue.add('send-message', { ...data, phoneNumber, messageId }, {
+    jobId: messageId
+  });
+  logger.debug('Job ajouté', { jobId: job.id, queue: queue.name, phone: phoneNumber });
+  return { success: true, jobId: job.id, queueName: queue.name };
+}
+
+/**
+ * Stats simples pour UN numéro
+ */
+async function getStatsForNumber(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const [waiting, active, failed] = await Promise.all([
+      queue.getWaitingCount(),
+      queue.getActiveCount(),
+      queue.getFailedCount()
+    ]);
+    return {
+      phone: phoneNumber,
+      waiting,
+      active,
+      failed,
+      total: waiting + active + failed
+    };
+  } catch (err) {
+    logger.error(`Erreur stats pour ${phoneNumber}`, err);
+    return { phone: phoneNumber, error: err.message };
+  }
+}
+
+/**
+ * Stats pour TOUS les numéros actifs
+ */
+async function getAllStats() {
+  try {
+    const res = await query(
+      'SELECT phone_number FROM whatsapp_numbers WHERE is_active = true'
+    );
+    const stats = [];
+    for (const { phone_number } of res.rows) {
+      stats.push(await getStatsForNumber(phone_number));
+    }
+    return stats;
+  } catch (err) {
+    logger.error('Erreur getAllStats', err);
+    throw err;
+  }
+}
+
+/**
+ * Pause la queue d’un numéro spécifique
+ */
+async function pauseQueueForNumber(phoneNumber) {
+  const queue = getQueue(phoneNumber);
+  await queue.pause();
+  logger.info(`Queue ${queue.name} mise en pause`);
+  return { success: true, message: `Queue pour ${phoneNumber} mise en pause` };
+}
+
+/**
+ * Reprend la queue d’un numéro spécifique
+ */
+async function resumeQueueForNumber(phoneNumber) {
+  const queue = getQueue(phoneNumber);
+  await queue.resume();
+  logger.info(`Queue ${queue.name} reprise`);
+  return { success: true, message: `Queue pour ${phoneNumber} reprise` };
+}
+
+/**
+ * Réessaye TOUS les jobs échoués pour un numéro donné
+ * @returns {Promise<number>} Nombre de jobs relancés
+ */
+async function retryAllFailedForPhone(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const failedJobs = await queue.getFailed(0, -1); // -1 = tous
+
+    let count = 0;
+    for (const job of failedJobs) {
+      await job.retry();
+      count++;
+    }
+
+    logger.info(`[RETRY-ALL] ${count} jobs relancés pour ${phoneNumber}`);
+    return count;
+  } catch (err) {
+    logger.error(`Erreur retryAllFailedForPhone ${phoneNumber}:`, err);
+    throw err;
+  }
+}
+
+/**
+ * Supprime TOUS les jobs échoués pour un numéro donné
+ * @returns {Promise<number>} Nombre de jobs supprimés
+ */
+async function clearFailedForPhone(phoneNumber) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const cleaned = await queue.clean(0, 0, 'failed'); // Nettoie tous les failed
+    const count = cleaned.length;
+
+    logger.info(`[CLEAR-FAILED] ${count} jobs supprimés pour ${phoneNumber}`);
+    return count;
+  } catch (err) {
+    logger.error(`Erreur clearFailedForPhone ${phoneNumber}:`, err);
+    throw err;
+  }
+}
+
+/**
+ * Vérifie si un numéro existe dans whatsapp_numbers
+ */
+async function numberExists(phoneNumber) {
+  try {
+    const res = await query(
+      'SELECT 1 FROM whatsapp_numbers WHERE phone_number = $1 AND is_active = true',
+      [phoneNumber]
+    );
+    return res.rowCount > 0;
+  } catch (err) {
+    logger.error(`Erreur numberExists ${phoneNumber}:`, err);
+    return false;
+  }
+}
+
+/**
+ * Récupérer toutes les queues actives
+ */
+async function getAllQueues() {
+  try {
+    const res = await query(
+      'SELECT phone_number FROM whatsapp_numbers WHERE is_active = true'
+    );
+    const queueList = [];
+    for (const { phone_number } of res.rows) {
+      try {
+        const queue = getQueue(phone_number);
+        queueList.push(queue);
+      } catch (err) {
+        logger.error(`Erreur récupération queue ${phone_number}:`, err);
+      }
+    }
+    return queueList;
+  } catch (err) {
+    logger.error('Erreur getAllQueues:', err);
+    return [];
+  }
+}
+
+/**
+ * Récupérer les jobs actifs pour un numéro
+ */
+async function getActiveJobsForNumber(phoneNumber, limit = 10) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const jobs = await queue.getJobs(['active'], 0, limit);
+    return jobs.map(job => ({
+      id: job.id,
+      data: job.data,
+      timestamp: job.timestamp,
+      attemptsMade: job.attemptsMade
+    }));
+  } catch (err) {
+    logger.error(`Erreur getActiveJobsForNumber ${phoneNumber}:`, err);
+    return [];
+  }
+}
+
+/**
+ * Récupérer les jobs échoués pour un numéro
+ */
+async function getFailedJobsForNumber(phoneNumber, limit = 10) {
+  try {
+    const queue = getQueue(phoneNumber);
+    const jobs = await queue.getJobs(['failed'], 0, limit);
+    return jobs.map(job => ({
+      id: job.id,
+      data: job.data,
+      timestamp: job.timestamp,
+      failedReason: job.failedReason,
+      attemptsMade: job.attemptsMade
+    }));
+  } catch (err) {
+    logger.error(`Erreur getFailedJobsForNumber ${phoneNumber}:`, err);
+    return [];
+  }
+}
+
+module.exports = {
+  getQueue,
+  addMessageToQueue,
+  getStatsForNumber,
+  getAllStats,
+  pauseQueueForNumber,
+  resumeQueueForNumber,
+  retryAllFailedForPhone,
+  clearFailedForPhone,
+  numberExists,
+  getAllQueues,
+  getActiveJobsForNumber,
+  getFailedJobsForNumber
+};

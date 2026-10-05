@@ -1,0 +1,58 @@
+'use strict';
+
+const logger = require('../utils/logger');
+const {
+  sendDailyReportEmail,
+  buildReportData,
+  buildReportHtml,
+} = require('../services/socadel-daily-report.service');
+const fs = require('fs');
+
+const HOUR_UTC = parseInt(process.env.SOCADEL_REPORT_HOUR_UTC || '6', 10);
+
+async function runOnce() {
+  logger.info('[SOCADEL-REPORT] Début génération…');
+  const result = await sendDailyReportEmail();
+  logger.info('[SOCADEL-REPORT] Terminé OK ' + JSON.stringify(result));
+  return result;
+}
+
+async function runDry() {
+  logger.info('[SOCADEL-REPORT] Mode DRY');
+  const data = await buildReportData();
+  const html = buildReportHtml(data);
+  fs.writeFileSync('/tmp/socadel-report.html', html, 'utf8');
+  logger.info(
+    `[SOCADEL-REPORT] HTML /tmp/socadel-report.html bytes=${html.length} total=${data.global.total}`
+  );
+}
+
+if (process.env.REPORT_RUN_NOW === '1') {
+  const job = process.env.REPORT_DRY === '1' ? runDry : runOnce;
+  job()
+  .then((r) => {
+    console.error('[SOCADEL-REPORT] OK ' + JSON.stringify(r));
+    process.exitCode = 0;
+  })
+  .catch((err) => {
+    logger.error('[SOCADEL-REPORT] ÉCHEC: ' + (err && err.message));
+    console.error(err);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    // 3s max pour flush winston + fermer SMTP + PG, puis exit
+    setTimeout(() => process.exit(process.exitCode ?? 0), 3000).unref();
+  });
+
+} else {
+  setInterval(async () => {
+    const now = new Date();
+    if (now.getUTCHours() !== HOUR_UTC || now.getUTCMinutes() > 5) return;
+    try {
+      await runOnce();
+    } catch (err) {
+      logger.error('[SOCADEL-REPORT] Échec cron: ' + err.message);
+    }
+  }, 60 * 1000);
+  logger.info('[SOCADEL-REPORT] Cron démarré UTC hour=' + HOUR_UTC);
+}

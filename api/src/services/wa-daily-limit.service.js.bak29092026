@@ -1,0 +1,130 @@
+// api/src/services/wa-daily-limit.service.js
+'use strict';
+
+const { redis } = require('../config/redis');
+const logger = require('../utils/logger');
+
+/**
+ * Limites journalières par numéro (succès réservés atomiquement).
+ * Format env :
+ *   WA_DAILY_LIMITS=+237688356291:9000,+237688359040:5000
+ *   ou WA_DAILY_LIMIT_+237688356291=9000
+ *
+ * Timezone compteur : Africa/Douala (jour calendaire Cameroun)
+ */
+function getLimitForPhone(phone) {
+  const n = normalize(phone);
+  if (!n) return null;
+
+  const map = process.env.WA_DAILY_LIMITS || '';
+  for (const part of map.split(',')) {
+    const [p, lim] = part.split(':').map((s) => s.trim());
+    if (p && normalize(p) === n) {
+      const v = parseInt(lim, 10);
+      return Number.isFinite(v) && v > 0 ? v : null;
+    }
+  }
+
+  const single = process.env[`WA_DAILY_LIMIT_${n}`] || process.env[`WA_DAILY_LIMIT_${n.replace('+', '')}`];
+  if (single) {
+    const v = parseInt(single, 10);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+
+  // défaut pour le canal factures Socadel
+  const defPhone = normalize(
+    process.env.SOCADEL_QUICK_REGISTER_INVOICE_NUMBER || '+237688356291'
+  );
+  if (n === defPhone) {
+    const v = parseInt(process.env.SOCADEL_INVOICE_DAILY_LIMIT || '9000', 10);
+    return Number.isFinite(v) && v > 0 ? v : 9000;
+  }
+
+  return null; // pas de limite
+}
+
+function normalize(phone) {
+  if (!phone) return '';
+  let d = String(phone).replace(/\D/g, '');
+  if (d.startsWith('237') && d.length >= 12) return `+${d}`;
+  if (d.length === 9) return `+237${d}`;
+  if (String(phone).startsWith('+')) return `+${d}`;
+  return d ? `+${d}` : '';
+}
+
+/** YYYY-MM-DD en Africa/Douala */
+function todayKeyDouala() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Douala',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+function cacheKey(phone) {
+  return `wa:daily_ok:${normalize(phone)}:${todayKeyDouala()}`;
+}
+
+/** Secondes jusqu'à ~02:00 Douala le lendemain (marge) */
+function ttlSeconds() {
+  // 36h max — simple et sûr
+  return 36 * 3600;
+}
+
+/**
+ * Réserve 1 envoi sur le quota du jour (INCR atomique).
+ * @returns {{ ok: true, used: number, limit: number } | { ok: false, reason: 'LIMIT_REACHED', used, limit }}
+ */
+async function tryReserveDailySlot(phone) {
+  const limit = getLimitForPhone(phone);
+  if (limit == null) return { ok: true, used: 0, limit: null, unlimited: true };
+
+  const key = cacheKey(phone);
+  try {
+    const used = await redis.incr(key);
+    if (used === 1) {
+      await redis.expire(key, ttlSeconds());
+    }
+    if (used > limit) {
+      await redis.decr(key);
+      return { ok: false, reason: 'LIMIT_REACHED', used: limit, limit };
+    }
+    return { ok: true, used, limit };
+  } catch (err) {
+    // Redis down → on laisse passer (ne bloque pas la prod)
+    logger.warn(`[WA-DAILY-LIMIT] Redis indisponible, skip limit: ${err.message}`);
+    return { ok: true, used: 0, limit, degraded: true };
+  }
+}
+
+/** Rembourse 1 slot si l'envoi a échoué après réservation */
+async function releaseDailySlot(phone) {
+  const limit = getLimitForPhone(phone);
+  if (limit == null) return;
+  try {
+    const key = cacheKey(phone);
+    const v = await redis.decr(key);
+    if (v < 0) await redis.set(key, '0', 'EX', ttlSeconds());
+  } catch (_) {}
+}
+
+/** Lecture seule (dashboard / logs) */
+async function getDailyUsage(phone) {
+  const limit = getLimitForPhone(phone);
+  if (limit == null) return { used: 0, limit: null, remaining: null };
+  try {
+    const used = parseInt((await redis.get(cacheKey(phone))) || '0', 10);
+    return { used, limit, remaining: Math.max(0, limit - used) };
+  } catch (_) {
+    return { used: 0, limit, remaining: limit };
+  }
+}
+
+module.exports = {
+  tryReserveDailySlot,
+  releaseDailySlot,
+  getDailyUsage,
+  getLimitForPhone,
+  normalize,
+};

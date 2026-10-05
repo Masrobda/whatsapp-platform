@@ -1,0 +1,408 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { cn } from '@/lib/utils';
+import {
+  FiHome, FiShoppingCart, FiFileText, FiSend, FiBook, FiSettings,
+  FiUsers, FiBarChart2, FiClipboard, FiCheckCircle, FiDollarSign,
+  FiMessageSquare, FiUserPlus, FiChevronLeft, FiMenu, FiRefreshCw, FiActivity,
+  FiSmartphone, FiDatabase, FiHardDrive, FiCreditCard, FiGrid, FiFolder,
+  FiUpload, FiDownload, FiTrash2, FiLock, FiUnlock, FiCalendar,
+  FiShield, FiZap, FiStar, FiClock, FiTrendingUp, FiInfo, FiKey,
+  FiCode, FiCopy, FiEdit2, FiPlus, FiEye, FiSearch, FiFilter, FiX,
+  FiCheck, FiAlertCircle, FiPackage, FiUserCheck, FiBell, FiLink
+} from 'react-icons/fi';
+
+interface MenuItem {
+  label: string;
+  href?: string;
+  icon?: React.ReactNode;
+  roles?: string[];
+  badge?: string;
+  type?: 'subtitle' | 'separator';
+  className?: string;
+  disabled?: boolean;
+}
+
+interface MenuCategory {
+  name: string;
+  icon?: React.ReactNode;
+  roles?: string[];  // Ajout de la propriété roles pour les catégories
+  items: MenuItem[];
+}
+
+interface SidebarProps {
+  userType: 'client' | 'user';
+  userRole?: string;
+}
+
+export default function Sidebar({ userType, userRole }: SidebarProps) {
+  const pathname = usePathname();
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
+  const role = userRole?.toLowerCase() || '';
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 1024) setIsCollapsed(true);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Toggle category expansion
+  const toggleCategory = (categoryName: string) => {
+    setExpandedCategories(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(categoryName)) {
+        newSet.delete(categoryName);
+      } else {
+        newSet.add(categoryName);
+      }
+      return newSet;
+    });
+  };
+
+  const menuCategories: MenuCategory[] = [
+    {
+      name: 'Principal',
+      icon: <FiHome />,
+      items: [
+        { label: 'Tableau de bord', href: '/dashboard', icon: <FiHome /> },
+        { label: 'Mes commandes', href: '/dashboard/orders', icon: <FiShoppingCart /> },
+        { label: 'Mes factures', href: '/dashboard/invoices', icon: <FiFileText /> },
+        { label: 'Messages envoyés', href: '/dashboard/messages', icon: <FiSend /> },
+        { label: 'Mes templates', href: '/dashboard/templates/my-templates', icon: <FiMessageSquare />, roles: ['client'] },
+        { label: 'Paramètres', href: '/dashboard/settings', icon: <FiSettings /> },
+        { label: 'Webhooks', href: '/dashboard/settings/webhooks', icon: <FiLink />, roles: ['client', 'admin', 'commercial', 'secretaire', 'responsable_achat', 'responsable_financier'], badge: 'Nouveau' },
+        { label: 'Communication (Prelude)', href: '/dashboard/prelude', icon: <FiActivity /> },
+      ]
+    },
+    {
+      name: 'Campagnes',
+      icon: <FiSend />,
+      items: [
+        { label: 'Gestion des campagnes', href: '/dashboard/campaign', icon: <FiSend />, roles: ['client', 'admin', 'commercial', 'secretaire'] },
+        { label: 'Statistiques campagnes', href: '/dashboard/campaign/stats', icon: <FiBarChart2 />, roles: ['client', 'admin'] },
+      ]
+    },
+    {
+      name: 'Stockage Cloud',
+      icon: <FiHardDrive />,
+      items: [
+        { label: 'Catalogue des offres', href: '/dashboard/storage/offers', icon: <FiShoppingCart />, roles: ['client'] },
+        { label: 'Mon Abonnement', href: '/dashboard/storage/subscription', icon: <FiCreditCard />, roles: ['client'], badge: 'Actif' },
+        { label: 'Mon Espace', href: '/dashboard/storage/space', icon: <FiHardDrive />, roles: ['client'] },
+        { label: 'Gestion des fichiers', href: '/dashboard/storage/files', icon: <FiFolder />, roles: ['client'] },
+        { label: 'Mes factures stockage', href: '/dashboard/invoices-storage', icon: <FiFileText />, roles: ['client'] },
+        { label: 'Admin Stockage', href: '/dashboard/admin/storage', icon: <FiHardDrive />, roles: ['admin', 'responsable_financier'], badge: 'Admin' },
+        { label: 'Offres (CRUD)', href: '/dashboard/admin/storage/offers', icon: <FiEdit2 />, roles: ['admin'], badge: 'CRUD' },
+        { label: 'Commandes en attente', href: '/dashboard/admin/orders/pending', icon: <FiClock />, roles: ['admin', 'responsable_financier'] },
+        { label: 'Validation commandes', href: '/dashboard/admin/orders/validation', icon: <FiCheckCircle />, roles: ['admin', 'responsable_achat', 'responsable_financier'] },
+      ]
+    },
+    {
+      name: 'Documentation',
+      icon: <FiBook />,
+      items: [
+        { label: 'Documentation API', href: '/dashboard/documentation', icon: <FiBook />, roles: ['client', 'admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+        { label: 'Testeur API', href: '/dashboard/api-tester', icon: <FiClipboard />, roles: ['client', 'admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+        { label: 'Notifications', href: '/dashboard/notification', icon: <FiBell />, roles: ['client', 'admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+      ]
+    },
+    {
+      name: 'Administration',
+      icon: <FiSettings />,
+      roles: ['admin', 'commercial', 'secretaire', 'responsable_achat', 'responsable_financier', 'auditeur'],
+      items: [
+        { label: 'Gestion clients', href: '/dashboard/clients', icon: <FiUsers />, roles: ['admin', 'commercial', 'secretaire'] },
+        { label: 'Validation commandes', href: '/dashboard/orders/validation', icon: <FiCheckCircle />, roles: ['admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+        { label: 'Factures & Décaissements', href: '/dashboard/invoices-disbursements', icon: <FiDollarSign />, roles: ['admin', 'responsable_financier', 'responsable_achat'] },
+        { label: 'Templates WhatsApp', href: '/dashboard/templates', icon: <FiMessageSquare />, roles: ['admin', 'commercial', 'responsable_achat', 'secretaire'] },
+        { label: 'Assignation templates', href: '/dashboard/templates/assignments', icon: <FiUserPlus />, roles: ['admin', 'commercial', 'secretaire', 'responsable_achat'], badge: 'Nouveau' },
+        { label: 'Statistiques globales', href: '/dashboard/stats', icon: <FiBarChart2 />, roles: ['admin'] },
+        { label: 'Invitations équipe', href: '/dashboard/invitations', icon: <FiUserPlus />, roles: ['admin'] },
+        { label: 'Réconciliation 360dialog', href: '/dashboard/reconciliation', icon: <FiRefreshCw />, roles: ['admin', 'responsable_financier'] },
+        { label: 'Gestion BSP', href: '/dashboard/bsp-management', icon: <FiActivity />, roles: ['admin', 'responsable_financier'] },
+        { label: 'Stock Messages', href: '/dashboard/message-stock', icon: <FiPackage />, roles: ['admin', 'responsable_achat'] },
+        { label: 'Gestion WhatsApp', href: '/dashboard/whatsapp', icon: <FiSmartphone />, roles: ['admin', 'commercial', 'secretaire'] },
+        { label: 'Config Prelude', href: '/dashboard/admin/prelude', icon: <FiSettings />, roles: ['admin', 'responsable_financier'] },
+      ]
+    },
+    {
+      name: 'Consultation',
+      icon: <FiEye />,
+      items: [
+        { label: 'Suivi Stock SMS', href: '/dashboard/stock-viewer', icon: <FiEye />, roles: ['admin', 'secretaire', 'commercial', 'auditeur', 'responsable_achat', 'responsable_financier'] },
+      ]
+    },
+    {
+      name: 'Rapports & Analyses',
+      icon: <FiBarChart2 />,
+      roles: ['admin', 'responsable_financier', 'auditeur'],
+      items: [
+        { label: 'Erreurs de facturation', href: '/dashboard/orders/invoice-errors', icon: <FiAlertCircle />, roles: ['admin', 'responsable_financier'] },
+        { label: 'Factures manquantes', href: '/dashboard/orders/missing-invoices-report', icon: <FiFileText />, roles: ['admin', 'responsable_financier'] },
+      ]
+    },
+  ];
+
+  const shouldShowItem = (item: MenuItem): boolean => {
+    if (!item.roles) return true;
+    if (userType === 'client') return item.roles.includes('client');
+    if (userType === 'user') {
+      if (role === 'admin') return true;
+      return item.roles.includes(role);
+    }
+    return false;
+  };
+
+  const shouldShowCategory = (category: MenuCategory): boolean => {
+    // Vérifier les rôles de la catégorie d'abord
+    if (category.roles) {
+      if (userType === 'client') {
+        if (!category.roles.includes('client')) return false;
+      } else if (userType === 'user') {
+        if (role !== 'admin' && !category.roles.includes(role)) return false;
+      }
+    }
+    // Ensuite vérifier qu'au moins un item est visible
+    return category.items.some(shouldShowItem);
+  };
+
+  const badgeVariant: Record<string, string> = {
+    'Admin': 'bg-amber-50 text-amber-600 border border-amber-200',
+    'CRUD': 'bg-sky-50 text-sky-600 border border-sky-200',
+    'Nouveau': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+    'Actif': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+  };
+
+  const displayName = userType === 'client'
+    ? 'Espace Client'
+    : `Espace ${role ? role.charAt(0).toUpperCase() + role.slice(1).replace('_', ' ') : 'Utilisateur'}`;
+
+  const avatarLetter = userType === 'client' ? 'C' : role?.charAt(0).toUpperCase() || 'U';
+
+  return (
+    <>
+      <style>{`
+        .sidebar-scroll::-webkit-scrollbar { width: 3px; }
+        .sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+        .sidebar-scroll::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.08); border-radius: 99px; }
+        .sidebar-scroll::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.15); }
+        .nav-item { transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease; }
+        .nav-item:hover { transform: translateX(2px); }
+        .nav-item.active { transform: translateX(3px); }
+        .category-header { transition: background 0.15s ease, transform 0.15s ease; }
+        .category-header:hover { transform: translateX(2px); }
+      `}</style>
+
+      <aside
+        className={cn(
+          'flex flex-col min-h-screen sticky top-0 transition-all duration-300 ease-in-out',
+          isCollapsed ? 'w-[72px]' : 'w-72'
+        )}
+        style={{
+          background: 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
+          borderRight: '1px solid #e8ecf0',
+        }}
+      >
+        {/* ── Header ───────────────────────────────────────────────── */}
+        <div
+          className="flex items-center px-4 py-5 shrink-0"
+          style={{ borderBottom: '1px solid #e8ecf0' }}
+        >
+          <Link
+            href="/dashboard"
+            className={cn('flex items-center gap-3 min-w-0', isCollapsed && 'justify-center')}
+          >
+            <div
+              className="shrink-0 w-9 h-9 rounded-xl flex items-center justify-center font-black text-lg text-white shadow-lg"
+              style={{ background: 'linear-gradient(135deg, #22c55e, #16a34a)' }}
+            >
+              N
+            </div>
+            {!isCollapsed && (
+              <div className="min-w-0">
+                <p className="text-sm font-bold text-gray-900 tracking-wide leading-tight">NEXT LTD</p>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.15em] mt-0.5"
+                   style={{ color: '#22c55e' }}>
+                  Tableau de bord
+                </p>
+              </div>
+            )}
+          </Link>
+
+          {!isCollapsed && <div className="flex-1" />}
+          <button
+            onClick={() => setIsCollapsed(!isCollapsed)}
+            className={cn(
+              'shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 transition-colors',
+              isCollapsed ? 'ml-auto' : 'ml-2',
+            )}
+            style={{ background: 'rgba(0,0,0,0.04)' }}
+            aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {isCollapsed ? <FiMenu size={15} /> : <FiChevronLeft size={15} />}
+          </button>
+        </div>
+
+        {/* ── Navigation ──────────────────────────────────────────── */}
+        <nav className="sidebar-scroll flex-1 overflow-y-auto py-4 px-3 space-y-3">
+          {menuCategories.map((category, idx) => {
+            if (!shouldShowCategory(category)) return null;
+
+            const isExpanded = expandedCategories.has(category.name);
+            const visibleItems = category.items.filter(shouldShowItem);
+
+            if (visibleItems.length === 0) return null;
+
+            return (
+              <div key={idx} className="space-y-1">
+                {/* Category Header */}
+                <button
+                  onClick={() => toggleCategory(category.name)}
+                  className={cn(
+                    'category-header w-full flex items-center gap-3 px-3 py-2 rounded-xl text-sm font-semibold transition-all',
+                    isCollapsed && 'justify-center px-0',
+                    !isCollapsed && 'hover:bg-gray-50'
+                  )}
+                  style={{
+                    color: '#374151',
+                  }}
+                  title={isCollapsed ? category.name : undefined}
+                >
+                  {/* Category Icon */}
+                  <span className={cn('shrink-0 text-base', isCollapsed && 'text-lg')}>
+                    {category.icon}
+                  </span>
+
+                  {/* Category Name & Toggle */}
+                  {!isCollapsed && (
+                    <>
+                      <span className="flex-1 text-left truncate">{category.name}</span>
+                      <svg
+                        className={cn(
+                          'w-4 h-4 transition-transform duration-200 text-gray-400',
+                          isExpanded ? 'rotate-90' : ''
+                        )}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                    </>
+                  )}
+
+                  {/* Tooltip when collapsed */}
+                  {isCollapsed && (
+                    <span
+                      className="pointer-events-none absolute left-full ml-3 px-2.5 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-50"
+                      style={{
+                        background: '#1f2937',
+                        color: 'rgba(255,255,255,0.9)',
+                        border: '1px solid rgba(255,255,255,0.08)',
+                        boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+                      }}
+                    >
+                      {category.name}
+                    </span>
+                  )}
+                </button>
+
+                {/* Category Items */}
+                {(!isCollapsed && isExpanded) && (
+                  <ul className="space-y-0.5 pl-4">
+                    {visibleItems.map((item) => {
+                      const isActive = item.href && (pathname === item.href || pathname.startsWith(item.href));
+
+                      return (
+                        <li key={item.href}>
+                          <Link
+                            href={item.href!}
+                            className={cn(
+                              'nav-item flex items-center gap-3 px-3 py-2 rounded-xl text-sm font-medium relative group',
+                              isActive ? 'active' : ''
+                            )}
+                            style={
+                              isActive
+                                ? {
+                                    background: 'linear-gradient(90deg, rgba(34,197,94,0.12) 0%, rgba(34,197,94,0.04) 100%)',
+                                    color: '#16a34a',
+                                    boxShadow: 'inset 2px 0 0 0 #22c55e',
+                                  }
+                                : {
+                                    color: '#6b7280',
+                                  }
+                            }
+                            onMouseEnter={e => {
+                              if (!isActive) {
+                                (e.currentTarget as HTMLAnchorElement).style.background = 'rgba(0,0,0,0.04)';
+                                (e.currentTarget as HTMLAnchorElement).style.color = '#111827';
+                              }
+                            }}
+                            onMouseLeave={e => {
+                              if (!isActive) {
+                                (e.currentTarget as HTMLAnchorElement).style.background = '';
+                                (e.currentTarget as HTMLAnchorElement).style.color = '#6b7280';
+                              }
+                            }}
+                          >
+                            {item.icon && (
+                              <span className="shrink-0 text-base">
+                                {item.icon}
+                              </span>
+                            )}
+                            <span className="flex-1 truncate">{item.label}</span>
+                            {item.badge && (
+                              <span className={cn(
+                                'shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded-md',
+                                badgeVariant[item.badge] ?? 'bg-gray-100 text-gray-500'
+                              )}>
+                                {item.badge}
+                              </span>
+                            )}
+                          </Link>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+        </nav>
+
+        {/* ── Footer ──────────────────────────────────────────────── */}
+        <div
+          className="shrink-0 p-3"
+          style={{ borderTop: '1px solid #e8ecf0' }}
+        >
+          <div className={cn('flex items-center gap-3 px-2 py-2 rounded-xl',
+            isCollapsed && 'justify-center px-0')}
+            style={{ background: 'rgba(0,0,0,0.03)' }}
+          >
+            <div
+              className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-white font-bold text-xs"
+              style={{ background: 'linear-gradient(135deg, #22c55e, #16a34a)' }}
+            >
+              {avatarLetter}
+            </div>
+
+            {!isCollapsed && (
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-semibold text-gray-700 truncate">{displayName}</p>
+                <p className="text-[10px] text-gray-400 mt-0.5">
+                  v2.0.4 &nbsp;·&nbsp; {new Date().getFullYear()}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
+    </>
+  );
+}

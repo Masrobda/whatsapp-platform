@@ -1,0 +1,257 @@
+// src/workers/whatsapp.worker.universal.js
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const watiService = require('../services/wati.service');
+const campaignWatiService = require('../services/campaign-wati.service');
+const { canSendToRecipient, incrementClientStats } = require('../services/message.service');
+
+const WORKER_CONFIG = {
+  connection: redisConnection,
+  concurrency: 15,
+  lockDuration: 60000,
+  stalledInterval: 30000,
+  maxStalledCount: 3,
+  removeOnComplete: { age: 3600, count: 500 },
+  removeOnFail: { age: 86400, count: 2000 },
+  settings: {
+    backoffStrategies: {
+      exponential: (attemptsMade) => Math.min(Math.pow(2, attemptsMade) * 1000, 300000)
+    }
+  }
+};
+
+const workerStats = new Map();
+const redis = require('../config/redis').redisClient;
+
+async function processMessage(job) {
+  const startTime = Date.now();
+  const { messageId, client_id, recipient_phone, phoneNumber } = job.data;
+
+  logger.debug(`[${job.queueName}] Traitement ${messageId} (attempt ${job.attemptsMade + 1})`);
+
+  try {
+    const statusCheck = await query(
+      `SELECT wa_status FROM messages WHERE id = $1 FOR UPDATE SKIP LOCKED`,
+      [messageId]
+    );
+    if (statusCheck.rows.length === 0) throw new Error(`Message ${messageId} non trouvé`);
+    if (statusCheck.rows[0].wa_status !== 'queued') {
+      logger.info(`[${messageId}] Déjà traité: ${statusCheck.rows[0].wa_status}`);
+      return { success: true, skipped: true };
+    }
+
+    const cooldownCheck = await canSendToRecipient(recipient_phone, client_id);
+    if (!cooldownCheck.canSend) {
+      await markMessageAsFailed(messageId, client_id, cooldownCheck.reason);
+      throw new Error(cooldownCheck.reason);
+    }
+
+    const result = await sendViaWati(job.data);
+
+    if (!result?.success) throw new Error(result?.error || 'Échec WATI');
+
+    await markMessageAsSent(messageId, client_id, result);
+    await incrementClientStats(phoneNumber, client_id);
+
+    const duration = Date.now() - startTime;
+    logger.info(`[${messageId}] Succès en ${duration}ms | WATI: ${result.watiMessageId}`);
+
+    updateWorkerStats(job.queueName, true, duration);
+    return { success: true, duration, watiId: result.watiMessageId };
+
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    logger.error(`[${messageId}] Échec: ${error.message}`);
+    updateWorkerStats(job.queueName, false, duration);
+    if (isFatalError(error)) {
+      await markMessageAsFailed(messageId, client_id, error.message);
+      return { success: false, fatal: true };
+    }
+    throw error;
+  }
+}
+
+async function sendViaWati(data) {
+  console.log("=== [WORKER] DONNÉES REÇUES ===");
+  console.log("message_type:", data.message_type);
+  console.log("template_name:", data.template_name);
+  console.log("is_campaign:", data.is_campaign);
+
+  const recipient_phone = data.recipient_phone || data.recipientPhone;
+  const message_type = data.message_type || data.messageType;
+  const template_name = data.template_name || data.templateName;
+  const template_language = data.template_language || data.templateLanguage || 'fr';
+  const phoneNumber = data.phoneNumber || data.phone_number;
+  const clientMessageId = data.messageId; // UUID interne du message
+
+  let result;
+
+  switch (message_type) {
+    case 'template':
+    if (data.is_campaign && data.ordered_values) {
+        console.log(`📋 [CAMPAGNE] Envoi avec ordre préservé (${data.ordered_values.length} valeurs)`);
+        result = await campaignWatiService.sendCampaignTemplateMessage(
+          recipient_phone,
+          template_name,
+          data.ordered_values,
+          template_language,
+          phoneNumber
+        );
+      }
+      else if (data.invoice_data) {
+        result = await watiService.sendInvoiceWithPDF(
+          recipient_phone,
+          template_name,
+          data.template_params || {},
+          data.invoice_data,
+          phoneNumber
+        );
+      } else {
+        result = await watiService.sendTemplateMessage(
+          recipient_phone,
+          template_name,
+          data.template_params || {},
+          template_language,
+          phoneNumber
+        );
+      }
+      break;
+    case 'text':
+      result = await watiService.sendTextMessage(recipient_phone, data.message_content || data.text, phoneNumber, clientMessageId);
+      break;
+    case 'media':
+      result = await watiService.sendMediaMessage(
+        recipient_phone, data.media_url, data.media_type || 'document', data.caption || '', phoneNumber, clientMessageId
+      );
+      break;
+    default:
+      throw new Error(`Type inconnu: ${message_type}`);
+  }
+
+  // 🔥 Enregistrement des mappings (PostgreSQL + Redis) uniquement en cas de succès
+  if (result.success && result.localMessageId && data.messageId) {
+    // 1. Mapping PostgreSQL (fiable, persistant)
+    await query(
+      `INSERT INTO message_id_mapping (local_message_id, internal_message_id, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '60 seconds')
+       ON CONFLICT (local_message_id) DO UPDATE SET 
+         internal_message_id = EXCLUDED.internal_message_id, 
+         expires_at = NOW() + INTERVAL '60 seconds'`,
+      [result.localMessageId, data.messageId]
+    );
+    console.log(`📝 Mapping PostgreSQL: ${result.localMessageId} -> ${data.messageId}`);
+
+    // 2. Mapping Redis (ultra-rapide, fallback)
+    const mappingKey = `msg:lid:${result.localMessageId}`;
+    const mappingValue = JSON.stringify({
+      messageId: data.messageId,
+      clientId: data.client_id,
+      recipient: recipient_phone,
+      timestamp: Date.now()
+    });
+    await redis.setex(mappingKey, 60, mappingValue);
+    console.log(`📝 Redis mapping enregistré: ${mappingKey} -> ${mappingValue}`);
+  }
+
+  return result;
+} 
+
+async function markMessageAsSent(messageId, clientId, sendResult) {
+  const watiMessageId = sendResult.localMessageId;
+  if (!watiMessageId) {
+    console.error(`❌ Pas de localMessageId pour ${messageId}`);
+    return;
+  }
+  console.log(`📝 Stockage wa_message_id = ${watiMessageId} pour message ${messageId}`);
+
+  await query(
+    `UPDATE messages SET wa_message_id = $1, wa_status = 'sent', sent_at = NOW() WHERE id = $2`,
+    [watiMessageId, messageId]
+  );
+
+  const clientTable = `messages_client_${clientId.replace(/-/g, '_')}`;
+  await query(
+    `UPDATE ${clientTable} SET wa_message_id = $1, wa_status = 'sent', sent_at = NOW() WHERE id = $2`,
+    [watiMessageId, messageId]
+  );
+}
+
+async function markMessageAsFailed(messageId, clientId, errorMessage) {
+  console.log(`❌ Message ${messageId} échoué: ${errorMessage}`);
+  await query(
+    `UPDATE messages SET wa_status = 'failed', wa_error_message = $1, failed_at = NOW() WHERE id = $2 AND wa_status = 'queued'`,
+    [errorMessage, messageId]
+  );
+  const clientTable = `messages_client_${clientId.replace(/-/g, '_')}`;
+  await query(
+    `UPDATE ${clientTable} SET wa_status = 'failed', wa_error_message = $1, failed_at = NOW() WHERE id = $2`,
+    [errorMessage, messageId]
+  );
+}
+
+function isFatalError(error) {
+  const fatalMessages = [
+    'COOLDOWN_ACTIVE', 'INVALID_MESSAGE_TYPE', 'CLIENT_NOT_FOUND',
+    'INSUFFICIENT_QUOTA', 'template non trouvé', 'URL du PDF invalide'
+  ];
+  return fatalMessages.some(msg => error.message.includes(msg));
+}
+
+function updateWorkerStats(queueName, success, duration) {
+  if (!workerStats.has(queueName)) workerStats.set(queueName, { total: 0, success: 0, failed: 0, avgDuration: 0 });
+  const stats = workerStats.get(queueName);
+  stats.total++;
+  success ? stats.success++ : stats.failed++;
+  stats.avgDuration = (stats.avgDuration * (stats.total - 1) + duration) / stats.total;
+}
+
+const workers = new Map();
+let statsInterval = null;
+
+async function initWorkers() {
+  try {
+    const result = await query(`SELECT phone_number FROM whatsapp_numbers WHERE is_active = true`);
+    const activePhones = result.rows.map(r => r.phone_number);
+    for (const phone of activePhones) {
+      const normalizedPhone = phone.replace(/[^0-9]/g, '');
+      const queueName = `whatsapp-messages-${normalizedPhone}`;
+      if (!workers.has(queueName)) {
+        logger.info(`🚀 Démarrage worker pour: ${queueName}`);
+        const worker = new Worker(queueName, processMessage, WORKER_CONFIG);
+        worker.on('completed', job => logger.debug(`✅ Job ${job.id} terminé`));
+        worker.on('failed', (job, err) => job && logger.error(`❌ Job ${job.id} échoué: ${err?.message}`));
+        worker.on('stalled', jobId => logger.warn(`⚠️ Job stalled: ${jobId}`));
+        worker.on('error', err => logger.error(`🔥 Worker error: ${err.message}`));
+        workers.set(queueName, worker);
+      }
+    }
+    if (!statsInterval) startStatsReporting();
+    logger.info(`📊 ${workers.size} workers actifs sur ${activePhones.length} numéros`);
+  } catch (error) {
+    logger.error('❌ Erreur initWorkers:', error);
+  }
+}
+
+function startStatsReporting() {
+  statsInterval = setInterval(() => {
+    logger.info('📈 STATS WORKERS:');
+    for (const [name, stats] of workerStats) {
+      const successRate = stats.total > 0 ? (stats.success / stats.total * 100).toFixed(1) : 0;
+      logger.info(`   ${name}: ${stats.total} jobs | Succès: ${successRate}% | Avg: ${stats.avgDuration.toFixed(0)}ms`);
+    }
+  }, 60000);
+}
+
+setInterval(initWorkers, 300000);
+process.on('SIGTERM', async () => {
+  logger.info('🛑 Arrêt des workers...');
+  if (statsInterval) clearInterval(statsInterval);
+  for (const [, worker] of workers) await worker.close();
+  process.exit(0);
+});
+
+initWorkers();
+
+module.exports = { processMessage, initWorkers };

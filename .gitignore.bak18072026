@@ -1,0 +1,52 @@
+# Fichiers sensibles
+.env
+.env.*
+.pgpass
+*.env
+
+# Backups et archives
+*.sql
+*.sql.gz
+*.tar
+*.tar.gz
+*.zip
+last_backup.sql.gz
+backup_*.sql*
+backup_db.sh
+
+# Dépendances
+node_modules/
+venv/
+api/venv/
+api/node_modules/
+dashboard/node_modules/
+vitrine/node_modules/
+
+# Images générées ou lourdes
+vitrine/public/images/*-preview.png
+*.so
+phantomjs
+
+# Logs
+*.log
+logs/
+
+# Fichiers temporaires
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Builds
+.next/
+out/
+dist/
+build/
+*.zip.*
+ngrok-stable-linux-amd64.zip.*

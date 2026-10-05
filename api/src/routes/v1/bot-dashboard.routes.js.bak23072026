@@ -1,0 +1,20 @@
+// src/routes/v1/bot-dashboard.routes.js
+// Toutes ces routes sont réservées à l'administration (admin uniquement) —
+// aucune donnée B2B client n'est exposée ici, ce sont des données consommateur.
+const botDashboardController = require('../../controllers/bot-dashboard.controller');
+const { authenticateJWT } = require('../../middlewares/auth.middleware');
+const { requireRole, ROLES } = require('../../middlewares/role.middleware');
+
+async function botDashboardRoutes(fastify, opts) {
+  const adminOnly = { preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)] };
+
+  fastify.get('/stats', adminOnly, botDashboardController.getStats);
+  fastify.get('/conversations', adminOnly, botDashboardController.listConversations);
+  fastify.post('/conversations/:phone/unlock', adminOnly, botDashboardController.unlockConversation);
+  fastify.get('/contracts', adminOnly, botDashboardController.listActivatedContacts);
+  fastify.get('/link-clicks', adminOnly, botDashboardController.getLinkClicks);
+  fastify.get('/invoices/stats', adminOnly, botDashboardController.getInvoiceStats);
+fastify.get('/invoices/export', adminOnly, botDashboardController.exportInvoices);
+}
+
+module.exports = botDashboardRoutes;

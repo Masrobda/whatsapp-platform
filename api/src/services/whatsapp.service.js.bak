@@ -1,0 +1,458 @@
+// src/services/whatsapp.service.js
+require('dotenv').config();
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+// ============================================
+// CONFIGURATION AVANCÉE
+// ============================================
+const TEST_MODE = process.env.WHATSAPP_TEST_MODE === 'true' || true;
+const SIMULATE_DELAY_MS = 800;
+
+// Configuration 360Dialog
+const API_BASE_URL = process.env.WHATSAPP_API_URL || 'https://waba.360dialog.io/v1';
+const API_KEY = process.env.WHATSAPP_API_KEY || '';
+const WABA_ID = process.env.WHATSAPP_WABA_ID || '';
+
+// Headers communs
+const getHeaders = () => ({
+  'D360-API-KEY': API_KEY,
+  'Content-Type': 'application/json'
+});
+
+// ============================================
+// SERVICES DE SIMULATION AMÉLIORÉS
+// ============================================
+
+const testServices = {
+  // Envoyer un message texte
+  sendTextMessage: async (recipientPhone, messageText) => {
+    logger.info(`[TEST MODE] 📱 Simulation envoi texte à ${recipientPhone}`);
+    logger.debug(`Message: "${messageText.substring(0, 100)}${messageText.length > 100 ? '...' : ''}"`);
+
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+
+    return {
+      success: true,
+      messageId: `test_text_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'sent',
+      simulated: true,
+      timestamp: new Date().toISOString()
+    };
+  },
+
+  // Envoyer un template avec variables
+  sendTemplateMessage: async (recipientPhone, templateName, language, parameters = []) => {
+    logger.info(`[TEST MODE] 📱 Simulation template à ${recipientPhone}`);
+    logger.info(`Template: ${templateName}, Langue: ${language}`);
+    
+    if (parameters.length > 0) {
+      logger.info('Paramètres:', parameters);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+
+    return {
+      success: true,
+      messageId: `test_template_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'sent',
+      simulated: true,
+      templateName,
+      language,
+      parameters
+    };
+  },
+
+  // Soumettre un template à Meta
+  submitTemplate: async (templateData) => {
+    logger.info('[TEST MODE] 📝 Simulation soumission template:', templateData.name);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    
+    // Simulation de différents statuts
+    const statuses = ['pending', 'approved', 'rejected'];
+    const randomStatus = statuses[Math.floor(Math.random() * 3)];
+    
+    return { 
+      success: true, 
+      wa_template_id: `test_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: randomStatus,
+      simulated: true 
+    };
+  },
+
+  // Vérifier le statut d'un template
+  getTemplateStatus: async (templateId) => {
+    logger.info(`[TEST MODE] 🔍 Simulation vérification statut template: ${templateId}`);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    const statuses = ['PENDING', 'APPROVED', 'REJECTED'];
+    const randomStatus = statuses[Math.floor(Math.random() * 3)];
+    
+    return { 
+      success: true, 
+      status: randomStatus,
+      simulated: true 
+    };
+  },
+
+  // Envoyer un média
+  sendMediaMessage: async (recipientPhone, mediaType, mediaUrl, caption = '') => {
+    logger.info(`[TEST MODE] 📱 Simulation envoi média ${mediaType} à ${recipientPhone}`);
+    logger.info(`URL: ${mediaUrl}`);
+    
+    if (caption) logger.info(`Légende: ${caption}`);
+
+    await new Promise(resolve => setTimeout(resolve, SIMULATE_DELAY_MS));
+
+    return {
+      success: true,
+      messageId: `test_media_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'sent',
+      simulated: true,
+      mediaType,
+      mediaUrl
+    };
+  },
+
+  // Récupérer tous les templates
+  getTemplates: async () => {
+    logger.info('[TEST MODE] 🔧 Simulation récupération templates');
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Templates de test plus réalistes
+    const testTemplates = [
+      {
+        id: 'test_1',
+        name: 'bienvenue_client',
+        language: 'fr',
+        status: 'APPROVED',
+        category: 'UTILITY',
+        components: [
+          { type: 'HEADER', format: 'TEXT', text: 'Bienvenue {{1}}' },
+          { type: 'BODY', text: 'Merci de nous rejoindre, {{1}} ! Nous sommes ravis de vous compter parmi nos clients.' },
+          { type: 'FOOTER', text: 'Équipe NEXT LTD' }
+        ]
+      },
+      {
+        id: 'test_2',
+        name: 'confirmation_commande',
+        language: 'fr',
+        status: 'APPROVED',
+        category: 'TRANSACTIONAL',
+        components: [
+          { type: 'HEADER', format: 'TEXT', text: 'Commande #{{1}} confirmée' },
+          { type: 'BODY', text: 'Bonjour {{2}},\n\nVotre commande de {{3}} a été confirmée. Montant: {{4}} FCFA\n\nLivraison prévue: {{5}}' },
+          { type: 'FOOTER', text: 'Merci pour votre confiance' }
+        ]
+      },
+      {
+        id: 'test_3',
+        name: 'promo_ete',
+        language: 'fr',
+        status: 'PENDING',
+        category: 'MARKETING',
+        components: [
+          { type: 'HEADER', format: 'IMAGE' },
+          { type: 'BODY', text: '🔥 Offre spéciale été!\n{{1}}% de réduction sur tous nos produits.\nCode: {{2}}' },
+          { type: 'BUTTONS', buttons: [{ type: 'URL', text: 'Voir l\'offre', url: 'https://numericexport.com/promo' }] }
+        ]
+      }
+    ];
+
+    return {
+      success: true,
+      templates: testTemplates,
+      simulated: true,
+      count: testTemplates.length
+    };
+  },
+
+  // Récupérer le statut d'un message
+  getMessageStatus: async (messageId) => {
+    logger.info(`[TEST MODE] 🔍 Simulation statut message: ${messageId}`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    const statuses = ['sent', 'delivered', 'read', 'failed'];
+    const randomStatus = statuses[Math.floor(Math.random() * statuses.length)];
+
+    return {
+      success: true,
+      status: randomStatus,
+      simulated: true,
+      messageId
+    };
+  },
+
+  // Valider et formater un numéro de téléphone
+  validatePhoneNumber: (phone) => {
+    logger.info(`[TEST MODE] 📞 Validation téléphone: ${phone}`);
+
+    let cleanPhone = phone.replace(/[\s\-\(\)]/g, '');
+    
+    // Format international
+    if (!cleanPhone.startsWith('+')) {
+      if (cleanPhone.startsWith('237')) {
+        cleanPhone = '+' + cleanPhone; // Cameroun
+      } else if (cleanPhone.startsWith('6') || cleanPhone.startsWith('2')) {
+        cleanPhone = '+237' + cleanPhone; // Ajouter indicatif Cameroun par défaut
+      } else {
+        cleanPhone = '+' + cleanPhone;
+      }
+    }
+
+    logger.info(`[TEST MODE] ✅ Téléphone formaté: ${cleanPhone}`);
+    return cleanPhone;
+  },
+
+  // Télécharger un média
+  downloadMedia: async (mediaId) => {
+    logger.info(`[TEST MODE] 📥 Simulation téléchargement média: ${mediaId}`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    return {
+      success: true,
+      simulated: true,
+      mediaId,
+      url: `https://simulated-media.com/${mediaId}`,
+      mimeType: 'image/jpeg'
+    };
+  }
+};
+
+// ============================================
+// SERVICES RÉELS 360DIALOG
+// ============================================
+
+const realServices = {
+  // Envoyer un message texte
+  sendTextMessage: async (recipientPhone, messageText) => {
+    try {
+      const url = `${API_BASE_URL}/messages`;
+      const payload = {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'text',
+        text: { body: messageText }
+      };
+
+      const response = await axios.post(url, payload, { headers: getHeaders() });
+      logger.info(`Message envoyé à ${recipientPhone}: ${response.data.messages[0].id}`);
+
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi message:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Envoyer un template
+  sendTemplateMessage: async (recipientPhone, templateName, language, parameters = []) => {
+    try {
+      const url = `${API_BASE_URL}/messages`;
+      const payload = {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: 'template',
+        template: {
+          name: templateName,
+          language: { code: language },
+          components: parameters.length > 0 ? [{
+            type: 'body',
+            parameters: parameters.map(param => ({ type: 'text', text: param }))
+          }] : undefined
+        }
+      };
+
+      // Nettoyer le payload si pas de paramètres
+      if (parameters.length === 0) {
+        delete payload.template.components;
+      }
+
+      const response = await axios.post(url, payload, { headers: getHeaders() });
+      logger.info(`Template envoyé à ${recipientPhone}: ${response.data.messages[0].id}`);
+
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi template:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Soumettre un template
+  submitTemplate: async (templateData) => {
+    try {
+      const url = `${API_BASE_URL}/configs/templates`;
+      
+      // Valider les données du template
+      if (!templateData.name || !templateData.language || !templateData.category) {
+        throw new Error('Données template incomplètes');
+      }
+
+      const response = await axios.post(url, templateData, { headers: getHeaders() });
+      logger.info(`Template soumis avec succès: ${response.data.id}`);
+
+      return { 
+        success: true, 
+        wa_template_id: response.data.id,
+        status: response.data.status || 'PENDING'
+      };
+    } catch (error) {
+      logger.error(`Erreur soumission template:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Vérifier statut template
+  getTemplateStatus: async (templateId) => {
+    try {
+      const url = `${API_BASE_URL}/configs/templates/${templateId}`;
+      const response = await axios.get(url, { headers: getHeaders() });
+      
+      return { 
+        success: true, 
+        status: response.data.status,
+        category: response.data.category,
+        name: response.data.name
+      };
+    } catch (error) {
+      logger.error(`Erreur vérification statut:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Envoyer un média
+  sendMediaMessage: async (recipientPhone, mediaType, mediaUrl, caption = '') => {
+    try {
+      const url = `${API_BASE_URL}/messages`;
+      const payload = {
+        recipient_type: 'individual',
+        to: recipientPhone,
+        type: mediaType,
+        [mediaType]: { link: mediaUrl }
+      };
+
+      if (caption && mediaType !== 'audio') {
+        payload[mediaType].caption = caption;
+      }
+
+      const response = await axios.post(url, payload, { headers: getHeaders() });
+      logger.info(`Média envoyé à ${recipientPhone}: ${response.data.messages[0].id}`);
+
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        status: 'sent'
+      };
+    } catch (error) {
+      logger.error(`Erreur envoi média:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Récupérer tous les templates
+  getTemplates: async () => {
+    try {
+      const url = `${API_BASE_URL}/configs/templates`;
+      const response = await axios.get(url, { headers: getHeaders() });
+
+      return {
+        success: true,
+        templates: response.data.waba_templates || [],
+        count: response.data.waba_templates?.length || 0
+      };
+    } catch (error) {
+      logger.error(`Erreur récupération templates:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Récupérer statut message
+  getMessageStatus: async (messageId) => {
+    try {
+      const url = `${API_BASE_URL}/messages/${messageId}`;
+      const response = await axios.get(url, { headers: getHeaders() });
+
+      return {
+        success: true,
+        status: response.data.messages?.[0]?.status || 'unknown'
+      };
+    } catch (error) {
+      logger.error(`Erreur vérification statut message:`, error.response?.data || error.message);
+      throw error;
+    }
+  },
+
+  // Valider téléphone
+  validatePhoneNumber: (phone) => {
+    let cleanPhone = phone.replace(/[\s\-\(\)]/g, '');
+    
+    if (!cleanPhone.startsWith('+')) {
+      if (cleanPhone.startsWith('237')) {
+        cleanPhone = '+' + cleanPhone;
+      } else if (cleanPhone.match(/^[6|2][0-9]{7}$/)) {
+        cleanPhone = '+237' + cleanPhone;
+      } else {
+        cleanPhone = '+' + cleanPhone;
+      }
+    }
+    
+    return cleanPhone;
+  },
+
+  // Télécharger média
+  downloadMedia: async (mediaId) => {
+    try {
+      const url = `${API_BASE_URL}/media/${mediaId}`;
+      const response = await axios.get(url, { 
+        headers: getHeaders(),
+        responseType: 'arraybuffer'
+      });
+
+      return {
+        success: true,
+        data: response.data,
+        mimeType: response.headers['content-type']
+      };
+    } catch (error) {
+      logger.error(`Erreur téléchargement média:`, error.response?.data || error.message);
+      throw error;
+    }
+  }
+};
+
+// ============================================
+// EXPORT DES SERVICES
+// ============================================
+
+const services = TEST_MODE ? testServices : realServices;
+
+// Log de mode au démarrage
+if (TEST_MODE) {
+  console.log('\n⚠️  ===============================================');
+  console.log('⚠️  WHATSAPP SERVICE EN MODE TEST');
+  console.log('⚠️  Tous les messages seront simulés');
+  console.log('⚠️  Pour utiliser 360Dialog, mettez WHATSAPP_TEST_MODE=false dans .env');
+  console.log('⚠️  ===============================================\n');
+}
+
+// Exporter toutes les fonctions
+module.exports = {
+  sendTextMessage: services.sendTextMessage.bind(services),
+  sendTemplateMessage: services.sendTemplateMessage.bind(services),
+  sendMediaMessage: services.sendMediaMessage.bind(services),
+  submitTemplate: services.submitTemplate.bind(services),
+  getTemplateStatus: services.getTemplateStatus.bind(services),
+  getTemplates: services.getTemplates.bind(services),
+  getMessageStatus: services.getMessageStatus.bind(services),
+  validatePhoneNumber: services.validatePhoneNumber.bind(services),
+  downloadMedia: services.downloadMedia?.bind(services),
+  isTestMode: () => TEST_MODE
+};

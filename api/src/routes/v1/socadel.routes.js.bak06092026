@@ -1,0 +1,662 @@
+// api/src/routes/v1/socadel.routes.js
+'use strict';
+const {
+  normalizePhone,
+  isValidPhone237,
+  normalizeIdentite,
+  countPhoneOnItinerary,
+  getWhatsappPrimary,
+  addSecondaryPhone,
+  buildResponsableLabel,
+  collectorFromUser
+} = require('../../services/socadel-collect.service');
+const { redis } = require('../../config/redis');
+
+async function invalidateStatsCache() {
+  try {
+    await redis.del('socadel:stats');
+    const keys = await redis.keys('socadel:stats:*');
+    if (keys && keys.length) await redis.del(...keys);
+  } catch (_) {}
+}
+
+const { query } = require('../../config/database');
+const { generateBordereauPDF } = require('../../services/pdf.service');
+const { enqueueSocadelSync } = require('../../queues/socadel.queue');
+
+const CACHE_STATS_KEY = 'socadel:stats';
+const CACHE_STATS_TTL = 60; // secondes
+
+function normalizePhone(p) {
+  if (!p) return '';
+  return String(p).replace(/[\s\-.]/g, '').trim();
+}
+
+function isValidPhone237(phone) {
+  return /^\+237[0-9]{9}$/.test(normalizePhone(phone));
+}
+
+function computeResponsable({
+  checkStatus,
+  statut,
+  activatedAt,
+  checkDate,
+  rapport,
+  numeroTelephone,
+  whatsappPhone
+}) {
+  if (checkStatus !== 'OK' || statut !== 'ABONNE') return 'AUTRES';
+  if (!activatedAt || !checkDate) return 'AUTRES';
+  if (String(rapport || '').toUpperCase() !== 'MRA') return 'AUTRES';
+
+  const act = new Date(activatedAt).getTime();
+  const chk = new Date(checkDate).getTime();
+  if (Number.isNaN(act) || Number.isNaN(chk) || act < chk) return 'AUTRES';
+
+  const entered = normalizePhone(numeroTelephone);
+  if (!entered) return 'AUTRES';
+  if (whatsappPhone) {
+    if (entered !== normalizePhone(whatsappPhone)) return 'AUTRES';
+  }
+  return 'TERRAIN';
+}
+
+async function getRedis(fastify) {
+  return fastify.redis || null;
+}
+
+async function invalidateStatsCache(fastify) {
+  try {
+    const redis = await getRedis(fastify);
+    if (redis) await redis.del(CACHE_STATS_KEY);
+  } catch (_) {}
+}
+
+async function socadelRoutes(fastify) {
+  const auth = { preHandler: [fastify.authenticateJWT] };
+
+  // ── GET /itineraries (optionnel admin) ──
+  fastify.get('/itineraries', auth, async (request, reply) => {
+    const result = await query(`
+      SELECT DISTINCT itineraires
+      FROM socadel_contacts
+      WHERE itineraires IS NOT NULL AND itineraires <> ''
+      ORDER BY itineraires
+      LIMIT 5000
+    `);
+    return reply.send({
+      success: true,
+      data: result.rows.map((r) => r.itineraires)
+    });
+  });
+
+  // ── GET /data ──
+  fastify.get('/data', auth, async (request, reply) => {
+    const {
+      itineraires,
+      meter_no,
+      service_no,
+      page = 1,
+      limit: rawLimit = 50
+    } = request.query;
+
+    if (!itineraires) {
+      return reply.code(400).send({ success: false, message: 'Paramètre itineraires requis' });
+    }
+
+    const list = String(itineraires)
+      .split(',')
+      .map((i) => i.trim())
+      .filter(Boolean);
+
+    if (list.length === 0) {
+      return reply.code(400).send({ success: false, message: 'Aucun itinéraire valide' });
+    }
+
+    const limit = Math.min(Math.max(parseInt(rawLimit, 10) || 50, 1), 100);
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const offset = (pageNum - 1) * limit;
+
+    const params = [list];
+    let where = `WHERE itineraires = ANY($1::text[])`;
+
+    if (meter_no) {
+      params.push(`%${meter_no}%`);
+      where += ` AND meter_no ILIKE $${params.length}`;
+    }
+    if (service_no) {
+      params.push(`%${service_no}%`);
+      where += ` AND service_no ILIKE $${params.length}`;
+    }
+
+    const countRes = await query(
+      `SELECT COUNT(*)::int AS total FROM socadel_contacts ${where}`,
+      params
+    );
+    const total = countRes.rows[0].total;
+
+    const dataRes = await query(
+      `SELECT
+         id, region, division, agence, service_no, noms, categorie, mrc,
+         ref_geo, itineraires, meter_no, numero_telephone, rapport, identite,
+         check_status, check_date, api_status, api_date, statut, responsable,
+         activated_at
+       FROM socadel_contacts
+       ${where}
+       ORDER BY itineraires, ref_geo
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+
+    return reply.send({
+      success: true,
+      data: dataRes.rows,
+      pagination: {
+        total,
+        page: pageNum,
+        limit,
+        totalPages: Math.ceil(total / limit) || 1
+      }
+    });
+  });
+
+  // ── PUT /update-check ──
+  fastify.put('/update-check', auth, async (request, reply) => {
+    const { id, check_status } = request.body || {};
+    if (!id) return reply.code(400).send({ success: false, message: 'id requis' });
+
+    const current = await query(
+      `SELECT statut, activated_at, check_date, rapport, numero_telephone, service_no
+       FROM socadel_contacts WHERE id = $1`,
+      [id]
+    );
+    if (current.rows.length === 0) {
+      return reply.code(404).send({ success: false, message: 'Contact introuvable' });
+    }
+
+    const row = current.rows[0];
+    const isOk = check_status === 'OK';
+    const newCheckDate = isOk ? new Date() : null;
+
+    let whatsappPhone = null;
+    if (row.service_no) {
+      const valid = await query(
+        `SELECT whatsapp_phone FROM whatsapp_valid_contacts WHERE contract_number = $1 LIMIT 1`,
+        [row.service_no]
+      );
+      if (valid.rows[0]) whatsappPhone = valid.rows[0].whatsapp_phone;
+    }
+
+    const responsable = computeResponsable({
+      checkStatus: isOk ? 'OK' : null,
+      statut: row.statut || 'NON ABONNE',
+      activatedAt: row.activated_at,
+      checkDate: newCheckDate || row.check_date,
+      rapport: row.rapport || 'OK',
+      numeroTelephone: row.numero_telephone,
+      whatsappPhone
+    });
+
+    await query(
+      `UPDATE socadel_contacts
+       SET check_status = $1,
+           check_date   = CASE WHEN $1 = 'OK' THEN NOW() ELSE NULL END,
+           responsable  = $2,
+           updated_at   = NOW()
+       WHERE id = $3`,
+      [isOk ? 'OK' : null, responsable, id]
+    );
+
+    await invalidateStatsCache(fastify);
+
+    return reply.send({
+      success: true,
+      data: {
+        check_status: isOk ? 'OK' : null,
+        check_date: isOk ? new Date().toISOString() : null,
+        responsable
+      }
+    });
+  });
+
+  // ── PUT /update-rapport ──
+  fastify.put('/update-rapport', auth, async (request, reply) => {
+    const { id, rapport, numero_telephone } = request.body || {};
+    if (!id) return reply.code(400).send({ success: false, message: 'id requis' });
+
+    const r = String(rapport || 'OK').toUpperCase();
+    if (r !== 'OK' && r !== 'MRA') {
+      return reply.code(400).send({ success: false, message: 'rapport doit être OK ou MRA' });
+    }
+
+    if (r === 'MRA' && !isValidPhone237(numero_telephone)) {
+      return reply.code(400).send({
+        success: false,
+        message: 'Pour MRA, numéro obligatoire au format +237XXXXXXXXX'
+      });
+    }
+
+    const current = await query(
+      `SELECT check_status, check_date, statut, activated_at, numero_telephone, service_no
+       FROM socadel_contacts WHERE id = $1`,
+      [id]
+    );
+    if (current.rows.length === 0) {
+      return reply.code(404).send({ success: false, message: 'Contact introuvable' });
+    }
+
+    const row = current.rows[0];
+    const phone = r === 'MRA' ? normalizePhone(numero_telephone) : row.numero_telephone;
+
+    let whatsappPhone = null;
+    if (row.service_no) {
+      const valid = await query(
+        `SELECT whatsapp_phone FROM whatsapp_valid_contacts WHERE contract_number = $1 LIMIT 1`,
+        [row.service_no]
+      );
+      if (valid.rows[0]) whatsappPhone = valid.rows[0].whatsapp_phone;
+    }
+
+    const responsable = computeResponsable({
+      checkStatus: row.check_status,
+      statut: row.statut || 'NON ABONNE',
+      activatedAt: row.activated_at,
+      checkDate: row.check_date,
+      rapport: r,
+      numeroTelephone: phone,
+      whatsappPhone
+    });
+
+    await query(
+      `UPDATE socadel_contacts
+       SET rapport = $1,
+           numero_telephone = CASE WHEN $1 = 'MRA' THEN $2 ELSE numero_telephone END,
+           responsable = $3,
+           updated_at = NOW()
+       WHERE id = $4`,
+      [r, phone, responsable, id]
+    );
+
+    await invalidateStatsCache(fastify);
+
+    return reply.send({
+      success: true,
+      data: {
+        rapport: r,
+        numero_telephone: r === 'MRA' ? phone : row.numero_telephone,
+        responsable
+      }
+    });
+  });
+
+  // ── PUT /update-identite ──
+  fastify.put('/update-identite', auth, async (request, reply) => {
+    const { id, identite } = request.body || {};
+    if (!id) return reply.code(400).send({ success: false, message: 'id requis' });
+
+    const val = String(identite || 'proprietaire').toLowerCase();
+    if (val !== 'proprietaire' && val !== 'relation') {
+      return reply.code(400).send({
+        success: false,
+        message: 'identite doit être proprietaire ou relation'
+      });
+    }
+
+    const result = await query(
+      `UPDATE socadel_contacts SET identite = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING identite`,
+      [val, id]
+    );
+    if (result.rows.length === 0) {
+      return reply.code(404).send({ success: false, message: 'Contact introuvable' });
+    }
+
+    return reply.send({ success: true, data: { identite: result.rows[0].identite } });
+  });
+
+  // ── PUT /check-itinerary ──
+  fastify.put('/check-itinerary', auth, async (request, reply) => {
+    const { itineraires, check_status } = request.body || {};
+    if (!itineraires) {
+      return reply.code(400).send({ success: false, message: 'itineraires requis' });
+    }
+
+    const list = Array.isArray(itineraires)
+      ? itineraires.map((i) => String(i).trim()).filter(Boolean)
+      : String(itineraires).split(/[,;\s]+/).map((i) => i.trim()).filter(Boolean);
+
+    if (list.length === 0) {
+      return reply.code(400).send({ success: false, message: 'Aucun itinéraire valide' });
+    }
+
+    const isOk = check_status === 'OK';
+
+    const result = await query(
+      `UPDATE socadel_contacts sc
+       SET
+         check_status = $1,
+         check_date   = CASE WHEN $1 = 'OK' THEN NOW() ELSE NULL END,
+         responsable  = CASE
+           WHEN $1 = 'OK'
+            AND sc.statut = 'ABONNE'
+            AND sc.activated_at IS NOT NULL
+            AND sc.activated_at >= NOW()
+            AND UPPER(COALESCE(sc.rapport, 'OK')) = 'MRA'
+            AND sc.numero_telephone IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM whatsapp_valid_contacts w
+              WHERE w.contract_number = sc.service_no
+                AND regexp_replace(w.whatsapp_phone, '[^0-9+]', '', 'g')
+                  = regexp_replace(sc.numero_telephone, '[^0-9+]', '', 'g')
+            )
+           THEN 'TERRAIN'
+           ELSE 'AUTRES'
+         END,
+         updated_at = NOW()
+       WHERE itineraires = ANY($2::text[])
+       RETURNING id`,
+      [isOk ? 'OK' : null, list]
+    );
+
+    await invalidateStatsCache(fastify);
+
+    return reply.send({
+      success: true,
+      updated: result.rowCount,
+      check_status: isOk ? 'OK' : null
+    });
+  });
+
+  // ── POST /sync → file BullMQ (non bloquant) ──
+  fastify.post('/sync', auth, async (request, reply) => {
+    try {
+      const jobId = await enqueueSocadelSync({
+        requestedBy: request.user?.username || 'agent'
+      });
+      return reply.send({
+        success: true,
+        queued: true,
+        jobId,
+        message: 'Synchronisation en file d’attente'
+      });
+    } catch (err) {
+      request.log?.error?.(err) || console.error('[socadel/sync]', err);
+      return reply.code(500).send({ success: false, message: 'Impossible d’enfiler la sync' });
+    }
+  });
+
+  // ── GET /export-pdf ──
+  fastify.get('/export-pdf', auth, async (request, reply) => {
+    const { itineraires } = request.query;
+    if (!itineraires) {
+      return reply.code(400).send({ success: false, message: 'itineraires requis' });
+    }
+    const list = String(itineraires).split(',').map((i) => i.trim()).filter(Boolean);
+    if (list.length === 0) {
+      return reply.code(400).send({ success: false, message: 'Aucun itinéraire valide' });
+    }
+
+    try {
+      const result = await query(
+        `SELECT * FROM socadel_contacts
+         WHERE itineraires = ANY($1::text[])
+         ORDER BY itineraires, service_no`,
+        [list]
+      );
+      if (result.rows.length === 0) {
+        return reply.code(404).send({
+          success: false,
+          message: 'Aucune donnée pour les itinéraires sélectionnés'
+        });
+      }
+      if (result.rows.length > 15000) {
+        return reply.code(413).send({
+          success: false,
+          message: 'Trop de lignes pour un export PDF unique (max 15000). Filtrez les itinéraires.'
+        });
+      }
+
+      const pdfBuffer = await generateBordereauPDF(result.rows, list);
+      return reply
+        .header('Content-Type', 'application/pdf')
+        .header('Content-Disposition', `attachment; filename="bordereau_socadel_${Date.now()}.pdf"`)
+        .send(pdfBuffer);
+    } catch (err) {
+      request.log?.error?.(err) || console.error('[socadel/export-pdf]', err);
+      return reply.code(500).send({ success: false, message: 'Erreur génération PDF' });
+    }
+  });
+
+  // ── GET /export-csv ──
+  fastify.get('/export-csv', auth, async (request, reply) => {
+    const { itineraires, meter_no, service_no } = request.query;
+    if (!itineraires) {
+      return reply.code(400).send({ success: false, message: 'itineraires requis' });
+    }
+    const list = String(itineraires).split(',').map((i) => i.trim()).filter(Boolean);
+    if (list.length === 0) {
+      return reply.code(400).send({ success: false, message: 'Aucun itinéraire valide' });
+    }
+
+    const params = [list];
+    let where = `WHERE itineraires = ANY($1::text[])`;
+    if (meter_no) {
+      params.push(`%${meter_no}%`);
+      where += ` AND meter_no ILIKE $${params.length}`;
+    }
+    if (service_no) {
+      params.push(`%${service_no}%`);
+      where += ` AND service_no ILIKE $${params.length}`;
+    }
+
+    try {
+      const result = await query(
+        `SELECT
+           region, division, agence, service_no, noms, categorie, mrc,
+           ref_geo, itineraires, meter_no, numero_telephone, identite, rapport,
+           check_status, check_date, api_status, api_date,
+           statut, responsable, activated_at
+         FROM socadel_contacts
+         ${where}
+         ORDER BY itineraires, ref_geo
+         LIMIT 50000`,
+        params
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({
+          success: false,
+          message: 'Aucune donnée pour les itinéraires sélectionnés'
+        });
+      }
+
+      const headers = [
+        'REGION', 'DIVISION', 'AGENCE', 'SERVICE_NO', 'NOMS', 'CATEGORIE', 'MRC',
+        'REF_GEO', 'ITINERAIRE', 'METER_NO', 'NUMERO_TELEPHONE', 'IDENTITE', 'RAPPORT',
+        'CHECK', 'CHECK_DATE', 'API', 'API_DATE', 'STATUT', 'RESPONSABLE', 'DATE_ABONNEMENT'
+      ];
+
+      const escapeCsv = (val) => {
+        if (val == null || val === '') return '';
+        const s = String(val);
+        if (/^\d{4}-\d{2}-\d{2}/.test(s) && !Number.isNaN(Date.parse(s))) {
+          return `"${new Date(s).toLocaleString('fr-FR').replace(/"/g, '""')}"`;
+        }
+        if (/[",\n\r;]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      };
+
+      const lines = [headers.join(';')];
+      for (const row of result.rows) {
+        lines.push(
+          [
+            row.region, row.division, row.agence, row.service_no, row.noms, row.categorie, row.mrc,
+            row.ref_geo, row.itineraires, row.meter_no, row.numero_telephone, row.identite, row.rapport,
+            row.check_status, row.check_date, row.api_status, row.api_date,
+            row.statut, row.responsable, row.activated_at
+          ].map(escapeCsv).join(';')
+        );
+      }
+
+      const csv = '\uFEFF' + lines.join('\r\n');
+      return reply
+        .header('Content-Type', 'text/csv; charset=utf-8')
+        .header('Content-Disposition', `attachment; filename="export_socadel_${Date.now()}.csv"`)
+        .send(csv);
+    } catch (err) {
+      request.log?.error?.(err) || console.error('[socadel/export-csv]', err);
+      return reply.code(500).send({ success: false, message: 'Erreur génération CSV' });
+    }
+  });
+
+  // GET /progress?itineraires=125370,125369
+fastify.get('/progress', auth, async (request, reply) => {
+  const { itineraires } = request.query;
+  if (!itineraires) {
+    return reply.code(400).send({ success: false, message: 'itineraires requis' });
+  }
+
+  const list = String(itineraires)
+    .split(',')
+    .map((i) => i.trim())
+    .filter(Boolean);
+
+  if (list.length === 0) {
+    return reply.code(400).send({ success: false, message: 'Aucun itinéraire valide' });
+  }
+
+  const result = await query(
+    `SELECT
+       itineraires,
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+       COUNT(*) FILTER (WHERE check_status IS NULL OR check_status <> 'OK')::int AS remaining,
+       COUNT(*) FILTER (WHERE statut = 'ABONNE')::int AS abonne,
+       COUNT(*) FILTER (WHERE UPPER(COALESCE(rapport, 'OK')) = 'MRA')::int AS mra
+     FROM socadel_contacts
+     WHERE itineraires = ANY($1::text[])
+     GROUP BY itineraires
+     ORDER BY itineraires`,
+    [list]
+  );
+
+  const rows = result.rows.map((r) => ({
+    ...r,
+    percent: r.total > 0 ? Math.round((r.checked / r.total) * 1000) / 10 : 0
+  }));
+
+  const global = rows.reduce(
+    (acc, r) => {
+      acc.total += r.total;
+      acc.checked += r.checked;
+      acc.remaining += r.remaining;
+      return acc;
+    },
+    { total: 0, checked: 0, remaining: 0 }
+  );
+  global.percent =
+    global.total > 0 ? Math.round((global.checked / global.total) * 1000) / 10 : 0;
+
+  return reply.send({ success: true, byItinerary: rows, global });
+});
+
+  // ── GET /stats (cache Redis 60s) ──
+  fastify.get('/stats', auth, async (request, reply) => {
+    const { redis } = require('../../config/redis');
+
+  // 1) Essayer le cache
+  try {
+    const cached = await redis.get('socadel:stats');
+    if (cached) {
+      return reply.send(JSON.parse(cached)); // déjà en mémoire → on s'arrête là
+    }
+  } catch (e) {
+    // Redis down ? on continue avec SQL, pas de plantage
+  }
+
+    const [global, byRegion, byDivision, byAgence, byMrc, byItinerary, byDay] =
+      await Promise.all([
+        query(`
+          SELECT
+            COUNT(*)::int AS total,
+            COUNT(CASE WHEN numero_telephone IS NOT NULL AND numero_telephone <> '' THEN 1 END)::int AS with_phone,
+            COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne,
+            COUNT(CASE WHEN statut = 'NON ABONNE' THEN 1 END)::int AS non_abonne,
+            COUNT(CASE WHEN check_status = 'OK' THEN 1 END)::int AS checked,
+            COUNT(CASE WHEN api_status = 'OK' THEN 1 END)::int AS api_ok,
+            COUNT(CASE WHEN api_status = 'NOK' THEN 1 END)::int AS api_nok,
+            COUNT(CASE WHEN responsable = 'TERRAIN' THEN 1 END)::int AS terrain,
+            COUNT(CASE WHEN responsable = 'AUTRES' THEN 1 END)::int AS autres
+          FROM socadel_contacts
+        `),
+        query(`
+          SELECT region, COUNT(*)::int AS total,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne,
+                 COUNT(CASE WHEN check_status = 'OK' THEN 1 END)::int AS checked
+          FROM socadel_contacts WHERE region IS NOT NULL
+          GROUP BY region ORDER BY total DESC
+        `),
+        query(`
+          SELECT division, COUNT(*)::int AS total,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne
+          FROM socadel_contacts WHERE division IS NOT NULL
+          GROUP BY division ORDER BY total DESC
+        `),
+        query(`
+          SELECT agence, COUNT(*)::int AS total,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne
+          FROM socadel_contacts WHERE agence IS NOT NULL
+          GROUP BY agence ORDER BY total DESC LIMIT 20
+        `),
+        query(`
+          SELECT mrc, COUNT(*)::int AS total,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne
+          FROM socadel_contacts WHERE mrc IS NOT NULL
+          GROUP BY mrc ORDER BY total DESC LIMIT 20
+        `),
+        query(`
+          SELECT itineraires, COUNT(*)::int AS total,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne,
+                 COUNT(CASE WHEN check_status = 'OK' THEN 1 END)::int AS checked
+          FROM socadel_contacts WHERE itineraires IS NOT NULL
+          GROUP BY itineraires ORDER BY total DESC LIMIT 50
+        `),
+        query(`
+          SELECT DATE(COALESCE(check_date, api_date, updated_at)) AS jour,
+                 COUNT(*)::int AS total,
+                 COUNT(CASE WHEN check_status = 'OK' THEN 1 END)::int AS checked,
+                 COUNT(CASE WHEN statut = 'ABONNE' THEN 1 END)::int AS abonne
+          FROM socadel_contacts
+          WHERE COALESCE(check_date, api_date, updated_at) >= NOW() - INTERVAL '30 days'
+          GROUP BY jour ORDER BY jour
+        `)
+      ]);
+
+    const g = global.rows[0];
+    const payload = {
+      success: true,
+      stats: {
+        ...g,
+        taux_abonnement: g.total > 0 ? Math.round((g.abonne / g.total) * 1000) / 10 : 0,
+        taux_check: g.total > 0 ? Math.round((g.checked / g.total) * 1000) / 10 : 0,
+        taux_api_ok: g.total > 0 ? Math.round((g.api_ok / g.total) * 1000) / 10 : 0
+      },
+      byRegion: byRegion.rows,
+      byDivision: byDivision.rows,
+      byAgence: byAgence.rows,
+      byMrc: byMrc.rows,
+      byItinerary: byItinerary.rows,
+      byDay: byDay.rows
+    };
+
+   try {
+    await redis.set('socadel:stats', JSON.stringify(payload), 'EX', 60);
+  } catch (e) {
+    // ignore si Redis indisponible
+  }
+
+  return reply.send(payload);
+});
+}
+
+module.exports = socadelRoutes;

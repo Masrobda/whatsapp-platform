@@ -1,0 +1,839 @@
+'use client';
+
+import { useState, useEffect, useCallback } from 'react';
+import {
+  FiRefreshCw,
+  FiDownload,
+  FiSearch,
+  FiCheck,
+  FiX,
+  FiLogOut,
+  FiFileText
+} from 'react-icons/fi';
+import { useRouter } from 'next/navigation';
+import Tabs from '@/components/ui/Tabs';
+import StatsTab from './StatsTab';
+
+type Contact = {
+  id: string;
+  region: string;
+  division: string;
+  agence: string;
+  service_no: string;
+  noms: string;
+  categorie: string;
+  mrc: string;
+  ref_geo: string;
+  itineraires: string;
+  meter_no: string;
+  numero_telephone: string;
+  check_status: string | null;
+  check_date: string | null;
+  api_status: string | null;
+  api_date: string | null;
+  statut: string | null;
+  responsable: string | null;
+  activated_at: string | null;
+  rapport: string | null;
+  identite: string | null;
+};
+
+export default function SocadelDashboard() {
+  const router = useRouter();
+  const [token, setToken] = useState<string | null>(null);
+  const [itineraryInput, setItineraryInput] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [data, setData] = useState<Contact[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [checkingItinerary, setCheckingItinerary] = useState<string | null>(null); // pour un itinéraire spécifique
+  const [checkingAll, setCheckingAll] = useState(false); // pour l'action globale
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [limit] = useState(50);
+  const [filters, setFilters] = useState({ meter_no: '', service_no: '' });
+  const [activeTab, setActiveTab] = useState<'table' | 'stats'>('table');
+
+  // Auth guard
+  useEffect(() => {
+    const t = localStorage.getItem('socadel_token');
+    if (!t) {
+      router.replace('/socadel/login');
+      return;
+    }
+    setToken(t);
+  }, [router]);
+
+  const applyItineraries = () => {
+    const list = itineraryInput
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (list.length === 0) {
+      alert('Saisissez au moins un numéro d’itinéraire');
+      return;
+    }
+
+    const unique = [...new Set(list)];
+    setSelected(unique);
+    setPage(1);
+  };
+
+  // Charger les données
+  const fetchData = useCallback(async () => {
+    if (!token || selected.length === 0) {
+      setData([]);
+      setTotal(0);
+      return;
+    }
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        itineraires: selected.join(','),
+        page: String(page),
+        limit: String(limit)
+      });
+      if (filters.meter_no) params.set('meter_no', filters.meter_no);
+      if (filters.service_no) params.set('service_no', filters.service_no);
+
+      const res = await fetch(`/api/v1/socadel/data?${params}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        localStorage.removeItem('socadel_token');
+        router.replace('/socadel/login');
+        return;
+      }
+      const json = await res.json();
+      if (json.success) {
+        setData(json.data);
+        setTotal(json.pagination.total);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [token, selected, page, limit, filters, router]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  // Check individuel
+  const handleCheck = async (id: string, current: string | null) => {
+    if (!token) return;
+    const next = current === 'OK' ? null : 'OK';
+    try {
+      const res = await fetch('/api/v1/socadel/update-check', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id, check_status: next })
+      });
+      const json = await res.json();
+      if (json.success) {
+        setData((prev) =>
+          prev.map((r) =>
+            r.id === id
+              ? {
+                  ...r,
+                  check_status: json.data.check_status,
+                  check_date: json.data.check_date,
+                  responsable: json.data.responsable
+                }
+              : r
+          )
+        );
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Check tout un itinéraire (individuel via tag)
+  const checkItinerary = async (itinerary: string) => {
+    if (!token) return;
+    setCheckingItinerary(itinerary);
+    try {
+      const res = await fetch('/api/v1/socadel/check-itinerary', {
+        method: 'PUT', // conforme à la spécification
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ itineraires: [itinerary], check_status: 'OK' })
+      });
+      if (!res.ok) throw new Error('Erreur lors du check de l\'itinéraire');
+      await fetchData();
+    } catch (e) {
+      console.error(e);
+      alert('Impossible de checker tous les contacts de cet itinéraire.');
+    } finally {
+      setCheckingItinerary(null);
+    }
+  };
+
+  // Check / Uncheck global sur tous les itinéraires sélectionnés
+  const checkEntireItinerary = async (status: 'OK' | null) => {
+    if (!token || selected.length === 0) return;
+    const action = status === 'OK' ? 'Marquer CHECK = OK' : 'Retirer le CHECK';
+    if (
+      !confirm(
+        `${action} pour tous les contacts des itinéraires : ${selected.join(', ')} ?`
+      )
+    ) {
+      return;
+    }
+
+    setCheckingAll(true);
+    try {
+      const res = await fetch('/api/v1/socadel/check-itinerary', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ itineraires: selected, check_status: status })
+      });
+      const json = await res.json();
+      if (json.success) {
+        await fetchData();
+      } else {
+        alert(json.message || 'Erreur');
+      }
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    } finally {
+      setCheckingAll(false);
+    }
+  };
+
+  const exportPDF = async () => {
+    if (!token || selected.length === 0) return;
+    try {
+      const res = await fetch(
+        `/api/v1/socadel/export-pdf?itineraires=${selected.join(',')}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) throw new Error('Erreur export');
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `bordereau_${new Date().toISOString().slice(0, 10)}.pdf`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+      alert('Impossible de générer le PDF');
+    }
+  };
+
+    const exportCSV = async () => {
+    if (!token || selected.length === 0) return;
+    try {
+      const params = new URLSearchParams({
+        itineraires: selected.join(',')
+      });
+      if (filters.meter_no) params.set('meter_no', filters.meter_no);
+      if (filters.service_no) params.set('service_no', filters.service_no);
+
+      const res = await fetch(`/api/v1/socadel/export-csv?${params}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || 'Erreur export CSV');
+      }
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `export_socadel_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+      alert(e instanceof Error ? e.message : 'Impossible de générer le CSV');
+    }
+  };
+
+    const handleIdentite = async (id: string, identite: 'proprietaire' | 'relation') => {
+    if (!token) return;
+    try {
+      const res = await fetch('/api/v1/socadel/update-identite', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id, identite })
+      });
+      const json = await res.json();
+      if (!json.success) {
+        alert(json.message || 'Erreur');
+        return;
+      }
+      setData((prev) =>
+        prev.map((r) =>
+          r.id === id ? { ...r, identite: json.data.identite } : r
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+    const handleRapport = async (
+    id: string,
+    rapport: 'OK' | 'MRA',
+    currentPhone: string | null
+  ) => {
+    if (!token) return;
+
+    let numero_telephone = currentPhone || '+237';
+
+    if (rapport === 'MRA') {
+      const input = window.prompt(
+        'Numéro WhatsApp obligatoire (format +237XXXXXXXXX) :',
+        numero_telephone.startsWith('+237') ? numero_telephone : '+237'
+      );
+      if (input === null) return; // annulé
+      const phone = input.replace(/[\s\-.]/g, '').trim();
+      if (!/^\+237[0-9]{9}$/.test(phone)) {
+        alert('Numéro invalide. Format attendu : +237 suivi de 9 chiffres.');
+        return;
+      }
+      numero_telephone = phone;
+    }
+
+    try {
+      const res = await fetch('/api/v1/socadel/update-rapport', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          id,
+          rapport,
+          numero_telephone: rapport === 'MRA' ? numero_telephone : undefined
+        })
+      });
+      const json = await res.json();
+      if (!json.success) {
+        alert(json.message || 'Erreur');
+        return;
+      }
+      setData((prev) =>
+        prev.map((r) =>
+          r.id === id
+            ? {
+                ...r,
+                rapport: json.data.rapport,
+                numero_telephone: json.data.numero_telephone ?? r.numero_telephone,
+                responsable: json.data.responsable
+              }
+            : r
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+  const syncAPI = async () => {
+    if (!token) return;
+    setSyncing(true);
+    try {
+      await fetch('/api/v1/socadel/sync', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      await fetchData();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const logout = () => {
+    localStorage.removeItem('socadel_token');
+    router.replace('/socadel/login');
+  };
+
+  if (!token) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <p className="text-blue-600">Chargement…</p>
+      </div>
+    );
+  }
+
+  const tableContent = (
+    <div className="space-y-4">
+      {/* Saisie des itinéraires */}
+      <div className="bg-white p-4 rounded-xl shadow-sm border border-blue-100">
+        <div className="mb-3">
+          <span className="text-sm font-semibold text-blue-800">
+            Itinéraires
+          </span>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Saisissez le(s) numéro(s) d’itinéraire que vous connaissez (séparés par virgule ou espace).
+          </p>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-3">
+          <input
+            type="text"
+            value={itineraryInput}
+            onChange={(e) => setItineraryInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && applyItineraries()}
+            placeholder="Ex: 117187, 110708, 3493"
+            className="flex-1 border border-blue-200 rounded-xl px-4 py-2.5 text-sm
+                       focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none
+                       font-mono"
+          />
+          <button
+            onClick={applyItineraries}
+            className="px-5 py-2.5 bg-blue-700 hover:bg-blue-800 text-white
+                       rounded-xl text-sm font-semibold transition whitespace-nowrap"
+          >
+            Valider
+          </button>
+        </div>
+
+        {selected.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-500">Actifs :</span>
+            {selected.map((it) => (
+              <span
+                key={it}
+                className="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-100
+                           text-blue-800 rounded-full text-xs font-medium font-mono"
+              >
+                {it}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = selected.filter((i) => i !== it);
+                    setSelected(next);
+                    setItineraryInput(next.join(', '));
+                    setPage(1);
+                  }}
+                  className="hover:text-red-600 ml-0.5"
+                  aria-label="Retirer"
+                >
+                  ×
+                </button>
+                <button
+                  type="button"
+                  onClick={() => checkItinerary(it)}
+                  disabled={checkingItinerary === it || checkingAll}
+                  className="ml-1 text-emerald-600 hover:text-emerald-800 disabled:opacity-50"
+                  aria-label="Tout checker"
+                >
+                  {checkingItinerary === it ? (
+                    <FiRefreshCw size={12} className="animate-spin" />
+                  ) : (
+                    <FiCheck size={12} />
+                  )}
+                </button>
+              </span>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setSelected([]);
+                setItineraryInput('');
+                setData([]);
+                setTotal(0);
+                setPage(1);
+              }}
+              className="text-xs text-red-600 hover:underline ml-1"
+            >
+              Tout effacer
+            </button>
+          </div>
+        )}
+
+        <div className="mt-4 flex flex-wrap gap-2 justify-end">
+          {/* Boutons globaux Check / Uncheck */}
+          <button
+            onClick={() => checkEntireItinerary('OK')}
+            disabled={checkingAll || checkingItinerary !== null || selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700
+                       hover:bg-emerald-800 disabled:bg-emerald-400 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiCheck size={14} />
+            Check itinéraire
+          </button>
+          <button
+            onClick={() => checkEntireItinerary(null)}
+            disabled={checkingAll || checkingItinerary !== null || selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-500
+                       hover:bg-slate-600 disabled:bg-slate-300 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiX size={14} />
+            Uncheck itinéraire
+          </button>
+
+          <button
+            onClick={syncAPI}
+            disabled={syncing || selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600
+                       hover:bg-emerald-700 disabled:bg-emerald-400 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiRefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
+            Sync API
+          </button>
+          <button
+            onClick={exportPDF}
+            disabled={selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600
+                       hover:bg-blue-700 disabled:bg-blue-300 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiDownload size={14} />
+            PDF
+          </button>
+          <button
+  onClick={exportCSV}
+  disabled={selected.length === 0}
+  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600
+             hover:bg-indigo-700 disabled:bg-indigo-300 text-white
+             rounded-lg text-sm font-medium transition"
+>
+  <FiFileText size={14} />
+  CSV
+</button>    
+    </div>
+      </div>
+
+      {/* Filtres */}
+      {selected.length > 0 && (
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-blue-100 flex flex-wrap gap-3 items-end">
+          <div>
+            <label className="block text-xs font-medium text-blue-800 mb-1">
+              Meter No
+            </label>
+            <input
+              type="text"
+              value={filters.meter_no}
+              onChange={(e) =>
+                setFilters((p) => ({ ...p, meter_no: e.target.value }))
+              }
+              placeholder="Rechercher…"
+              className="border border-blue-200 rounded-lg px-3 py-2 text-sm
+                         focus:ring-2 focus:ring-blue-400 outline-none w-40"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-blue-800 mb-1">
+              Service No
+            </label>
+            <input
+              type="text"
+              value={filters.service_no}
+              onChange={(e) =>
+                setFilters((p) => ({ ...p, service_no: e.target.value }))
+              }
+              placeholder="Rechercher…"
+              className="border border-blue-200 rounded-lg px-3 py-2 text-sm
+                         focus:ring-2 focus:ring-blue-400 outline-none w-40"
+            />
+          </div>
+          <button
+            onClick={() => {
+              setPage(1);
+              fetchData();
+            }}
+            className="inline-flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700
+                       text-white px-4 py-2 rounded-lg text-sm font-medium transition"
+          >
+            <FiSearch size={14} />
+            Filtrer
+          </button>
+          <div className="ml-auto text-sm text-blue-700 font-medium self-center">
+            {total} ligne{total > 1 ? 's' : ''}
+          </div>
+        </div>
+      )}
+
+      {/* Tableau */}
+      <div className="bg-white rounded-xl shadow-sm border border-blue-100 overflow-hidden">
+        {selected.length === 0 ? (
+          <div className="p-12 text-center text-slate-400">
+            <p className="text-lg font-medium text-slate-500 mb-1">
+              Saisissez un ou plusieurs itinéraires
+            </p>
+            <p className="text-sm">
+              Entrez les numéros que vous connaissez, puis cliquez sur Valider.
+            </p>
+          </div>
+        ) : loading ? (
+          <div className="p-12 text-center text-blue-500">Chargement…</div>
+        ) : data.length === 0 ? (
+          <div className="p-12 text-center text-slate-400">
+            Aucune donnée pour les itinéraires / filtres sélectionnés
+          </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-blue-100 text-sm">
+                <thead className="bg-blue-50 sticky top-0">
+                  <tr>
+                    {[
+                      'REGION',
+                      'DIVISION',
+                      'AGENCE',
+                      'SERVICE NO',
+                      'NOMS',
+                      'CATEGORIE',
+                      'MRC',
+                      'REF GEO',
+                      'ITINERAIRE',
+                      'METER NO',
+                      'TELEPHONE',
+                      'RAPPORT',
+                      'IDENTITE',
+                      'CHECK',
+                      'CHECK DATE',
+                      'API',
+                      'API DATE',
+                      'DATE ABONNEMENT',
+                      'STATUT',
+                      'RESPONSABLE'
+                              
+                ].map((h) => (
+                      <th
+                        key={h}
+                        className="px-3 py-3 text-left text-[10px] font-semibold
+                                   text-blue-800 uppercase tracking-wider whitespace-nowrap"
+                      >
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-blue-50">
+                  {data.map((row) => (
+                    <tr key={row.id} className="hover:bg-blue-50/40 transition">
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.region}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.division}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.agence}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        {row.service_no}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs truncate" title={row.noms}>
+                        {row.noms}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.categorie}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.mrc}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        {row.ref_geo}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">{row.itineraires}</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        {row.meter_no}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        {row.numero_telephone}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+  <select
+    value={row.rapport === 'MRA' ? 'MRA' : 'OK'}
+    onChange={(e) =>
+      handleRapport(
+        row.id,
+        e.target.value as 'OK' | 'MRA',
+        row.numero_telephone
+      )
+    }
+    className={`text-xs font-medium rounded-lg border px-2 py-1 outline-none cursor-pointer
+      ${
+        row.rapport === 'MRA'
+          ? 'border-amber-300 bg-amber-50 text-amber-800'
+          : 'border-blue-200 bg-blue-50 text-blue-800'
+      }`}
+  >
+    <option value="OK">OK</option>
+    <option value="MRA">MRA</option>
+  </select>
+</td>
+                   <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+  <select
+    value={row.identite === 'relation' ? 'relation' : 'proprietaire'}
+    onChange={(e) =>
+      handleIdentite(row.id, e.target.value as 'proprietaire' | 'relation')
+    }
+    className={`text-xs font-medium rounded-lg border px-2 py-1 outline-none cursor-pointer
+      ${
+        row.identite === 'relation'
+          ? 'border-violet-300 bg-violet-50 text-violet-800'
+          : 'border-blue-200 bg-blue-50 text-blue-800'
+      }`}
+  >
+    <option value="proprietaire">Propriétaire</option>
+    <option value="relation">Relation</option>
+  </select>
+</td>   
+                   
+                    <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        <button
+                          onClick={() => handleCheck(row.id, row.check_status)}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full
+                                      text-xs font-medium transition
+                            ${
+                              row.check_status === 'OK'
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : 'bg-slate-100 text-slate-400 hover:bg-slate-200'
+                            }`}
+                        >
+                          {row.check_status === 'OK' ? (
+                            <FiCheck size={12} />
+                          ) : (
+                            <FiX size={12} />
+                          )}
+                          {row.check_status || '—'}
+                        </button>
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+                        {row.check_date
+                          ? new Date(row.check_date).toLocaleDateString('fr-FR')
+                          : ''}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-xs font-medium
+                            ${
+                              row.api_status === 'OK'
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : row.api_status === 'NOK'
+                                ? 'bg-red-100 text-red-700'
+                                : 'bg-slate-100 text-slate-500'
+                            }`}
+                        >
+                          {row.api_status || '—'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+                        {row.api_date
+                          ? new Date(row.api_date).toLocaleDateString('fr-FR')
+                          : ''}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+  {row.activated_at
+    ? new Date(row.activated_at).toLocaleString('fr-FR')
+    : '—'}
+</td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-xs font-medium
+                            ${
+                              row.statut === 'ABONNE'
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : 'bg-red-100 text-red-700'
+                            }`}
+                        >
+                          {row.statut || 'NON ABONNE'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                        {row.responsable || 'AUTRES'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            {total > limit && (
+              <div className="flex justify-between items-center px-4 py-3 bg-blue-50/60 border-t border-blue-100">
+                <span className="text-sm text-blue-800">
+                  {total} ligne{total > 1 ? 's' : ''} — page {page} /{' '}
+                  {Math.ceil(total / limit)}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => p - 1)}
+                    className="px-3 py-1.5 border border-blue-300 rounded-lg text-sm
+                               disabled:opacity-40 hover:bg-blue-50 transition"
+                  >
+                    Précédent
+                  </button>
+                  <button
+                    disabled={page * limit >= total}
+                    onClick={() => setPage((p) => p + 1)}
+                    className="px-3 py-1.5 border border-blue-300 rounded-lg text-sm
+                               disabled:opacity-40 hover:bg-blue-50 transition"
+                  >
+                    Suivant
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  const tabs = [
+    {
+      id: 'table',
+      label: `Données${selected.length > 0 ? ` (${total})` : ''}`,
+      content: tableContent
+    },
+    {
+      id: 'stats',
+      label: 'Statistiques',
+      content: <StatsTab token={token} />
+    }
+  ];
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-blue-100 sticky top-0 z-20">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img src="/assets/socad.png" alt="Socadel" className="h-9" />
+            <div>
+              <h1 className="text-lg font-bold text-blue-900 leading-tight">
+                Campagne de collecte WhatsApp
+              </h1>
+              <p className="text-xs text-blue-600/70">Socadel</p>
+            </div>
+          </div>
+          <button
+            onClick={logout}
+            className="inline-flex items-center gap-1.5 text-sm text-blue-700
+                       hover:text-blue-900 font-medium transition"
+          >
+            <FiLogOut size={15} />
+            Déconnexion
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+        <Tabs tabs={tabs} defaultTab="table" />
+      </main>
+    </div>
+  );
+}

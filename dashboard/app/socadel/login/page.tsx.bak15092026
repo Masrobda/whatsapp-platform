@@ -1,0 +1,381 @@
+'use client';
+
+import { useState, FormEvent } from 'react';
+import { useRouter } from 'next/navigation';
+import { setSocadelSession, apiUrl } from '../../lib/socadel-auth';
+
+type TabId = 'releveur' | 'agent';
+type ReleveurMode = 'login' | 'register';
+type AgentStep = 'login' | 'register' | 'activate';
+
+const TABS: { id: TabId; label: string }[] = [
+  { id: 'releveur', label: 'Releveur' },
+  { id: 'agent', label: 'Agent Socadel' },
+];
+
+export default function SocadelLoginPage() {
+  const router = useRouter();
+  const [tab, setTab] = useState<TabId>('releveur');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [mode, setMode] = useState<ReleveurMode>('login');
+
+  const [phone, setPhone] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [entreprise, setEntreprise] = useState('');
+
+  const [email, setEmail] = useState('');
+  const [matricule, setMatricule] = useState('');
+  const [code, setCode] = useState('');
+  const [agentStep, setAgentStep] = useState<AgentStep>('login');
+
+  async function handleReleveurLogin(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/v1/auth/socadel-releveur/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Connexion impossible');
+      setSocadelSession({
+        token: data.token,
+        user: { role: 'releveur', ...data.releveur },
+      });
+      router.push('/socadel/dashboard');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleReleveurRegister(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/v1/auth/socadel-releveur/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone,
+          full_name: fullName,
+          entreprise,
+          password,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Inscription impossible');
+      setMode('login');
+      alert(data.message || 'Compte créé. Connectez-vous.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAgentLogin(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/v1/auth/socadel-agent/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (data.code === 'NOT_ACTIVATED') setAgentStep('activate');
+        throw new Error(data.message || 'Connexion impossible');
+      }
+      setSocadelSession({
+        token: data.token,
+        user: { role: 'agent_socadel', ...data.agent },
+      });
+      router.push('/socadel/dashboard');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAgentRegister(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/v1/auth/socadel-agent/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          matricule,
+          password,
+          full_name: fullName,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Inscription impossible');
+      setAgentStep('activate');
+      alert(data.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAgentActivate(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/v1/auth/socadel-agent/activate'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Activation impossible');
+      setAgentStep('login');
+      alert('Compte activé. Connectez-vous.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erreur');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-white flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-blue-100 overflow-hidden">
+        <div className="bg-blue-800 text-white px-6 py-5 text-center">
+          <img src="/socad.png" alt="Socadel" className="h-12 mx-auto mb-2" />
+          <h1 className="text-xl font-semibold">Socadel Collecte</h1>
+          <p className="text-sm text-blue-100 mt-1">Facture digitale WhatsApp</p>
+        </div>
+
+        <div className="flex border-b border-slate-200">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => {
+                setTab(t.id);
+                setError('');
+                setMode('login');
+                setAgentStep('login');
+              }}
+              className={`flex-1 py-3 text-sm font-medium ${
+                tab === t.id
+                  ? 'text-blue-800 border-b-2 border-blue-700 bg-blue-50/50'
+                  : 'text-slate-500'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="p-6">
+          {error && (
+            <div className="mb-4 rounded-lg bg-red-50 text-red-700 text-sm px-3 py-2 border border-red-100">
+              {error}
+            </div>
+          )}
+
+          {tab === 'releveur' && mode === 'login' && (
+            <form onSubmit={handleReleveurLogin} className="space-y-4">
+              <Field
+                label="Téléphone"
+                value={phone}
+                onChange={setPhone}
+                placeholder="+2376XXXXXXXX"
+                inputMode="tel"
+              />
+              <Field
+                label="Mot de passe"
+                type="password"
+                value={password}
+                onChange={setPassword}
+              />
+              <Btn loading={loading}>Se connecter</Btn>
+              <p className="text-center text-sm text-slate-500">
+                Pas de compte ?{' '}
+                <button
+                  type="button"
+                  className="text-blue-700 font-medium"
+                  onClick={() => setMode('register')}
+                >
+                  Créer un compte
+                </button>
+              </p>
+            </form>
+          )}
+
+          {tab === 'releveur' && mode === 'register' && (
+            <form onSubmit={handleReleveurRegister} className="space-y-4">
+              <Field label="Nom complet" value={fullName} onChange={setFullName} required />
+              <Field label="Entreprise" value={entreprise} onChange={setEntreprise} required />
+              <Field
+                label="Téléphone"
+                value={phone}
+                onChange={setPhone}
+                placeholder="+2376XXXXXXXX"
+                inputMode="tel"
+                required
+              />
+              <Field
+                label="Mot de passe (8 car. min.)"
+                type="password"
+                value={password}
+                onChange={setPassword}
+                required
+              />
+              <Btn loading={loading}>Créer mon compte</Btn>
+              <p className="text-center text-sm text-slate-500">
+                <button type="button" className="text-blue-700" onClick={() => setMode('login')}>
+                  Déjà un compte ? Connexion
+                </button>
+              </p>
+            </form>
+          )}
+
+          {tab === 'agent' && agentStep === 'login' && (
+            <form onSubmit={handleAgentLogin} className="space-y-4">
+              <Field
+                label="Email Socadel"
+                type="email"
+                value={email}
+                onChange={setEmail}
+                placeholder="prenom@camlight.cm"
+              />
+              <Field
+                label="Mot de passe"
+                type="password"
+                value={password}
+                onChange={setPassword}
+              />
+              <Btn loading={loading}>Se connecter</Btn>
+              <p className="text-center text-sm text-slate-500 space-y-1">
+                <button
+                  type="button"
+                  className="text-blue-700 block w-full"
+                  onClick={() => setAgentStep('register')}
+                >
+                  Créer un compte agent
+                </button>
+                <button
+                  type="button"
+                  className="text-slate-500 text-xs block w-full"
+                  onClick={() => setAgentStep('activate')}
+                >
+                  Activer avec le code email
+                </button>
+              </p>
+            </form>
+          )}
+
+          {tab === 'agent' && agentStep === 'register' && (
+            <form onSubmit={handleAgentRegister} className="space-y-4">
+              <Field label="Nom complet" value={fullName} onChange={setFullName} />
+              <Field label="Matricule" value={matricule} onChange={setMatricule} required />
+              <Field
+                label="Email (@camlight.cm ou @eneo.cm)"
+                type="email"
+                value={email}
+                onChange={setEmail}
+                required
+              />
+              <Field
+                label="Mot de passe"
+                type="password"
+                value={password}
+                onChange={setPassword}
+                required
+              />
+              <Btn loading={loading}>S’inscrire</Btn>
+              <p className="text-center text-sm">
+                <button type="button" className="text-blue-700" onClick={() => setAgentStep('login')}>
+                  Retour connexion
+                </button>
+              </p>
+            </form>
+          )}
+
+          {tab === 'agent' && agentStep === 'activate' && (
+            <form onSubmit={handleAgentActivate} className="space-y-4">
+              <p className="text-sm text-slate-600">Code reçu par email Socadel.</p>
+              <Field label="Email" type="email" value={email} onChange={setEmail} />
+              <Field
+                label="Code d’activation"
+                value={code}
+                onChange={setCode}
+                inputMode="numeric"
+              />
+              <Btn loading={loading}>Activer le compte</Btn>
+              <p className="text-center text-sm">
+                <button type="button" className="text-blue-700" onClick={() => setAgentStep('login')}>
+                  Retour connexion
+                </button>
+              </p>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  type = 'text',
+  placeholder,
+  inputMode,
+  required,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  type?: string;
+  placeholder?: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode'];
+  required?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-slate-700">{label}</span>
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        inputMode={inputMode}
+        required={required}
+        className="mt-1 w-full rounded-xl border border-blue-200 px-3 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500"
+      />
+    </label>
+  );
+}
+
+function Btn({ children, loading }: { children: React.ReactNode; loading: boolean }) {
+  return (
+    <button
+      type="submit"
+      disabled={loading}
+      className="w-full rounded-xl bg-blue-700 hover:bg-blue-800 text-white font-semibold py-3 disabled:opacity-60"
+    >
+      {loading ? 'Patientez…' : children}
+    </button>
+  );
+}

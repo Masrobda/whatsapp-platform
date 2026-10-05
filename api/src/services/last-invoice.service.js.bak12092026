@@ -1,0 +1,144 @@
+// api/src/services/last-invoice.service.js
+'use strict';
+
+const { query } = require('../config/database');
+const watiService = require('./wati.service');
+const logger = require('../utils/logger');
+
+async function getLastInvoice(contractNumber) {
+  console.log(`[INVOICE] Recherche facture pour contrat: ${contractNumber}`);
+  try {
+    const result = await query(
+      `SELECT lien_pdf, date_creation, numero_facture, montant
+       FROM invoices_bot
+       WHERE numero_contrat = $1
+       ORDER BY date_creation DESC
+       LIMIT 1`,
+      [contractNumber]
+    );
+    const rows = result.rows || [];
+    if (rows.length > 0) {
+      console.log(`[INVOICE] Lien PDF: ${rows[0].lien_pdf}`);
+    }
+    return rows.length ? rows[0] : null;
+  } catch (err) {
+    logger.error(`[INVOICE] Erreur getLastInvoice: ${err.message}`);
+    return null;
+  }
+}
+
+async function getClientName(contractNumber) {
+  try {
+    const result = await query(
+      `SELECT client_name FROM contracts WHERE contract_number = $1`,
+      [contractNumber]
+    );
+    if (result.rows?.length) return result.rows[0].client_name;
+
+    const result2 = await query(
+      `SELECT client_name FROM whatsapp_valid_contacts WHERE contract_number = $1 LIMIT 1`,
+      [contractNumber]
+    );
+    return result2.rows?.length ? result2.rows[0].client_name : 'Client';
+  } catch (err) {
+    logger.error(`[INVOICE] Erreur getClientName: ${err.message}`);
+    return 'Client';
+  }
+}
+
+/**
+ * Envoie la dernière facture au client et loggue l’envoi
+ * @returns {{ success, alreadySent, message, localMessageId?, watiMessageId? }}
+ */
+async function requestLastInvoice(
+  contractNumber,
+  recipientPhone,
+  channelNumber = '+237688359040'
+) {
+  try {
+    const invoice = await getLastInvoice(contractNumber);
+    if (!invoice) {
+      logger.warn(`[INVOICE] Aucune facture pour contrat ${contractNumber}`);
+      return {
+        success: false,
+        alreadySent: false,
+        message: 'Aucune facture disponible pour ce contrat.'
+      };
+    }
+
+    const clientName = await getClientName(contractNumber);
+    const templateName = process.env.INVOICE_TEMPLATE_NAME || 'next_soc_chat_fact04_v4';
+    const templateLang = process.env.INVOICE_TEMPLATE_LANG || 'fr';
+
+    const params = {
+      '1': invoice.lien_pdf,
+      '2': clientName,
+      '3': invoice.numero_facture,
+      '4': contractNumber,
+      '5': invoice.montant
+    };
+
+    const sendResult = await watiService.sendTemplateMessage(
+      recipientPhone,
+      templateName,
+      params,
+      templateLang,
+      channelNumber
+    );
+
+    try {
+      await query(
+        `INSERT INTO invoice_send_logs
+           (contract_number, recipient_phone, pdf_link, template_name, status, error_message)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          contractNumber,
+          recipientPhone,
+          invoice.lien_pdf,
+          templateName,
+          sendResult.success ? 'sent' : 'failed',
+          sendResult.error || null
+        ]
+      );
+    } catch (logErr) {
+      logger.error(`[INVOICE] Erreur insertion log: ${logErr.message}`);
+    }
+
+    if (sendResult.success) {
+      logger.info(
+        `[INVOICE] Facture envoyée à ${recipientPhone} pour contrat ${contractNumber}`
+      );
+      return {
+        success: true,
+        alreadySent: false,
+        message: 'Facture envoyée avec succès',
+        // IDs pour socadel_invoice_pending + webhook étape 4
+        localMessageId:
+          sendResult.localMessageId ||
+          sendResult.local_message_id ||
+          null,
+        watiMessageId:
+          sendResult.watiMessageId ||
+          sendResult.waMessageId ||
+          sendResult.whatsappMessageId ||
+          null
+      };
+    }
+
+    logger.error(`[INVOICE] Échec envoi : ${sendResult.error}`);
+    return {
+      success: false,
+      alreadySent: false,
+      message: `Erreur d'envoi : ${sendResult.error}`
+    };
+  } catch (error) {
+    logger.error(`[INVOICE] Erreur pour ${contractNumber}:`, error.message);
+    return {
+      success: false,
+      alreadySent: false,
+      message: "Erreur technique lors de l'envoi de la facture"
+    };
+  }
+}
+
+module.exports = { requestLastInvoice, getLastInvoice, getClientName };

@@ -1,0 +1,184 @@
+'use client';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { auth } from '@/lib/api';
+import Cookies from 'js-cookie';
+import Button from '@/components/ui/Button';
+import Input from '@/components/ui/Input';
+import { FiMail, FiLock, FiAlertCircle } from 'react-icons/fi';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [formData, setFormData] = useState({
+    email: '',
+    password: '',
+    rememberMe: false,
+  });
+  const [userType, setUserType] = useState<'client' | 'user'>('client');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setIsLoading(true);
+
+    try {
+      // 1. Connexion initiale
+      const loginRes = await auth.login(formData.email, formData.password, userType);
+      console.log("Login API Response:", loginRes);
+
+      const token = loginRes.token;
+      const rawUserData = loginRes.user || loginRes.client;
+
+      if (!rawUserData) {
+        throw new Error("L'API n'a renvoyé aucune donnée utilisateur.");
+      }
+
+      const userData = {
+        ...rawUserData,
+        type: rawUserData.type || userType,
+      };
+
+      // 2. Stocker le token et les données utilisateur
+      Cookies.set('token', token, { expires: formData.rememberMe ? 30 : 7 });
+      const userString = JSON.stringify(userData);
+      console.log("Stockage du cookie user avec:", userString);
+
+      Cookies.set('user', userString, {
+        expires: formData.rememberMe ? 30 : 7,
+        path: '/',
+      });
+
+      // 3. Redirection
+      window.location.href = '/dashboard';
+    } catch (err: any) {
+      setError(err.response?.data?.message || err.message || 'Erreur de connexion');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+          <div className="min-h-screen bg-gradient-primary flex flex-col items-center justify-center px-4 relative">
+
+  {/* Logo tout en haut, centré */}
+  <div className="mb-8 md:mb-12">
+    <img
+      src="/logook1.png"
+      alt="NEXT LTD Logo"
+      className="h-20 md:h-24 w-auto object-contain drop-shadow-lg mx-auto"
+    />
+  </div>
+
+  <div className="max-w-md w-full">
+    <div className="bg-white rounded-lg shadow-custom-lg p-6 sm:p-8">
+      <h2 className="text-2xl font-bold text-dark text-center mb-6">Connexion</h2>
+
+          {/* Toggle Client/Equipe */}
+          <div className="flex gap-2 mb-6 p-1 bg-gray-100 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setUserType('client')}
+              className={`flex-1 py-2 px-4 rounded-md font-medium transition-all ${
+                userType === 'client'
+                  ? 'bg-white text-primary shadow-sm'
+                  : 'text-gray-600 hover:text-dark'
+              }`}
+            >
+              Client
+            </button>
+            <button
+              type="button"
+              onClick={() => setUserType('user')}
+              className={`flex-1 py-2 px-4 rounded-md font-medium transition-all ${
+                userType === 'user'
+                  ? 'bg-white text-primary shadow-sm'
+                  : 'text-gray-600 hover:text-dark'
+              }`}
+            >
+              Équipe
+            </button>
+          </div>
+
+          {/* Message d'erreur */}
+          {error && (
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-error">
+              <FiAlertCircle className="flex-shrink-0" />
+              <span className="text-sm">{error}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <Input
+              type="email"
+              label="Email"
+              placeholder="votre@email.com"
+              icon={<FiMail />}
+              value={formData.email}
+              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+              required
+            />
+            <Input
+              type="password"
+              label="Mot de passe"
+              placeholder="••••••••"
+              icon={<FiLock />}
+              value={formData.password}
+              onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+              required
+            />
+
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={formData.rememberMe}
+                  onChange={(e) => setFormData({ ...formData, rememberMe: e.target.checked })}
+                  className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+                />
+                <span className="text-sm text-gray-600">Se souvenir de moi</span>
+              </label>
+
+              <Link
+                href="/forgot-password"
+                className="text-sm text-primary hover:text-primary-dark font-medium"
+              >
+                Mot de passe oublié ?
+              </Link>
+            </div>
+
+            <Button
+              type="submit"
+              variant="primary"
+              className="w-full"
+              isLoading={isLoading}
+            >
+              Se connecter
+            </Button>
+          </form>
+
+          <div className="relative my-6">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-gray-300" />
+            </div>
+            <div className="relative flex justify-center text-sm">
+              <span className="px-2 bg-white text-gray-500">Nouveau client ?</span>
+            </div>
+          </div>
+
+          <Link href="/register">
+            <Button variant="outline" className="w-full">
+              Créer un compte
+            </Button>
+          </Link>
+        </div>
+
+        <p className="text-center text-white/80 text-sm mt-6">
+          © 2026 NEXT LTD - Tous droits réservés
+        </p>
+      </div>
+    </div>
+  );
+}

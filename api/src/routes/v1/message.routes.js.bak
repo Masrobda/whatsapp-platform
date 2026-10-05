@@ -1,0 +1,240 @@
+const {
+  sendMessageHandler,
+  getMessagesHandler,
+  getMessageByIdHandler,
+  getStatsHandler,
+  exportCSVHandler,
+  getQueueStatsHandler,
+  getActiveJobsHandler,
+  getFailedJobsHandler,
+  retryJobHandler,
+} = require('../../controllers/message.controller');
+
+const { authenticateJWT, authenticateApiToken } = require('../../middlewares/auth.middleware');
+const { requireRole, ROLES } = require('../../middlewares/role.middleware');
+
+/**
+ * Routes de gestion des messages
+ */
+async function messageRoutes(fastify, options) {
+
+  // ============================================
+  // ROUTES API (Avec API Token)
+  // ============================================
+
+  // Envoyer un message (API Token OU JWT)
+  fastify.post('/send', {
+    preHandler: [async (request, reply) => {
+      // Essayer d'abord l'API Token, sinon le JWT
+      try {
+        await authenticateApiToken(request, reply);
+      } catch {
+        await authenticateJWT(request, reply);
+      }
+    }],
+    schema: {
+      description: 'Envoyer un message WhatsApp',
+      tags: ['Messages'],
+      security: [{ bearerAuth: [] }],
+      body: {
+        type: 'object',
+        required: ['recipient_phone', 'message_type'],
+        properties: {
+          recipient_phone: { 
+            type: 'string',
+            pattern: '^\\+?[1-9]\\d{1,14}$',
+            description: 'Numéro au format E.164 (+237XXXXXXXXX)'
+          },
+          message_type: { 
+            type: 'string', 
+            enum: ['text', 'template', 'media'] 
+          },
+          message_content: { type: 'string' },
+          template_name: { type: 'string' },
+          template_language: { type: 'string', default: 'fr' },
+          template_params: { 
+            type: 'array',
+            items: { type: 'string' }
+          },
+          media_url: { type: 'string', format: 'uri' },
+          media_type: { 
+            type: 'string',
+            enum: ['image', 'video', 'document', 'audio']
+          }
+        }
+      },
+      response: {
+        201: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean' },
+            message: { type: 'string' },
+            data: { type: 'object' }
+          }
+        }
+      }
+    }
+  }, sendMessageHandler);
+
+  // ============================================
+  // ROUTES CLIENT (Avec JWT)
+  // ============================================
+
+  // Récupérer les messages
+  fastify.get('/', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer les messages du client',
+      tags: ['Messages'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          page: { type: 'integer', default: 1 },
+          limit: { type: 'integer', default: 5 },
+          status: { 
+            type: 'string',
+            enum: ['queued', 'sent', 'delivered', 'read', 'failed']
+          },
+          recipient_phone: { type: 'string' },
+          message_type: { 
+            type: 'string',
+            enum: ['text', 'template', 'media']
+          },
+          start_date: { type: 'string', format: 'date' },
+          end_date: { type: 'string', format: 'date' }
+        }
+      }
+    }
+  }, getMessagesHandler);
+
+fastify.get('/test-token', {
+  preHandler: [authenticateApiToken],
+}, async (request, reply) => {
+  return {
+    success: true,
+    clientId: request.client?.id,
+    token: request.headers.authorization
+  };
+});
+
+
+  // Récupérer un message
+  fastify.get('/:id', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer un message spécifique',
+      tags: ['Messages'],
+      security: [{ bearerAuth: [] }],
+      params: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', format: 'uuid' }
+        }
+      }
+    }
+  }, getMessageByIdHandler);
+
+  // Statistiques
+  fastify.get('/stats/summary', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Récupérer les statistiques des messages',
+      tags: ['Messages'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          period: {
+            type: 'string',
+            enum: ['7days', '30days', '90days'],
+            default: '30days'
+          }
+        }
+      }
+    }
+  }, getStatsHandler);
+
+  // Export CSV
+  fastify.get('/export/csv', {
+    preHandler: [authenticateJWT],
+    schema: {
+      description: 'Exporter les messages en CSV',
+      tags: ['Messages'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          start_date: { type: 'string', format: 'date' },
+          end_date: { type: 'string', format: 'date' }
+        }
+      }
+    }
+  }, exportCSVHandler);
+
+  // ============================================
+  // ROUTES ADMIN (Monitoring de la file)
+  // ============================================
+
+  // Stats de la file d'attente
+  fastify.get('/queue/stats', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Statistiques de la file d\'attente',
+      tags: ['Messages - Queue'],
+      security: [{ bearerAuth: [] }]
+    }
+  }, getQueueStatsHandler);
+
+  // Jobs actifs
+  fastify.get('/queue/active', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Jobs actifs dans la file',
+      tags: ['Messages - Queue'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', default: 10 }
+        }
+      }
+    }
+  }, getActiveJobsHandler);
+
+  // Jobs échoués
+  fastify.get('/queue/failed', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Jobs échoués dans la file',
+      tags: ['Messages - Queue'],
+      security: [{ bearerAuth: [] }],
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', default: 10 }
+        }
+      }
+    }
+  }, getFailedJobsHandler);
+
+  // Réessayer un job
+  fastify.post('/queue/:jobId/retry', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)],
+    schema: {
+      description: 'Réessayer un job échoué',
+      tags: ['Messages - Queue'],
+      security: [{ bearerAuth: [] }],
+      params: {
+        type: 'object',
+        properties: {
+          jobId: { type: 'string' }
+        }
+      }
+    }
+  }, retryJobHandler);
+
+}
+
+module.exports = messageRoutes;
