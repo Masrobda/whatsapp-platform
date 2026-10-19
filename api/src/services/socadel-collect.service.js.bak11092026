@@ -1,0 +1,164 @@
+// api/src/services/socadel-collect.service.js
+'use strict';
+
+const { query } = require('../config/database');
+
+function normalizePhone(p) {
+  if (!p) return '';
+  return String(p).replace(/[^0-9+]/g, '').trim();
+}
+
+function isValidPhone237(phone) {
+  return /^\+237[0-9]{9}$/.test(normalizePhone(phone));
+}
+
+const IDENTITE_OK = new Set(['proprietaire', 'relation', 'locataire', 'bailleur']);
+
+function normalizeIdentite(v) {
+  const x = String(v || 'proprietaire').toLowerCase().trim();
+  return IDENTITE_OK.has(x) ? x : 'proprietaire';
+}
+
+/**
+ * Max 3 fois le même numéro sur un même itinéraire (releveur)
+ */
+async function countPhoneOnItinerary(itineraires, phone, excludeId = null) {
+  const params = [itineraires, normalizePhone(phone)];
+  let sql = `
+    SELECT COUNT(*)::int AS n
+    FROM socadel_contacts
+    WHERE itineraires = $1
+      AND numero_telephone IS NOT NULL AND numero_telephone <> ''
+      AND regexp_replace(numero_telephone, '[^0-9+]', '', 'g')
+        = regexp_replace($2, '[^0-9+]', '', 'g')
+  `;
+  if (excludeId) {
+    params.push(excludeId);
+    sql += ` AND id <> $${params.length}`;
+  }
+  const r = await query(sql, params);
+  return r.rows[0]?.n || 0;
+}
+
+/**
+ * Max 10 contrats distincts pour un numéro (table principale)
+ */
+async function countContractsForPhone(phone) {
+  const r = await query(
+    `SELECT COUNT(DISTINCT contract_number)::int AS n
+     FROM whatsapp_valid_contacts
+     WHERE regexp_replace(COALESCE(whatsapp_phone, ''), '[^0-9+]', '', 'g')
+         = regexp_replace($1, '[^0-9+]', '', 'g')`,
+    [phone]
+  );
+  return r.rows[0]?.n || 0;
+}
+
+async function getWhatsappPrimary(serviceNo) {
+  const r = await query(
+    `SELECT whatsapp_phone, activated_at, client_name
+     FROM whatsapp_valid_contacts WHERE contract_number = $1 LIMIT 1`,
+    [serviceNo]
+  );
+  return r.rows[0] || null;
+}
+
+/**
+ * Enregistre un numéro secondaire sans toucher au principal
+ */
+async function addSecondaryPhone({
+  contractNumber,
+  phone,
+  source = 'collecte',
+  collectedByType = null,
+  collectedById = null
+}) {
+  await query(
+    `INSERT INTO whatsapp_contact_phones
+       (contract_number, whatsapp_phone, source, is_primary, collected_by_type, collected_by_id)
+     VALUES ($1, $2, $3, false, $4, $5)
+     ON CONFLICT (contract_number, whatsapp_phone) DO NOTHING`,
+    [contractNumber, phone, source, collectedByType, collectedById]
+  );
+}
+
+/**
+ * Libellé RESPONSABLE pour l'UI
+ */
+function buildResponsableLabel({
+  checkStatus,
+  statut,
+  activatedAt,
+  checkDate,
+  rapport,
+  numeroTelephone,
+  whatsappPhone,
+  collectedByType,
+  collectedByLabel
+}) {
+  // Règle TERRAIN stricte (MRA + dates + match)
+  const isTerrain =
+    checkStatus === 'OK' &&
+    statut === 'ABONNE' &&
+    activatedAt &&
+    checkDate &&
+    new Date(activatedAt) >= new Date(checkDate) &&
+    String(rapport || '').toUpperCase() === 'MRA' &&
+    normalizePhone(numeroTelephone) &&
+    normalizePhone(numeroTelephone) === normalizePhone(whatsappPhone);
+
+  if (isTerrain) return 'TERRAIN';
+
+  if (collectedByType === 'agent_socadel' && collectedByLabel) {
+    return `AGENT ${collectedByLabel}`;
+  }
+  if (collectedByType === 'releveur') return 'RELEVEUR';
+  if (collectedByType === 'chatbot') return 'CHATBOT';
+  return 'AUTRES';
+}
+
+function assertNotAlreadyChecked(row) {
+  if (row && row.check_status === 'OK') {
+    const err = new Error(
+      'Ce client a déjà été checké. Modification interdite (releveur et agent).'
+    );
+    err.statusCode = 409;
+    err.code = 'ALREADY_CHECKED';
+    throw err;
+  }
+}
+
+
+/**
+ * Contexte collecteur depuis JWT
+ */
+function collectorFromUser(user) {
+  if (!user) {
+    return { type: 'autre', id: null, label: null };
+  }
+  if (user.role === 'agent_socadel') {
+    return {
+      type: 'agent_socadel',
+      id: user.agentId || null,
+      label: user.matricule || null
+    };
+  }
+  // partenaire / releveur (socadel-login)
+  if (user.role === 'socadel' || user.scope === 'socadel') {
+    return { type: 'releveur', id: null, label: 'RELEVEUR' };
+  }
+  return { type: 'autre', id: null, label: null };
+}
+
+module.exports = {
+  normalizePhone,
+  isValidPhone237,
+  normalizeIdentite,
+  IDENTITE_OK,
+  countPhoneOnItinerary,
+  countContractsForPhone,
+  getWhatsappPrimary,
+  addSecondaryPhone,
+  buildResponsableLabel,
+  collectorFromUser
+};

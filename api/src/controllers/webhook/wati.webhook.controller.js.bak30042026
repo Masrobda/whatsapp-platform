@@ -1,0 +1,365 @@
+// src/controllers/webhook/wati.webhook.controller.js
+const { query } = require('../../config/database');
+const logger = require('../../utils/logger');
+const crypto = require('crypto');
+const axios = require('axios');
+
+class WatiWebhookController {
+  constructor() {
+    this.secret = process.env.WATI_WEBHOOK_SECRET || 'your-secret-key';
+    this.apiKey = process.env.WATI_API_KEY;
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.rateLimit = new Map();
+  }
+
+  checkRateLimit(ip, limit = 10, windowMs = 60000) {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    
+    if (!this.rateLimit.has(ip)) {
+      this.rateLimit.set(ip, []);
+    }
+    
+    const requests = this.rateLimit.get(ip).filter(t => t > windowStart);
+    requests.push(now);
+    this.rateLimit.set(ip, requests);
+    
+    return requests.length <= limit;
+  }
+
+  isTestPayload(payload) {
+    const testIndicators = [
+      payload.localMessageId === 'message.LocalMessageId',
+      payload.whatsappMessageId === 'message.WhatsappMessageId',
+      payload.id === 'message.Id',
+      payload.conversationId === 'message.ConversationId',
+      payload.ticketId === 'message.TicketId',
+      payload.timestamp === 'message.Time'
+    ];
+    return testIndicators.some(indicator => indicator === true);
+  }
+
+  mapWatiStatus(eventType) {
+    if (!eventType) return 'unknown';
+    if (eventType.includes('DELIVERED')) return 'delivered';
+    if (eventType.includes('READ')) return 'read';
+    if (eventType.includes('FAILED')) return 'failed';
+    if (eventType.includes('SENT')) return 'sent';
+    if (eventType.includes('REPLIED')) return 'sent';
+    return 'unknown';
+  }
+
+  getTimestampField(status) {
+    const fieldMap = {
+      'sent': 'sent_at',
+      'delivered': 'delivered_at',
+      'read': 'read_at',
+      'failed': 'failed_at'
+    };
+    return fieldMap[status] || 'updated_at';
+  }
+
+  isValidStatusTransition(currentStatus, newStatus) {
+    const statusOrder = { 'queued': 0, 'sent': 1, 'delivered': 2, 'read': 3, 'failed': 4 };
+    const current = statusOrder[currentStatus] || -1;
+    const newStat = statusOrder[newStatus] || -1;
+    
+    if (newStat < current && newStatus !== 'failed') {
+      return false;
+    }
+    return true;
+  }
+
+  async updateMessageStatus(whatsappMessageId, status, timestamp, eventType, localMessageId = null) {
+    try {
+      const internalStatus = this.mapWatiStatus(eventType);
+      const timestampDate = timestamp ? new Date(parseInt(timestamp) * 1000) : new Date();
+
+      let messageResult = null;
+
+      // Recherche par localMessageId (notre message_id)
+      if (localMessageId && localMessageId !== 'message.LocalMessageId') {
+        const result = await query(
+          `SELECT id, client_id, wa_status, wa_message_id FROM messages WHERE id = $1`,
+          [localMessageId]
+        );
+        if (result.rows.length > 0) {
+          messageResult = result;
+          logger.debug('Message found by localMessageId:', { localMessageId });
+        }
+      }
+
+      // Recherche par wa_message_id
+      if (!messageResult && whatsappMessageId && whatsappMessageId !== 'message.WhatsappMessageId') {
+        const result = await query(
+          `SELECT id, client_id, wa_status, wa_message_id FROM messages WHERE wa_message_id = $1`,
+          [whatsappMessageId]
+        );
+        if (result.rows.length > 0) {
+          messageResult = result;
+          logger.debug('Message found by wa_message_id:', { whatsappMessageId });
+        }
+      }
+
+      if (!messageResult || messageResult.rows.length === 0) {
+        logger.debug('Message not found:', { localMessageId, whatsappMessageId, eventType });
+        return;
+      }
+
+      const message = messageResult.rows[0];
+      const currentStatus = message.wa_status;
+
+      if (!this.isValidStatusTransition(currentStatus, internalStatus)) {
+        logger.info('Invalid status transition', { messageId: message.id, currentStatus, newStatus: internalStatus });
+        return;
+      }
+
+      if (currentStatus === internalStatus) {
+        logger.debug('Duplicate status update ignored', { messageId: message.id });
+        return;
+      }
+
+      const timestampField = this.getTimestampField(internalStatus);
+      const updateWaMessageId = !message.wa_message_id && whatsappMessageId && 
+                                 whatsappMessageId !== 'message.WhatsappMessageId';
+
+      // Mise à jour table globale
+      if (updateWaMessageId) {
+        await query(
+          `UPDATE messages SET wa_status = $1, ${timestampField} = $2, wa_message_id = $3, updated_at = NOW() WHERE id = $4`,
+          [internalStatus, timestampDate, whatsappMessageId, message.id]
+        );
+      } else {
+        await query(
+          `UPDATE messages SET wa_status = $1, ${timestampField} = $2, updated_at = NOW() WHERE id = $3`,
+          [internalStatus, timestampDate, message.id]
+        );
+      }
+
+      // Mise à jour table client
+      const clientTable = `messages_client_${message.client_id.replace(/-/g, '_')}`;
+      if (updateWaMessageId) {
+        await query(
+          `UPDATE ${clientTable} SET wa_status = $1, ${timestampField} = $2, wa_message_id = $3 WHERE id = $4`,
+          [internalStatus, timestampDate, whatsappMessageId, message.id]
+        );
+      } else {
+        await query(
+          `UPDATE ${clientTable} SET wa_status = $1, ${timestampField} = $2 WHERE id = $3`,
+          [internalStatus, timestampDate, message.id]
+        );
+      }
+
+      logger.info('✅ Message status updated:', {
+        messageId: message.id,
+        oldStatus: currentStatus,
+        newStatus: internalStatus,
+        eventType
+      });
+
+      // Mettre à jour les stats
+      if (internalStatus === 'delivered') {
+        await this.updateDeliveryStats(message.client_id);
+      } else if (internalStatus === 'read') {
+        await this.updateReadStats(message.client_id);
+      }
+
+      // Déclencher webhooks clients
+      await this.triggerClientWebhooks(message.id, internalStatus);
+
+    } catch (error) {
+      logger.error('Error updating message status:', error);
+    }
+  }
+
+  async saveIncomingMessage(payload) {
+    try {
+      const { id, whatsappMessageId, conversationId, ticketId, text, type, timestamp, waId, senderName, data } = payload;
+      
+      const messageText = text || data?.text || '';
+      const messageType = type || data?.type || 'text';
+      const fromNumber = waId;
+      const sender = senderName;
+
+      // Skip tests
+      if (!id || id === 'message.Id') {
+        logger.debug('Test incoming message, skipping save');
+        return;
+      }
+
+      // Vérifier si existe déjà
+      const existing = await query(`SELECT id FROM incoming_messages WHERE message_id = $1`, [id]);
+      if (existing.rows.length > 0) {
+        logger.debug('Incoming message already exists', { messageId: id });
+        return;
+      }
+
+      // Insertion
+      await query(
+        `INSERT INTO incoming_messages (message_id, wa_message_id, conversation_id, ticket_id, message_content, message_type, phone_number, sender_name, received_at, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          id, whatsappMessageId, conversationId, ticketId,
+          messageText, messageType, fromNumber, sender,
+          timestamp ? new Date(parseInt(timestamp) * 1000) : new Date(),
+          JSON.stringify(payload)
+        ]
+      );
+
+      logger.info('📥 Incoming message saved:', { messageId: id, from: fromNumber, text: messageText.substring(0, 50) });
+
+      // Vérifier opt-out
+      const optOutKeywords = ['stop', 'arrêter', 'unsubscribe', 'desabonner'];
+      if (optOutKeywords.some(kw => messageText.toLowerCase().includes(kw))) {
+        await this.handleOptOut(fromNumber);
+      }
+
+      await this.notifyClientIncomingMessage(fromNumber, messageText, sender);
+
+    } catch (error) {
+      if (!error.message.includes('duplicate key')) {
+        logger.error('Error saving incoming message:', error);
+      }
+    }
+  }
+
+  async handleOptOut(phoneNumber) {
+    try {
+      await query(
+        `INSERT INTO opt_out_contacts (phone_number, opt_out_at, source)
+         VALUES ($1, NOW(), 'wati')
+         ON CONFLICT (phone_number) DO UPDATE SET opt_out_at = NOW(), source = 'wati'`,
+        [phoneNumber]
+      );
+      logger.info('🚫 Opt-out registered:', { phoneNumber });
+    } catch (error) {
+      logger.error('Error handling opt-out:', error);
+    }
+  }
+
+  async updateDeliveryStats(clientId) {
+    try {
+      await query(`UPDATE clients SET messages_delivered = messages_delivered + 1, total_delivered = total_delivered + 1 WHERE id = $1`, [clientId]);
+    } catch (error) {
+      logger.error('Error updating delivery stats:', error);
+    }
+  }
+
+  async updateReadStats(clientId) {
+    try {
+      await query(`UPDATE clients SET messages_read = messages_read + 1, total_read = total_read + 1 WHERE id = $1`, [clientId]);
+    } catch (error) {
+      logger.error('Error updating read stats:', error);
+    }
+  }
+
+  async notifyClientIncomingMessage(phoneNumber, message, senderName) {
+    try {
+      const webhooks = await query(
+        `SELECT ch.* FROM client_webhooks ch
+         JOIN whatsapp_number_assignments wa ON wa.client_id = ch.client_id
+         JOIN whatsapp_numbers wn ON wn.id = wa.number_id
+         WHERE wn.phone_number = $1 AND ch.is_active = true AND $2 = ANY(ch.events)`,
+        [phoneNumber, 'message.incoming']
+      );
+
+      for (const webhook of webhooks.rows) {
+        const payload = {
+          event: 'message.incoming',
+          timestamp: new Date().toISOString(),
+          data: { from: phoneNumber, sender_name: senderName, message: message, received_at: new Date().toISOString() }
+        };
+        const signature = crypto.createHmac('sha256', webhook.secret).update(JSON.stringify(payload)).digest('hex');
+        axios.post(webhook.url, payload, { headers: { 'Content-Type': 'application/json', 'X-Webhook-Signature': signature }, timeout: 10000 }).catch(err => logger.error('Error sending webhook:', err.message));
+      }
+    } catch (error) {
+      logger.error('Error notifying client:', error);
+    }
+  }
+
+  async triggerClientWebhooks(messageId, status) {
+    try {
+      const webhooksResult = await query(
+        `SELECT ch.* FROM client_webhooks ch JOIN messages m ON m.client_id = ch.client_id WHERE m.id = $1 AND ch.is_active = true AND $2 = ANY(ch.events)`,
+        [messageId, `message.${status}`]
+      );
+      for (const webhook of webhooksResult.rows) {
+        this.sendWebhookNotification(webhook, messageId, status).catch(err => logger.error('Error sending webhook:', err));
+      }
+    } catch (error) {
+      logger.error('Error triggering webhooks:', error);
+    }
+  }
+
+  async sendWebhookNotification(webhook, messageId, status) {
+    try {
+      const messageResult = await query(`SELECT * FROM messages WHERE id = $1`, [messageId]);
+      if (messageResult.rows.length === 0) return;
+      const payload = {
+        event: `message.${status}`,
+        timestamp: new Date().toISOString(),
+        data: {
+          message_id: messageId, status: status,
+          recipient: messageResult.rows[0].recipient_phone,
+          wa_message_id: messageResult.rows[0].wa_message_id,
+          sent_at: messageResult.rows[0].sent_at,
+          delivered_at: messageResult.rows[0].delivered_at,
+          read_at: messageResult.rows[0].read_at
+        }
+      };
+      const signature = crypto.createHmac('sha256', webhook.secret).update(JSON.stringify(payload)).digest('hex');
+      await axios.post(webhook.url, payload, { headers: { 'Content-Type': 'application/json', 'X-Webhook-Signature': signature }, timeout: 10000 });
+      logger.debug('Webhook notification sent to client');
+    } catch (error) {
+      logger.error('Error sending webhook notification:', error);
+    }
+  }
+
+  async handleWebhook(request, reply) {
+    const clientIp = request.ip || request.connection?.remoteAddress || 'unknown';
+    
+    try {
+      if (!this.checkRateLimit(clientIp)) {
+        return reply.code(429).send({ error: 'Too many requests' });
+      }
+
+      const payload = request.body;
+      
+      logger.info('📨 WATI webhook received:', { eventType: payload.eventType, localMessageId: payload.localMessageId, ip: clientIp });
+
+      if (this.isTestPayload(payload)) {
+        return reply.code(200).send({ status: 'received', message: 'Test webhook working', timestamp: new Date().toISOString() });
+      }
+
+      const eventType = payload.eventType || payload.event_type;
+
+      switch (eventType) {
+        case 'sentMessageDELIVERED_v2':
+          await this.updateMessageStatus(payload.whatsappMessageId, 'delivered', payload.timestamp, eventType, payload.localMessageId);
+          break;
+        case 'sentMessageREAD_v2':
+          await this.updateMessageStatus(payload.whatsappMessageId, 'read', payload.timestamp, eventType, payload.localMessageId);
+          break;
+        case 'sentMessageSENT_v2':
+          await this.updateMessageStatus(payload.whatsappMessageId, 'sent', payload.timestamp, eventType, payload.localMessageId);
+          break;
+        case 'sentMessageFAILED_v2':
+          await this.updateMessageStatus(payload.whatsappMessageId, 'failed', payload.timestamp, eventType, payload.localMessageId);
+          break;
+        case 'message':
+          await this.saveIncomingMessage(payload);
+          break;
+        default:
+          logger.debug(`Unhandled webhook type: ${eventType}`);
+      }
+
+      return reply.code(200).send({ status: 'received', timestamp: new Date().toISOString() });
+
+    } catch (error) {
+      logger.error('Error processing webhook:', error);
+      return reply.code(200).send({ status: 'error', message: 'Internal processing error', timestamp: new Date().toISOString() });
+    }
+  }
+}
+
+module.exports = new WatiWebhookController();

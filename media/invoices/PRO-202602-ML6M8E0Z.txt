@@ -1,0 +1,18 @@
+
+FACTURE PROFORMA PRO-202602-ML6M8E0Z
+Client: Ma Super Entreprise
+Date: 03/02/2026
+Montant total: 185314.50 FCFA
+Sous-total: 155400.00 FCFA
+TVA (19.25%): 29914.50 FCFA
+
+⚠️ PDF non généré - Erreur: Failed to launch the browser process:  Code: 1
+
+stderr:
+cannot set memlock limit to 524288:524288: Operation not permitted
+
+TROUBLESHOOTING: https://pptr.dev/troubleshooting
+
+
+NEXT LTD - Merci pour votre confiance !
+      

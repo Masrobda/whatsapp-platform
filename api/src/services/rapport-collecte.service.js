@@ -1,0 +1,1291 @@
+// ============================================================
+// src/services/rapport-collecte.service.js
+// Rapport email — Suivi Campagne Collecte WhatsApp SOCADEL
+// Compatible Outlook Bureau — tables HTML inline uniquement
+// ============================================================
+'use strict';
+
+const { query }        = require('../config/database');
+const emailService     = require('./email.service');
+
+// ── Couleurs Socadel ──
+const C = {
+  BLUE:      '#1a6fb5',
+  BLUE_D:    '#0d4d8a',
+  BLUE_M:    '#2e87cc',
+  BLUE_L:    '#e8f2fb',
+  WHITE:     '#ffffff',
+  GREEN:     '#1a7a3c',
+  GREEN_L:   '#e8f8ee',
+  ORANGE:    '#e67e22',
+  ORANGE_L:  '#fff8e1',
+  RED:       '#c0392b',
+  RED_L:     '#fff3f3',
+  GREY:      '#f4f6f9',
+  TEXT:      '#1a2a3a',
+  GOLD:      '#d4a017',
+  SILVER:    '#8c9ba8',
+  BRONZE:    '#a0522d',
+};
+
+// ── Helpers formatage ──
+const n    = (v) => Number(v || 0);
+const pct  = (a, b) => b > 0 ? (n(a) / n(b) * 100).toFixed(1) : '0.0';
+const fmt  = (v) => n(v).toLocaleString('fr-FR');
+const fmtP = (v) => n(v).toFixed(1) + '%';
+const colTaux = (t, hi = 95, mid = 70) =>
+  t >= hi ? C.GREEN : t >= mid ? C.ORANGE : C.RED;
+const delta = (a, b) => {
+  const d = n(a) - n(b);
+  const col = d >= 0 ? C.GREEN : C.RED;
+  const ico = d >= 0 ? '&#9650;' : '&#9660;';
+  const sign = d >= 0 ? '+' : '';
+  return `<span style="color:${col};font-weight:bold;font-size:9px;">${ico} ${sign}${fmt(Math.abs(d))}</span>`;
+};
+const deltaP = (a, b) => {
+  const d = (n(a) - n(b)).toFixed(1);
+  const col = Number(d) >= 0 ? C.GREEN : C.RED;
+  const ico = Number(d) >= 0 ? '&#9650;' : '&#9660;';
+  const sign = Number(d) >= 0 ? '+' : '';
+  return `<span style="color:${col};font-weight:bold;font-size:9px;">${ico} ${sign}${d}pt</span>`;
+};
+
+// ============================================================
+// COLLECTE DES DONNÉES
+// ============================================================
+// ============================================================
+// COLLECTE DES DONNÉES — version séquencée en 3 vagues
+// ============================================================
+async function fetchAllData() {
+
+  const today     = new Date();
+  const todayStr  = today.toISOString().split('T')[0];
+
+  // Bornes temporelles ISO
+  const yestStart = new Date(today); yestStart.setDate(yestStart.getDate() - 1); yestStart.setHours(0,0,0,0);
+  const yestEnd   = new Date(today); yestEnd.setDate(yestEnd.getDate() - 1); yestEnd.setHours(23,59,59,999);
+
+  // Début de semaine (lundi)
+  const dayOfWeek     = today.getDay() === 0 ? 6 : today.getDay() - 1;
+  const weekStart     = new Date(today); weekStart.setDate(today.getDate() - dayOfWeek); weekStart.setHours(0,0,0,0);
+  const prevWeekStart = new Date(weekStart); prevWeekStart.setDate(weekStart.getDate() - 7); prevWeekStart.setHours(0,0,0,0);
+  const prevWeekEnd   = new Date(weekStart); prevWeekEnd.setDate(weekStart.getDate() - 1); prevWeekEnd.setHours(23,59,59,999);
+
+  const todayStartStr    = `${todayStr} 00:00:00`;
+  const yestStartStr     = yestStart.toISOString();
+  const yestEndStr       = yestEnd.toISOString();
+  const weekStartStr     = weekStart.toISOString();
+  const prevWeekStartStr = prevWeekStart.toISOString();
+  const prevWeekEndStr   = prevWeekEnd.toISOString();
+
+  // ── Helper de chronométrage par requête ──
+  const timed = (label, p) => {
+    const t0 = Date.now();
+    return p.then(
+      r => { const d = Date.now() - t0;
+             console.log(`[fetch]   ✔ ${label.padEnd(22)} ${String(d).padStart(6)} ms  (${r.rows.length} lignes)`);
+             return r; },
+      e => { const d = Date.now() - t0;
+             console.error(`[fetch]   ✖ ${label.padEnd(22)} ${String(d).padStart(6)} ms  → ${e.message}`);
+             throw e; }
+    );
+  };
+
+  const tTotal = Date.now();
+
+  // ============================================================
+  // VAGUE 1 — KPIs légers et agrégats simples (~1 s)
+  // ============================================================
+  console.log('[fetch] ── Vague 1 : KPIs & top hebdo ──');
+  const [
+    globalNow, globalYest, globalWeek, globalPrevWeek,
+    chatbotStats, nonAbonneSplit,
+    topAgentsWeek, topReleveursWeek,
+    byDay,
+  ] = await Promise.all([
+    timed('globalNow', query(`
+      SELECT
+        COUNT(*)::int                                                                        AS total,
+        COUNT(*) FILTER (WHERE numero_telephone IS NOT NULL AND numero_telephone <> '')::int AS with_phone,
+        COUNT(*) FILTER (WHERE check_status = 'OK')::int                                     AS checked,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int               AS abonne,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'NON ABONNE')::int           AS non_abonne,
+        COUNT(*) FILTER (WHERE api_status = 'OK')::int                                       AS api_ok,
+        COUNT(*) FILTER (WHERE collected_by_type = 'agent_socadel')::int                     AS by_agent,
+        COUNT(*) FILTER (WHERE collected_by_type = 'releveur')::int                          AS by_releveur,
+        COUNT(*) FILTER (WHERE collected_by_type = 'chatbot')::int                           AS by_chatbot,
+        COUNT(*) FILTER (WHERE responsable = 'TERRAIN')::int                                 AS terrain,
+        COUNT(*) FILTER (WHERE UPPER(COALESCE(rapport,'MRA')) = 'MRA')::int                  AS mra_count
+      FROM socadel_contacts
+    `)),
+
+    timed('globalYest', query(`
+      SELECT
+        COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne,
+        COUNT(*) FILTER (WHERE api_status = 'OK')::int AS api_ok
+      FROM socadel_contacts
+      WHERE COALESCE(check_date, updated_at) BETWEEN $1::timestamp AND $2::timestamp
+    `, [yestStartStr, yestEndStr])),
+
+    timed('globalWeek', query(`
+      SELECT
+        COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne,
+        COUNT(*) FILTER (WHERE collected_by_type = 'agent_socadel')::int AS by_agent,
+        COUNT(*) FILTER (WHERE collected_by_type = 'releveur')::int AS by_releveur
+      FROM socadel_contacts
+      WHERE COALESCE(check_date, updated_at) >= $1::timestamp
+    `, [weekStartStr])),
+
+    timed('globalPrevWeek', query(`
+      SELECT
+        COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne
+      FROM socadel_contacts
+      WHERE COALESCE(check_date, updated_at) BETWEEN $1::timestamp AND $2::timestamp
+    `, [prevWeekStartStr, prevWeekEndStr])),
+
+    timed('chatbotStats', query(`
+      SELECT
+        COUNT(*)::int AS total_chatbot,
+        COUNT(*) FILTER (WHERE check_status='OK' AND statut='ABONNE')::int AS chatbot_abonne
+      FROM socadel_contacts
+      WHERE collected_by_type = 'chatbot'
+    `)),
+
+    timed('nonAbonneSplit', query(`
+      WITH fc AS (
+        SELECT service_no, UPPER(COALESCE(rapport,'MRA')) AS rap
+        FROM socadel_contacts
+        WHERE check_status = 'OK' AND statut = 'NON ABONNE'
+      ),
+      inv AS (
+        SELECT
+          contract_number,
+          BOOL_OR(status='sent')    AS has_sent,
+          BOOL_OR(status='pending') AS has_pending,
+          BOOL_OR(status='failed')  AS has_failed
+        FROM socadel_invoice_pending
+        WHERE status IN ('sent','pending','failed')
+        GROUP BY contract_number
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE fc.rap='MRA' AND inv.has_sent)::int                 AS en_attente_meta,
+        COUNT(*) FILTER (WHERE fc.rap='MRA' AND inv.has_pending)::int              AS en_cours_envoi,
+        COUNT(*) FILTER (WHERE fc.rap='MRA' AND inv.has_failed)::int               AS non_delivrees,
+        COUNT(*) FILTER (WHERE fc.rap='MRA' AND inv.contract_number IS NULL)::int AS sans_envoi,
+        COUNT(*) FILTER (WHERE fc.rap='OK')::int                                    AS sms_uniquement
+      FROM fc LEFT JOIN inv ON inv.contract_number = fc.service_no
+    `)),
+
+    timed('topAgentsWeek', query(`
+      SELECT
+        collected_by_label AS nom,
+        COUNT(*) FILTER (WHERE check_status='OK')::int AS checked_week
+      FROM socadel_contacts
+      WHERE collected_by_type = 'agent_socadel'
+        AND COALESCE(check_date, updated_at) >= $1::timestamp
+        AND collected_by_label IS NOT NULL
+      GROUP BY collected_by_label
+      ORDER BY checked_week DESC
+      LIMIT 5
+    `, [weekStartStr])),
+
+    timed('topReleveursWeek', query(`
+      SELECT
+        collected_by_label AS nom,
+        COUNT(*) FILTER (WHERE check_status='OK')::int AS checked_week
+      FROM socadel_contacts
+      WHERE collected_by_type = 'releveur'
+        AND COALESCE(check_date, updated_at) >= $1::timestamp
+        AND collected_by_label IS NOT NULL
+      GROUP BY collected_by_label
+      ORDER BY checked_week DESC
+      LIMIT 5
+    `, [weekStartStr])),
+
+    timed('byDay', query(`
+      SELECT
+        DATE(COALESCE(check_date, updated_at))                                          AS jour,
+        COUNT(*) FILTER (WHERE check_status = 'OK')::int                                AS checked,
+        COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int          AS abonne,
+        COUNT(*) FILTER (WHERE collected_by_type = 'agent_socadel')::int                AS by_agent,
+        COUNT(*) FILTER (WHERE collected_by_type = 'releveur')::int                     AS by_releveur,
+        COUNT(*) FILTER (WHERE collected_by_type = 'chatbot')::int                      AS by_chatbot
+      FROM socadel_contacts
+      WHERE COALESCE(check_date, updated_at) >= NOW() - INTERVAL '30 days'
+        AND (check_status = 'OK' OR collected_by_type IS NOT NULL)
+      GROUP BY 1
+      ORDER BY 1
+    `)),
+  ]);
+  console.log(`[fetch]   ── Vague 1 terminée en ${Date.now() - tTotal} ms`);
+
+    // ============================================================
+  // VAGUE 2 — SÉQUENTIELLE (bypass concurrency pool)
+  // ============================================================
+  const tV2 = Date.now();
+  console.log('[fetch] ── Vague 2 : dimensions (séquentiel) ──');
+
+  // Timeout universel : si une requête ne répond pas en 25 s, on lève une erreur explicite
+  const withTimeout = (promise, label, ms = 25000) => {
+    let to;
+    const timeout = new Promise((_, rej) => {
+      to = setTimeout(() => rej(new Error(`TIMEOUT ${label} après ${ms}ms — requête jamais revenue du pool`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(to));
+  };
+
+  console.log('[fetch]   → byRegion ...');
+  const byRegion = await timed('byRegion', withTimeout(query(`
+    SELECT
+      COALESCE(region, 'N/A') AS dim,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+      COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE api_status = 'OK')::int AS api_ok,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $1::timestamp)::int AS checked_today,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $2::timestamp)::int AS checked_week,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) BETWEEN $3::timestamp AND $4::timestamp)::int AS checked_prev_week,
+      0::int AS nb_itineraires
+    FROM socadel_contacts
+    WHERE region IS NOT NULL AND region <> ''
+    GROUP BY region
+    ORDER BY checked DESC
+  `, [todayStartStr, weekStartStr, prevWeekStartStr, prevWeekEndStr]), 'byRegion'));
+
+  console.log('[fetch]   → byDivision ...');
+  const byDivision = await timed('byDivision', withTimeout(query(`
+    SELECT
+      COALESCE(division, 'N/A') AS dim,
+      COALESCE(region, '') AS region,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+      COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE api_status = 'OK')::int AS api_ok,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $1::timestamp)::int AS checked_today,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $2::timestamp)::int AS checked_week,
+      0::int AS nb_itineraires
+    FROM socadel_contacts
+    WHERE division IS NOT NULL AND division <> ''
+    GROUP BY division, region
+    ORDER BY checked DESC
+  `, [todayStartStr, weekStartStr]), 'byDivision'));
+
+  console.log('[fetch]   → topAgents ...');
+  const topAgents = await timed('topAgents', withTimeout(query(`
+    WITH failed_invoices AS (
+      SELECT DISTINCT contract_number FROM socadel_invoice_pending WHERE status = 'failed'
+    )
+    SELECT
+      sc.collected_by_label AS nom,
+      MAX(ag.matricule) AS matricule,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK')::int AS checked,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK' AND sc.statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE sc.api_status = 'OK')::int AS api_ok,
+      ROUND(COUNT(*) FILTER (WHERE sc.check_status='OK' AND sc.statut='ABONNE')::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE sc.check_status='OK'),0) * 100, 1) AS taux_abonne,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK'
+        AND COALESCE(sc.check_date, sc.updated_at) BETWEEN $1::timestamp AND $2::timestamp)::int AS checked_prev_week,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK'
+        AND COALESCE(sc.check_date, sc.updated_at) >= $3::timestamp)::int AS checked_this_week,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK' AND sc.statut = 'NON ABONNE'
+        AND UPPER(COALESCE(sc.rapport,'MRA')) = 'MRA' AND fi.contract_number IS NOT NULL)::int AS non_delivrees
+    FROM socadel_contacts sc
+    LEFT JOIN socadel_agents ag ON ag.id = sc.collected_by_id
+    LEFT JOIN failed_invoices fi ON fi.contract_number = sc.service_no
+    WHERE sc.collected_by_type = 'agent_socadel' AND sc.collected_by_label IS NOT NULL
+    GROUP BY sc.collected_by_label
+    ORDER BY checked DESC LIMIT 20
+  `, [prevWeekStartStr, prevWeekEndStr, weekStartStr]), 'topAgents'));
+
+  console.log('[fetch]   → topReleveurs ...');
+  const topReleveurs = await timed('topReleveurs', withTimeout(query(`
+    WITH failed_invoices AS (
+      SELECT DISTINCT contract_number FROM socadel_invoice_pending WHERE status = 'failed'
+    )
+    SELECT
+      sc.collected_by_label AS nom,
+      COALESCE(MAX(rel.entreprise), '—') AS entreprise,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK')::int AS checked,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK' AND sc.statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE sc.api_status = 'OK')::int AS api_ok,
+      ROUND(COUNT(*) FILTER (WHERE sc.check_status='OK' AND sc.statut='ABONNE')::numeric
+        / NULLIF(COUNT(*) FILTER (WHERE sc.check_status='OK'),0) * 100, 1) AS taux_abonne,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK'
+        AND COALESCE(sc.check_date, sc.updated_at) BETWEEN $1::timestamp AND $2::timestamp)::int AS checked_prev_week,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK'
+        AND COALESCE(sc.check_date, sc.updated_at) >= $3::timestamp)::int AS checked_this_week,
+      COUNT(*) FILTER (WHERE sc.check_status = 'OK' AND sc.statut = 'NON ABONNE'
+        AND UPPER(COALESCE(sc.rapport,'MRA')) = 'MRA' AND fi.contract_number IS NOT NULL)::int AS non_delivrees
+    FROM socadel_contacts sc
+    LEFT JOIN socadel_releveurs rel ON rel.id = sc.collected_by_id
+    LEFT JOIN failed_invoices fi ON fi.contract_number = sc.service_no
+    WHERE sc.collected_by_type = 'releveur' AND sc.collected_by_label IS NOT NULL
+    GROUP BY sc.collected_by_label
+    ORDER BY checked DESC LIMIT 20
+  `, [prevWeekStartStr, prevWeekEndStr, weekStartStr]), 'topReleveurs'));
+
+  console.log('[fetch]   → byItinerary ...');
+  const byItinerary = await timed('byItinerary', withTimeout(query(`
+    SELECT
+      itineraires, COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+      ROUND(COUNT(*) FILTER (WHERE check_status='OK')::numeric / NULLIF(COUNT(*),0)*100,1) AS taux,
+      COALESCE(MAX(region),'') AS region, COALESCE(MAX(agence),'') AS agence
+    FROM socadel_contacts
+    WHERE itineraires IS NOT NULL AND itineraires <> ''
+    GROUP BY itineraires HAVING COUNT(*) > 0
+    ORDER BY taux DESC, checked DESC LIMIT 200
+  `), 'byItinerary'));
+
+  console.log(`[fetch]   ── Vague 2 terminée en ${Date.now() - tV2} ms`);
+
+    // ============================================================
+  // VAGUE 3 — TEMPORAIREMENT DÉSACTIVÉE (byMrc, byAgence)
+  // à réactiver après diagnostic du hang
+  // ============================================================
+  console.log('[fetch] ── Vague 3 : byCategorie (byMrc/byAgence désactivés) ──');
+
+  console.log('[fetch]   → byCategorie ...');
+  const byCategorie = await timed('byCategorie', withTimeout(query(`
+    SELECT
+      COALESCE(categorie, 'N/A') AS dim,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE check_status = 'OK')::int AS checked,
+      COUNT(*) FILTER (WHERE check_status = 'OK' AND statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE api_status = 'OK')::int AS api_ok,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $1::timestamp)::int AS checked_today,
+      COUNT(*) FILTER (WHERE COALESCE(check_date, updated_at) >= $2::timestamp)::int AS checked_week,
+      0::int AS nb_itineraires, 0::int AS itin_ok, 0::int AS itin_moyen, 0::int AS itin_faible
+    FROM socadel_contacts
+    WHERE categorie IS NOT NULL AND categorie <> ''
+    GROUP BY categorie
+    ORDER BY total DESC
+  `, [todayStartStr, weekStartStr]), 'byCategorie'));
+
+  // ── DÉSACTIVÉ TEMPORAIREMENT ──
+  const byMrc    = { rows: [] };
+  const byAgence = { rows: [] };
+
+  return {
+    today: todayStr, yestStr: yestStart.toISOString().split('T')[0],
+    weekStartStr: weekStart.toISOString().split('T')[0],
+    prevWeekStartStr: prevWeekStart.toISOString().split('T')[0],
+    prevWeekEndStr:   prevWeekEnd.toISOString().split('T')[0],
+    global:         globalNow.rows[0]      || {},
+    globalYest:     globalYest.rows[0]     || {},
+    globalWeek:     globalWeek.rows[0]     || {},
+    globalPrevWeek: globalPrevWeek.rows[0] || {},
+    byCategorie:    byCategorie.rows,
+    byRegion:       byRegion.rows,
+    byDivision:     byDivision.rows,
+    byMrc:          byMrc.rows,
+    byAgence:       byAgence.rows,
+    topAgents:      topAgents.rows,
+    topReleveurs:   topReleveurs.rows,
+    topAgentsWeek:  topAgentsWeek.rows,
+    topReleveursWeek: topReleveursWeek.rows,
+    byDay:          byDay.rows,
+    byItinerary:    byItinerary.rows,
+    chatbot:        chatbotStats.rows[0]   || {},
+    nonAbonne:      nonAbonneSplit.rows[0] || {},
+  };
+}
+
+// ============================================================
+// GÉNÉRATION HTML
+// ============================================================
+
+function buildHtml(d) {
+
+  const g   = d.global;
+  const gy  = d.globalYest;
+  const gw  = d.globalWeek;
+  const gpw = d.globalPrevWeek;
+  const na  = d.nonAbonne;
+
+  const totalAMigrer = n(g.total);
+  const checked      = n(g.checked);
+  const apiOk        = n(g.api_ok);
+  const abonne       = n(g.abonne);
+  const nonAbonne    = n(g.non_abonne);
+  const byAgent      = n(g.by_agent);
+  const byReleveur   = n(g.by_releveur);
+  const byChatbot    = n(g.by_chatbot);
+  const tauxCollecte = pct(checked, totalAMigrer);
+  const tauxWaOk     = pct(abonne, totalAMigrer);
+  const tauxAbonne   = pct(abonne, checked);
+
+  const dateLabel = new Date(d.today).toLocaleDateString('fr-FR', { day:'2-digit', month:'long', year:'numeric' });
+  const genAt     = new Date().toLocaleString('fr-FR');
+
+  // Commentaire dynamique
+  const zones = d.byRegion.slice(0,5).map(r => r.dim).join(', ');
+  const commentaire = buildCommentaire(d);
+
+  return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Rapport Collecte WhatsApp — SOCADEL</title>
+</head>
+<body style="margin:0;padding:0;background-color:#e4eaf2;font-family:Arial,Helvetica,sans-serif;">
+<table width="100%" border="0" cellpadding="0" cellspacing="0" bgcolor="#e4eaf2">
+<tr><td align="center" style="padding:20px 8px;">
+<table width="960" border="0" cellpadding="0" cellspacing="0" bgcolor="${C.WHITE}"
+  style="border:1px solid #b8c8d8;border-collapse:collapse;">
+
+${sectionHeader(dateLabel, genAt)}
+${sectionAlerteBandeau(checked, totalAMigrer, abonne, gw, gpw)}
+${sectionKpi(g, gy, gw, gpw, na, d.chatbot)}
+${sectionCommentaire(commentaire)}
+${sectionPalmaresAgents(d.topAgents, d.topAgentsWeek, 'agents')}
+${sectionPalmaresAgents(d.topReleveurs, d.topReleveursWeek, 'releveurs')}
+${sectionEvolutionJour(d.byDay)}
+${sectionItineraires(d.byItinerary)}
+${sectionPerf('Catégorie de clients', d.byCategorie, false)}
+${sectionPerf('Région', d.byRegion, true)}
+${sectionPerf('Division', d.byDivision, true)}
+${sectionPerf('MRC', d.byMrc, true)}
+${sectionPerf('Agence', d.byAgence, true)}
+${sectionGlossaire()}
+${sectionFooter(genAt)}
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
+}
+
+// ── Commentaire dynamique ─────────────────────────────────
+function buildCommentaire(d) {
+  const g    = d.global;
+  const gw   = d.globalWeek;
+  const gpw  = d.globalPrevWeek;
+  const today = d.today;
+  const checked = n(g.checked);
+  const total   = n(g.total);
+  const abonne  = n(g.abonne);
+  const tauxWa  = pct(abonne, total);
+  const byAgent = n(g.by_agent);
+  const byRel   = n(g.by_releveur);
+  const byChatbot = n(g.by_chatbot);
+  const weekEvol  = n(gw.checked) - n(gpw.checked);
+  const weekSign  = weekEvol >= 0 ? '+' : '';
+  const zones     = d.byRegion.slice(0,5).map(r => r.dim).filter(Boolean).join(', ');
+
+  const dateRange = `du 30/08/2026 au ${new Date(today).toLocaleDateString('fr-FR')}`;
+
+  let trend = '';
+  if (weekEvol > 1000)      trend = 'La dynamique est excellente cette semaine avec une forte accélération.';
+  else if (weekEvol > 0)    trend = `La semaine progresse positivement (${weekSign}${fmt(weekEvol)} checks).`;
+  else if (weekEvol === 0)  trend = 'Le rythme est stable par rapport à la semaine précédente.';
+  else                      trend = `Attention : le rythme marque un léger recul (${fmt(weekEvol)} checks) vs semaine passée.`;
+
+  return `Rapport de campagne — période <b>${dateRange}</b>. <b>${fmt(checked)}</b> checks terrain/agent ont été enregistrés sur <b>${fmt(total)}</b> lignes touchées, dont <b>${fmt(abonne)}</b> clients au statut ABONNÉ (<b>${tauxWa}%</b>). Les agents Socadel représentent <b>${pct(byAgent, checked)}%</b> des collectes tracées, les releveurs <b>${pct(byRel, checked)}%</b>${byChatbot > 0 ? `, le ChatBot <b>${pct(byChatbot, checked)}%</b>` : ''}. Les zones les plus dynamiques : <b>${zones}</b>. ${trend} Chaque numéro collecté et validé permet l'envoi numérique de la facture mensuelle — chaque point de taux gagné représente des milliers de clients connectés à SOCADEL.`;
+}
+
+// ── HEADER ───────────────────────────────────────────────
+function sectionHeader(dateLabel, genAt) {
+  return `
+<tr>
+  <td bgcolor="${C.BLUE_D}" style="padding:0;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0">
+      <tr>
+        <td bgcolor="${C.BLUE_M}" style="width:7px;font-size:0;">&nbsp;</td>
+        <td style="padding:20px 24px;">
+          <table width="100%" border="0" cellpadding="0" cellspacing="0">
+            <tr valign="middle">
+              <td>
+                <div style="font-family:Arial,sans-serif;font-size:22px;font-weight:900;
+                  color:${C.WHITE};letter-spacing:-0.5px;line-height:1;">
+                  &#9889; socad<span style="color:${C.BLUE_M};">'el</span>
+                </div>
+                <div style="font-family:Arial,sans-serif;font-size:9px;color:#a8cce8;
+                  letter-spacing:2px;text-transform:uppercase;padding-top:2px;">
+                  Société Camerounaise d'Electricité — NEXT LTD
+                </div>
+              </td>
+              <td align="right">
+                <div style="font-family:Arial,sans-serif;font-size:9px;color:#a8cce8;">
+                  Généré le ${genAt}
+                </div>
+              </td>
+            </tr>
+          </table>
+          <table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:14px;">
+            <tr>
+              <td style="border-left:4px solid ${C.BLUE_M};padding-left:14px;">
+                <div style="font-family:Arial,sans-serif;font-size:8px;color:#a8cce8;
+                  text-transform:uppercase;letter-spacing:3px;padding-bottom:3px;">
+                  RAPPORT OPÉRATIONNEL — CAMPAGNE COLLECTE
+                </div>
+                <div style="font-family:Arial,sans-serif;font-size:18px;font-weight:bold;
+                  color:${C.WHITE};line-height:1.2;">
+                  &#128241; Suivi des Numéros WhatsApp Collectés
+                </div>
+                <div style="font-family:Arial,sans-serif;font-size:11px;color:#a8cce8;
+                  padding-top:4px;">
+                  Classement agents &amp; releveurs · Performance par zone · Évolution journalière
+                  &nbsp;|&nbsp; <b style="color:${C.WHITE};">${dateLabel}</b>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── BANDEAU ALERTE OBJECTIF ───────────────────────────────
+function sectionAlerteBandeau(checked, total, abonne, gw, gpw) {
+  const taux = Number(pct(abonne, total));
+  const weekDelta = n(gw.checked) - n(gpw.checked);
+  const bg  = taux >= 30 ? C.GREEN : taux >= 15 ? C.ORANGE : C.RED;
+  const ico = taux >= 30 ? '&#127942;' : '&#9888;';
+  const trend = weekDelta >= 0
+    ? `&#9650; +${fmt(weekDelta)} checks vs semaine dernière`
+    : `&#9660; ${fmt(weekDelta)} checks vs semaine dernière`;
+  return `
+<tr>
+  <td bgcolor="${bg}" style="padding:9px 24px;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="font-family:Arial,sans-serif;font-size:11px;font-weight:bold;color:${C.WHITE};">
+          ${ico} ${fmt(abonne)} abonnés WhatsApp confirmés sur ${fmt(total)} à migrer — taux : <b>${taux}%</b>
+        </td>
+        <td align="right" style="font-family:Arial,sans-serif;font-size:10px;color:rgba(255,255,255,0.90);">
+          ${trend}
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── KPI GLOBAUX ───────────────────────────────────────────
+function sectionKpi(g, gy, gw, gpw, na, chatbot) {
+
+  const total    = n(g.total);
+  const checked  = n(g.checked);
+  const apiOk    = n(g.api_ok);
+  const abonne   = n(g.abonne);
+  const byAgent  = n(g.by_agent);
+  const byRel    = n(g.by_releveur);
+  const byChatbot= n(chatbot.total_chatbot || 0);
+  const tauxC    = Number(pct(checked, total));
+  const tauxWa   = Number(pct(abonne, total));
+
+  const colTc = colTaux(tauxC, 50, 20);
+  const colWa = colTaux(tauxWa, 30, 10);
+
+  const card = (valeur, label, bg, sub1='', sub2='') => `
+    <td width="16%" valign="top" style="padding:4px;">
+      <table width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:${bg};">
+        <tr>
+          <td align="center" style="padding:12px 6px 6px 6px;">
+            <div style="font-family:Arial,sans-serif;font-size:19px;font-weight:900;
+              color:${C.WHITE};white-space:nowrap;line-height:1.1;">${valeur}</div>
+          </td>
+        </tr>
+        <tr>
+          <td align="center" style="padding:0 6px 8px 6px;
+            border-top:1px solid rgba(255,255,255,0.25);">
+            <div style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+              color:${C.WHITE};text-transform:uppercase;letter-spacing:0.5px;
+              padding-top:5px;line-height:1.4;">${label}</div>
+            ${sub1 ? `<div style="font-family:Arial,sans-serif;font-size:8px;
+              color:rgba(255,255,255,0.82);padding-top:2px;line-height:1.3;">${sub1}</div>` : ''}
+            ${sub2 ? `<div style="font-family:Arial,sans-serif;font-size:8px;
+              color:rgba(255,255,255,0.65);padding-top:1px;">${sub2}</div>` : ''}
+          </td>
+        </tr>
+      </table>
+    </td>`;
+
+  // Ligne 1 — chiffres principaux
+  const row1 = `
+<table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:10px;">
+  <tr>
+    ${card(fmt(total), 'Total à Migrer', C.BLUE_D, 'Portefeuille global', 'Base de migration')}
+    ${card(fmt(checked), 'N° Collectés', C.BLUE, `${delta(checked, n(gy.checked))} vs hier`, `${delta(n(gw.checked), n(gpw.checked))} vs sem. passée`)}
+    ${card(fmt(apiOk), 'N° Checkés', '#1a5f9a', `${pct(apiOk, checked)}% des collectés`, 'Vérifiés API')}
+    ${card(fmt(abonne), 'N° WhatsApp OK', colWa, `${delta(abonne, n(gy.abonne))} vs hier`, `Taux : ${tauxWa}%`)}
+    ${card(tauxC+'%', 'Taux Collecte', colTc, `${delta(checked, n(gy.checked))} vs hier`, `Obj. : 100%`)}
+    ${card(tauxWa+'%', 'Taux WhatsApp OK', colWa, `${delta(abonne, n(gy.abonne))} vs hier`, `/ Total à migrer`)}
+  </tr>
+</table>`;
+
+  // Ligne 2 — collecteurs + non-abonnés
+  const chatbotPct = abonne > 0 ? ((n(chatbot.chatbot_abonne||0)/abonne)*100).toFixed(1) : '0.0';
+  const row2 = `
+<table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:6px;">
+  <tr>
+    ${card(fmt(byAgent), 'Agents Socadel', '#2a6090', `${pct(byAgent,checked)}% des collectes`, 'Collecte terrain')}
+    ${card(fmt(byRel), 'Releveurs', '#1e5178', `${pct(byRel,checked)}% des collectes`, 'Partenaires')}
+    ${card(fmt(byChatbot), 'ChatBot', '#0f3d5c', `${chatbotPct}% des WA OK`, 'Self-service client')}
+    ${card(fmt(n(na.en_attente_meta)||0), 'En Attente Meta', C.ORANGE, 'Transmis · attente retour', 'Exporter CSV')}
+    ${card(fmt(n(na.non_delivrees)||0), 'Non Délivrées', C.RED, 'Contact non WhatsApp', 'Échec livraison')}
+    ${card(fmt((n(na.sans_envoi)||0) + (n(na.sms_uniquement)||0)), 'Sans Envoi / SMS', '#5a7a9a', `${fmt(n(na.sans_envoi)||0)} sans facture`, `${fmt(n(na.sms_uniquement)||0)} SMS uniquement`)}
+  </tr>
+</table>`;
+
+  // Barre de progression globale
+  const pctFill = Math.min(100, Math.round(tauxWa));
+  const colFill = colTaux(tauxWa, 30, 10);
+  const barRow = `
+<table width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-top:10px;">
+  <tr valign="middle">
+    <td style="font-family:Arial,sans-serif;font-size:10px;font-weight:bold;
+      color:${C.BLUE};width:180px;padding-right:10px;">
+      Progression collecte globale
+    </td>
+    <td>
+      <table width="100%" border="0" cellpadding="0" cellspacing="0">
+        <tr>
+          <td width="${pctFill}%" height="12" bgcolor="${colFill}" style="font-size:0;">&nbsp;</td>
+          <td width="${100-pctFill}%" height="12" bgcolor="#c8d8e8" style="font-size:0;">&nbsp;</td>
+        </tr>
+      </table>
+    </td>
+    <td align="right" style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${colFill};padding-left:10px;width:60px;">${tauxWa}%</td>
+  </tr>
+</table>`;
+
+  return `
+<tr>
+  <td style="padding:18px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:2px;">
+      &#9636; 1. TABLEAU DE BORD — INDICATEURS CLÉS DU JOUR
+    </div>
+    ${row1}${row2}${barRow}
+  </td>
+</tr>`;
+}
+
+// ── COMMENTAIRE ───────────────────────────────────────────
+function sectionCommentaire(texte) {
+  return `
+<tr>
+  <td style="padding:14px 18px 0 18px;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"
+      style="border:1px solid #b8d4e8;background-color:${C.BLUE_L};">
+      <tr>
+        <td bgcolor="${C.BLUE}" style="padding:7px 14px;width:180px;">
+          <div style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+            color:${C.WHITE};text-transform:uppercase;letter-spacing:1px;">
+            &#128203; Analyse de campagne
+          </div>
+        </td>
+        <td style="padding:10px 16px;">
+          <div style="font-family:Arial,sans-serif;font-size:10px;color:${C.TEXT};
+            line-height:1.8;">${texte}</div>
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── PALMARÈS AGENTS / RELEVEURS ───────────────────────────
+function sectionPalmaresAgents(data, dataWeek, type) {
+
+  const isAgent    = type === 'agents';
+  const titre      = isAgent ? 'Agents Socadel' : 'Releveurs (Partenaires)';
+  const iconeTitre = isAgent ? '&#128100;' : '&#128101;';
+  const col2Label  = isAgent ? 'Matricule' : 'Entreprise';
+  const sectionNum = isAgent ? '2' : '3';
+
+  const medals = ['&#127941;', '&#129352;', '&#129353;', '&#11088;', '&#11088;',
+                  '&#11088;','&#11088;','&#11088;','&#11088;','&#11088;',
+                  '&nbsp;','&nbsp;','&nbsp;','&nbsp;','&nbsp;',
+                  '&nbsp;','&nbsp;','&nbsp;','&nbsp;','&nbsp;'];
+
+  // Top 5 semaine (bloc côté droit)
+  const weekBlock = dataWeek.slice(0,5).map((r, i) => {
+    const mColors = [C.GOLD, C.SILVER, C.BRONZE, '#555', '#555'];
+    const col = mColors[i] || '#555';
+    return `
+<tr>
+  <td style="font-family:Arial,sans-serif;font-size:9px;color:${C.TEXT};
+    padding:4px 8px;border-bottom:1px solid #eee;">
+    <b style="color:${col};">${medals[i]} ${i+1}.</b>&nbsp;${escH(r.nom||'—')}
+  </td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.GREEN};padding:4px 6px;border-bottom:1px solid #eee;">
+    +${fmt(r.checked_week)}
+  </td>
+</tr>`;
+  }).join('');
+
+  // Tableau principal
+  const th = (l, w='') => `<th ${w ? `width="${w}"` : ''} style="font-family:Arial,sans-serif;
+    font-size:8px;font-weight:bold;color:${C.WHITE};background-color:${C.BLUE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);text-align:center;
+    text-transform:uppercase;line-height:1.3;">${l}</th>`;
+
+  const progressionIcon = (curr, prev) => {
+    const d = n(curr) - n(prev);
+    if (d > 0) return `<span style="color:${C.GREEN};">&#9650;</span>`;
+    if (d < 0) return `<span style="color:${C.RED};">&#9660;</span>`;
+    return `<span style="color:#888;">&#9654;</span>`;
+  };
+
+  const rows = data.map((r, i) => {
+    const bg    = i % 2 === 0 ? C.WHITE : C.GREY;
+    const taux  = Number(n(r.taux_abonne)||0);
+    const col   = colTaux(taux, 80, 50);
+    const prog  = progressionIcon(r.checked_this_week, r.checked_prev_week);
+    return `
+<tr bgcolor="${bg}">
+  <td align="center" style="font-family:Arial,sans-serif;font-size:11px;
+    padding:4px 4px;border:1px solid #dde8f0;">${medals[i]}</td>
+  <td style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;color:${C.TEXT};
+    padding:4px 7px;border:1px solid #dde8f0;">${escH(r.nom||'—')}</td>
+  <td style="font-family:Arial,sans-serif;font-size:8px;color:#777;
+    padding:4px 5px;border:1px solid #dde8f0;">${escH(isAgent ? (r.matricule||'—') : (r.entreprise||'—'))}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;
+    padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.total)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.BLUE};padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.checked)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.GREEN};padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.abonne)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;
+    color:${C.ORANGE};padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.non_delivrees)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${col};padding:4px 5px;border:1px solid #dde8f0;">${taux}%</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;
+    color:${C.BLUE};padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.checked_prev_week)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.BLUE_D};padding:4px 5px;border:1px solid #dde8f0;">${fmt(r.checked_this_week)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:11px;
+    padding:4px 5px;border:1px solid #dde8f0;">${prog}</td>
+</tr>`;
+  }).join('');
+
+  return `
+<tr>
+  <td style="padding:16px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:10px;">
+      ${iconeTitre} ${sectionNum}. CLASSEMENT — TOP 20 ${titre.toUpperCase()}
+    </div>
+    <table width="100%" border="0" cellpadding="0" cellspacing="0">
+      <tr valign="top">
+        <!-- Tableau principal -->
+        <td width="72%">
+          <table width="100%" border="0" cellpadding="0" cellspacing="0"
+            style="border-collapse:collapse;">
+            <tr>
+              ${th('#','28')}
+              ${th('Nom')}
+              ${th(col2Label)}
+              ${th('Total assigné')}
+              ${th('N° Collectés')}
+              ${th('WA OK &#9989;')}
+              ${th('Non délivrées &#9888;')}
+              ${th('Taux WA%')}
+              ${th('Sem. passée')}
+              ${th('Cette sem.')}
+              ${th('Évol.')}
+            </tr>
+            ${rows}
+          </table>
+        </td>
+        <!-- Bloc Top 5 semaine -->
+        <td width="4%">&nbsp;</td>
+        <td width="24%" valign="top">
+          <table width="100%" border="0" cellpadding="0" cellspacing="0"
+            style="border:1px solid ${C.GREEN};">
+            <tr bgcolor="${C.GREEN}">
+              <td colspan="2" style="padding:7px 10px;">
+                <div style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+                  color:${C.WHITE};">&#127942; TOP 5 — Cette semaine</div>
+              </td>
+            </tr>
+            <tr bgcolor="${C.GREEN_L}">
+              <th align="left" style="font-family:Arial,sans-serif;font-size:8px;
+                color:${C.GREEN};padding:4px 8px;border-bottom:1px solid #c8e8d0;">Nom</th>
+              <th align="center" style="font-family:Arial,sans-serif;font-size:8px;
+                color:${C.GREEN};padding:4px 6px;border-bottom:1px solid #c8e8d0;">+Collectes</th>
+            </tr>
+            ${weekBlock}
+          </table>
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── ÉVOLUTION 30 JOURS ────────────────────────────────────
+function sectionEvolutionJour(rows) {
+  if (!rows.length) return '';
+
+  const maxVal = Math.max(...rows.map(r => n(r.checked)), 1);
+
+  const bars  = rows.map(r => {
+    const v = n(r.checked);
+    const h = Math.max(2, Math.round(v * 70 / maxVal));
+    const jour = new Date(r.jour+'T12:00:00').toLocaleDateString('fr-FR', { day:'2-digit', month:'2-digit' });
+    return `
+    <td valign="bottom" align="center" style="padding:0 1px;vertical-align:bottom;width:${Math.floor(620/rows.length)}px;">
+      <div style="font-family:Arial,sans-serif;font-size:7px;color:${C.BLUE};
+        text-align:center;padding-bottom:1px;">${v > 0 ? fmt(v) : ''}</div>
+      <table border="0" cellpadding="0" cellspacing="0" align="center">
+        <tr><td width="12" height="${h}" bgcolor="${C.BLUE}" style="font-size:0;">&nbsp;</td></tr>
+      </table>
+    </td>`;
+  }).join('');
+
+  const labels = rows.map(r => {
+    const jour = new Date(r.jour+'T12:00:00').toLocaleDateString('fr-FR', { day:'2-digit', month:'2-digit' });
+    return `<td align="center" style="font-family:Arial,sans-serif;font-size:7px;
+      color:#777;padding-top:2px;white-space:nowrap;">${jour}</td>`;
+  }).join('');
+
+  return `
+<tr>
+  <td style="padding:16px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:10px;">
+      &#128200; 4. ÉVOLUTION JOURNALIÈRE DES COLLECTES — 30 DERNIERS JOURS
+    </div>
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"
+      style="background-color:${C.GREY};border:1px solid #c8d8e8;padding:12px;">
+      <tr>
+        <td style="padding:12px 14px 0 14px;">
+          <div style="font-family:Arial,sans-serif;font-size:9px;color:#666;padding-bottom:8px;">
+            Numéros collectés (check_status = OK) par jour &nbsp;|&nbsp;
+            <span style="color:${C.BLUE};font-weight:bold;">&#9646;</span> Total collecté
+          </div>
+          <table border="0" cellpadding="0" cellspacing="0" width="100%">
+            <tr>${bars}</tr>
+            <tr>${labels}</tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── ITINÉRAIRES PAR PLAGE ─────────────────────────────────
+function sectionItineraires(rows) {
+  if (!rows.length) return '';
+
+  const ok     = rows.filter(r => Number(r.taux) >= 95);
+  const moyen  = rows.filter(r => Number(r.taux) >= 70 && Number(r.taux) < 95);
+  const faible = rows.filter(r => Number(r.taux) < 70);
+
+  const bloc = (titre, items, bg, border) => {
+    const lignes = items.slice(0,15).map(r => `
+<tr>
+  <td style="font-family:Arial,sans-serif;font-size:8px;color:${C.TEXT};
+    padding:3px 6px;border-bottom:1px solid #eee;">${escH(r.itineraires)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:8px;
+    padding:3px 4px;border-bottom:1px solid #eee;">${fmt(r.total)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+    color:${C.BLUE};padding:3px 4px;border-bottom:1px solid #eee;">${fmt(r.checked)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+    color:${border};padding:3px 4px;border-bottom:1px solid #eee;">${r.taux}%</td>
+  <td style="font-family:Arial,sans-serif;font-size:7px;color:#999;
+    padding:3px 4px;border-bottom:1px solid #eee;">${escH(r.agence||'')}</td>
+</tr>`).join('');
+
+    const plus = items.length > 15 ? `<tr><td colspan="5" align="center"
+      style="font-family:Arial,sans-serif;font-size:8px;color:#888;padding:3px;
+      font-style:italic;">+${items.length-15} autres itinéraires</td></tr>` : '';
+
+    return `
+<td width="32%" valign="top" style="padding:4px;">
+  <table width="100%" border="0" cellpadding="0" cellspacing="0"
+    style="border:1px solid ${border};">
+    <tr bgcolor="${border}">
+      <td colspan="5" style="padding:6px 8px;">
+        <div style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+          color:${C.WHITE};">${titre} <span style="font-weight:normal;">(${items.length})</span></div>
+      </td>
+    </tr>
+    <tr bgcolor="${bg}">
+      <th style="font-family:Arial,sans-serif;font-size:7px;color:${border};
+        padding:3px 6px;border-bottom:1px solid #ddd;text-align:left;">Itin.</th>
+      <th style="font-family:Arial,sans-serif;font-size:7px;color:${border};
+        padding:3px 4px;border-bottom:1px solid #ddd;text-align:center;">Total</th>
+      <th style="font-family:Arial,sans-serif;font-size:7px;color:${border};
+        padding:3px 4px;border-bottom:1px solid #ddd;text-align:center;">Collectés</th>
+      <th style="font-family:Arial,sans-serif;font-size:7px;color:${border};
+        padding:3px 4px;border-bottom:1px solid #ddd;text-align:center;">Taux</th>
+      <th style="font-family:Arial,sans-serif;font-size:7px;color:${border};
+        padding:3px 4px;border-bottom:1px solid #ddd;text-align:left;">Agence</th>
+    </tr>
+    ${lignes}${plus}
+  </table>
+</td>`;
+  };
+
+  return `
+<tr>
+  <td style="padding:16px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:10px;">
+      &#128197; 5. ITINÉRAIRES PAR PLAGE DE PERFORMANCE
+    </div>
+    <table width="100%" border="0" cellpadding="0" cellspacing="0">
+      <tr valign="top">
+        ${bloc('&#10003; &#8805; 95% — Payables', ok,    C.GREEN_L,   C.GREEN)}
+        <td width="2%">&nbsp;</td>
+        ${bloc('&#9888; 70–94% — En cours',       moyen,  C.ORANGE_L,  C.ORANGE)}
+        <td width="2%">&nbsp;</td>
+        ${bloc('&#128308; &lt; 70% — À mobiliser',faible, C.RED_L,     C.RED)}
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── TABLEAUX DE PERFORMANCE (générique) ──────────────────
+function sectionPerf(libDim, rows, showRegion) {
+  if (!rows.length) return '';
+
+  const sectionMap = {
+    'Catégorie de clients': '6',
+    'Région':               '7',
+    'Division':             '8',
+    'MRC':                  '9',
+    'Agence':               '10',
+  };
+  const sNum = sectionMap[libDim] || '?';
+
+  const th = (l, w='') => `<th ${w ? `width="${w}"` : ''} style="font-family:Arial,sans-serif;
+    font-size:8px;font-weight:bold;color:${C.WHITE};background-color:${C.BLUE};
+    padding:5px 4px;border:1px solid rgba(255,255,255,0.2);text-align:center;
+    text-transform:uppercase;line-height:1.3;">${l}</th>`;
+
+  // Groupes de colonnes
+  const grpHead = `
+<tr>
+  <th rowspan="2" align="left" style="font-family:Arial,sans-serif;font-size:8px;
+    font-weight:bold;color:${C.WHITE};background-color:${C.BLUE_D};
+    padding:5px 8px;border:1px solid rgba(255,255,255,0.2);vertical-align:middle;">
+    ${libDim}
+  </th>
+  ${showRegion ? `<th rowspan="2" style="font-family:Arial,sans-serif;font-size:8px;
+    font-weight:bold;color:${C.WHITE};background-color:${C.BLUE_D};
+    padding:5px 4px;border:1px solid rgba(255,255,255,0.2);text-align:center;
+    vertical-align:middle;">Région</th>` : ''}
+  <th colspan="3" style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+    color:${C.WHITE};background-color:#1a5f9a;padding:4px;
+    border:1px solid rgba(255,255,255,0.2);text-align:center;">Volume</th>
+  <th colspan="4" style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+    color:${C.WHITE};background-color:#144e80;padding:4px;
+    border:1px solid rgba(255,255,255,0.2);text-align:center;">Collecte</th>
+  <th colspan="3" style="font-family:Arial,sans-serif;font-size:8px;font-weight:bold;
+    color:${C.WHITE};background-color:#0d3d63;padding:4px;
+    border:1px solid rgba(255,255,255,0.2);text-align:center;">Itinéraires</th>
+</tr>
+<tr>
+  ${th('Total')}${th('Collectés')}${th('WA OK')}
+  ${th('Taux C.')}${th('Taux WA')}${th('Auj.')}${th('Sem.')}
+  ${th('Nb itin.')}${th('&#10003;&#8805;95%')}${th('Moyen')}
+</tr>`;
+
+  let totTotal=0, totChecked=0, totAbonne=0, totToday=0, totWeek=0, totItin=0;
+  let totItinOk=0, totItinMoyen=0;
+
+  const lignes = rows.map((r, i) => {
+    const total    = n(r.total);
+    const checked  = n(r.checked);
+    const abonne   = n(r.abonne);
+    const auj      = n(r.checked_today);
+    const week     = n(r.checked_week);
+    const nbItin   = n(r.nb_itineraires);
+    const itinOk   = n(r.itin_ok||0);
+    const itinMoy  = n(r.itin_moyen||0);
+    const tC       = Number(pct(checked, total));
+    const tW       = Number(pct(abonne, total));
+    const colC     = colTaux(tC, 50, 20);
+    const colW     = colTaux(tW, 30, 10);
+    const bg       = i % 2 === 0 ? C.WHITE : C.GREY;
+
+    totTotal   += total;   totChecked += checked;
+    totAbonne  += abonne;  totToday   += auj;
+    totWeek    += week;    totItin    += nbItin;
+    totItinOk  += itinOk;  totItinMoyen += itinMoy;
+
+    return `
+<tr bgcolor="${bg}">
+  <td style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;color:${C.TEXT};
+    padding:4px 8px;border:1px solid #dde8f0;">${escH(r.dim||'')}</td>
+  ${showRegion ? `<td style="font-family:Arial,sans-serif;font-size:8px;color:#777;
+    padding:4px 5px;border:1px solid #dde8f0;">${escH(r.region||'')}</td>` : ''}
+  <td align="right" style="font-family:Arial,sans-serif;font-size:9px;
+    padding:4px 5px;border:1px solid #dde8f0;">${fmt(total)}</td>
+  <td align="right" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.BLUE};padding:4px 5px;border:1px solid #dde8f0;">${fmt(checked)}</td>
+  <td align="right" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.GREEN};padding:4px 5px;border:1px solid #dde8f0;">${fmt(abonne)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${colC};padding:4px 5px;border:1px solid #dde8f0;">${tC}%</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${colW};padding:4px 5px;border:1px solid #dde8f0;">${tW}%</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;color:${C.BLUE_M};
+    padding:4px 5px;border:1px solid #dde8f0;">${auj > 0 ? '+'+fmt(auj) : '—'}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;color:${C.BLUE};
+    padding:4px 5px;border:1px solid #dde8f0;">${week > 0 ? '+'+fmt(week) : '—'}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;
+    padding:4px 5px;border:1px solid #dde8f0;">${fmt(nbItin)}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.GREEN};padding:4px 5px;border:1px solid #dde8f0;">${itinOk > 0 ? fmt(itinOk) : '—'}</td>
+  <td align="center" style="font-family:Arial,sans-serif;font-size:9px;
+    color:${C.ORANGE};padding:4px 5px;border:1px solid #dde8f0;">${itinMoy > 0 ? fmt(itinMoy) : '—'}</td>
+</tr>`;
+  }).join('');
+
+  // Ligne totaux
+  const totC = Number(pct(totChecked, totTotal));
+  const totW = Number(pct(totAbonne, totTotal));
+  const totLine = `
+<tr bgcolor="${C.BLUE}">
+  <th align="left" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${C.WHITE};padding:5px 8px;border:1px solid rgba(255,255,255,0.2);">TOTAL</th>
+  ${showRegion ? `<th style="border:1px solid rgba(255,255,255,0.2);">&nbsp;</th>` : ''}
+  <th align="right" style="font-family:Arial,sans-serif;font-size:9px;color:${C.WHITE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totTotal)}</th>
+  <th align="right" style="font-family:Arial,sans-serif;font-size:9px;color:${C.WHITE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totChecked)}</th>
+  <th align="right" style="font-family:Arial,sans-serif;font-size:9px;color:#c8f5d4;
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totAbonne)}</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${totC>=50?'#c8f5d4':'#ffd6d6'};padding:5px 5px;
+    border:1px solid rgba(255,255,255,0.2);">${totC}%</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+    color:${totW>=30?'#c8f5d4':'#ffd6d6'};padding:5px 5px;
+    border:1px solid rgba(255,255,255,0.2);">${totW}%</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;color:${C.WHITE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">+${fmt(totToday)}</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;color:${C.WHITE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">+${fmt(totWeek)}</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;color:${C.WHITE};
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totItin)}</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;color:#c8f5d4;
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totItinOk)}</th>
+  <th align="center" style="font-family:Arial,sans-serif;font-size:9px;color:#ffe8b0;
+    padding:5px 5px;border:1px solid rgba(255,255,255,0.2);">${fmt(totItinMoyen)}</th>
+</tr>`;
+
+  return `
+<tr>
+  <td style="padding:16px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:10px;">
+      &#128202; ${sNum}. PERFORMANCE PAR ${libDim.toUpperCase()}
+    </div>
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"
+      style="border-collapse:collapse;font-size:9px;">
+      ${grpHead}
+      ${lignes}
+      ${totLine}
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── GLOSSAIRE ─────────────────────────────────────────────
+function sectionGlossaire() {
+  const items = [
+    ['Total à Migrer',    'Nombre total de clients dans la base de collecte à équiper d\'un numéro WhatsApp valide.'],
+    ['N° Collectés',      'Clients pour lesquels un numéro a été saisi (check_status = OK). Indicateur de progression terrain.'],
+    ['N° Checkés',        'Numéros ayant été vérifiés via l\'API externe (api_status = OK).'],
+    ['WA OK / Abonné',   'Clients au statut ABONNÉ — numéro WhatsApp confirmé actif, prêt à recevoir les factures.'],
+    ['Taux Collecte',     'N° Collectés / Total à Migrer × 100. Vitesse d\'avancement de la campagne.'],
+    ['Taux WA OK',        'N° WhatsApp OK (Abonnés) / Total à Migrer × 100. Indicateur final de couverture.'],
+    ['Agents Socadel',    'Collectes effectuées par les agents internes SOCADEL (collected_by_type = agent_socadel).'],
+    ['Releveurs',         'Collectes effectuées par les partenaires prestataires de relève (collected_by_type = releveur).'],
+    ['ChatBot',           'Numéros capturés en self-service via le chatbot mis à disposition des clients.'],
+    ['En Attente Meta',   'Clients non abonnés dont la facture a été transmise à Meta (statut sent) — en attente de retour.'],
+    ['Non Délivrées',     'Clients non abonnés dont la facture a échoué à la livraison WhatsApp (statut failed).'],
+    ['Itin. ≥95%',        'Itinéraires avec ≥95% de clients collectés — éligibles au paiement prestataire.'],
+    ['Itin. 70–94%',      'Itinéraires en cours de complétion — à mobiliser pour atteindre le seuil de paiement 95%.'],
+    ['Auj.',              'Collectes enregistrées aujourd\'hui (date check = date du jour).'],
+    ['Sem.',              'Collectes enregistrées depuis le lundi de la semaine courante.'],
+  ];
+
+  const rows = items.map((it, i) => {
+    const bg = i%2===0 ? C.WHITE : C.BLUE_L;
+    return `<tr bgcolor="${bg}">
+      <td style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;color:${C.BLUE_D};
+        padding:5px 10px;border:1px solid #dde8f0;white-space:nowrap;width:180px;">${it[0]}</td>
+      <td style="font-family:Arial,sans-serif;font-size:9px;color:${C.TEXT};
+        padding:5px 10px;border:1px solid #dde8f0;line-height:1.5;">${it[1]}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+<tr>
+  <td style="padding:16px 18px 0 18px;">
+    <div style="font-family:Arial,sans-serif;font-size:12px;font-weight:bold;
+      color:${C.BLUE};padding-bottom:8px;border-bottom:2px solid ${C.BLUE};margin-bottom:10px;">
+      &#128218; 11. GLOSSAIRE DES INDICATEURS
+    </div>
+    <table width="100%" border="0" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <tr bgcolor="${C.BLUE}">
+        <th align="left" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+          color:${C.WHITE};padding:6px 10px;border:1px solid rgba(255,255,255,0.2);">Indicateur</th>
+        <th align="left" style="font-family:Arial,sans-serif;font-size:9px;font-weight:bold;
+          color:${C.WHITE};padding:6px 10px;border:1px solid rgba(255,255,255,0.2);">Définition</th>
+      </tr>
+      ${rows}
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── FOOTER ────────────────────────────────────────────────
+function sectionFooter(genAt) {
+  return `
+<tr><td style="padding:18px 0 0 0;">&nbsp;</td></tr>
+<tr>
+  <td bgcolor="${C.BLUE_D}" style="padding:14px 24px;border-top:3px solid ${C.BLUE_M};">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="font-family:Arial,sans-serif;font-size:9px;color:#a8cce8;padding-bottom:4px;">
+          &#9889; <b style="color:${C.WHITE};">SOCADEL</b> / <b style="color:${C.WHITE};">NEXT LTD</b>
+          &nbsp;|&nbsp; Rapport Campagne Collecte WhatsApp
+          &nbsp;|&nbsp; Généré le ${genAt}
+        </td>
+      </tr>
+      <tr>
+        <td style="font-family:Arial,sans-serif;font-size:9px;color:#7aaac8;">
+          Document interne — DSI / Département Collecte SOCADEL — team@numericexport.com
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>`;
+}
+
+// ── Escape HTML ───────────────────────────────────────────
+function escH(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ============================================================
+// ENVOI — version robuste avec logs détaillés + sauvegarde HTML
+// ============================================================
+async function sendRapportCollecte(destinataires) {
+  const fs   = require('fs');
+  const path = require('path');
+
+  // ── 1. Collecte des données ──
+  let data;
+  try {
+    data = await fetchAllData();
+    console.log('[rapport-collecte] ✅ Données collectées —',
+      'total:', data.global?.total,
+      'checked:', data.global?.checked,
+      'abonne:', data.global?.abonne);
+  } catch (err) {
+    throw new Error('[fetchAllData] ' + err.message);
+  }
+
+  // ── 2. Génération HTML ──
+  let html;
+  try {
+    html = buildHtml(data);
+    if (!html || html.length < 500) {
+      throw new Error('HTML trop court (' + (html || '').length + ' chars) — buildHtml a probablement planté');
+    }
+    console.log('[rapport-collecte] ✅ HTML généré —', html.length.toLocaleString('fr-FR'), 'caractères');
+  } catch (err) {
+    throw new Error('[buildHtml] ' + err.message);
+  }
+
+  // ── 3. Sauvegarde HTML locale ──
+  const stamp   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const fname   = `rapport_collecte_${stamp}.html`;
+  // Dossiers tentés dans l'ordre (du plus préféré au fallback absolu)
+  const tryDirs = [
+    '/tmp/rapports_socadel',
+    path.join(__dirname, '../../public/rapports'),
+    '/tmp',
+  ];
+  for (const dir of tryDirs) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const fpath = path.join(dir, fname);
+      fs.writeFileSync(fpath, html, 'utf8');
+      console.log('[rapport-collecte] 📄 HTML sauvegardé :', fpath);
+      break; // succès — on arrête
+    } catch (e) {
+      console.warn('[rapport-collecte] ⚠️  Impossible d\'écrire dans', dir, '—', e.message);
+    }
+  }
+
+  // ── 4. Vérification SMTP avant envoi ──
+  try {
+    await emailService.transporter.verify();
+    console.log('[rapport-collecte] ✅ SMTP OK');
+  } catch (smtpErr) {
+    console.error('[rapport-collecte] ❌ SMTP KO :', smtpErr.message);
+    console.error('[rapport-collecte]    Vérifier SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD');
+    // On continue quand même — certains serveurs refusent verify() mais acceptent sendMail()
+  }
+
+  // ── 5. Envoi email ──
+  const dateLabel = new Date(data.today).toLocaleDateString('fr-FR', {
+    day: '2-digit', month: 'long', year: 'numeric',
+  });
+  const sujet = `⚡ SOCADEL — Rapport Collecte WhatsApp — ${dateLabel}`;
+  console.log('[rapport-collecte] 📧 Sujet :', sujet);
+
+  const tos     = Array.isArray(destinataires) ? destinataires : [destinataires];
+  const results = [];
+
+  for (const to of tos) {
+    console.log('[rapport-collecte]   → Envoi à', to, '...');
+    try {
+      const info = await emailService.transporter.sendMail({
+        from:    `"Campagne Collecte SOCADEL" <${process.env.SMTP_USER}>`,
+        to,
+        subject: sujet,
+        html,
+      });
+      console.log('[rapport-collecte]   ✅ Accepté —',
+        'messageId:', info.messageId,
+        '| response:', info.response,
+        '| accepted:', JSON.stringify(info.accepted),
+        '| rejected:', JSON.stringify(info.rejected));
+      results.push({ to, sent: true, messageId: info.messageId, response: info.response });
+    } catch (err) {
+      console.error('[rapport-collecte]   ❌ Échec envoi à', to);
+      console.error('[rapport-collecte]      code     :', err.code);
+      console.error('[rapport-collecte]      command  :', err.command);
+      console.error('[rapport-collecte]      response :', err.response);
+      console.error('[rapport-collecte]      message  :', err.message);
+      results.push({
+        to, sent: false,
+        error: err.message,
+        code: err.code,
+        response: err.response,
+      });
+    }
+  }
+
+  const ok = results.filter(r => r.sent).length;
+  const ko = results.filter(r => !r.sent).length;
+  console.log(`[rapport-collecte] ── ${ok} email(s) envoyé(s) / ${ko} échoué(s) ──`);
+
+  return { success: ko === 0, date: data.today, sujet, results };
+}
+
+module.exports = { sendRapportCollecte, fetchAllData, buildHtml };

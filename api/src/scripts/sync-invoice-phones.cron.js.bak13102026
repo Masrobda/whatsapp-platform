@@ -1,0 +1,53 @@
+// /var/www/numericexport/api/src/scripts/sync-invoice-phones.cron.js
+require('dotenv').config();
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+// Fenêtre : on traite les factures importées récemment (par défaut 60 jours)
+const WINDOW_DAYS = parseInt(process.env.PHONE_SYNC_WINDOW_DAYS || '60', 10);
+
+(async () => {
+  try {
+    const t0 = Date.now();
+
+    // UPDATE global :
+    // 1. Aligne le numéro de téléphone sur celui de la table des contacts valides
+    // 2. Marque le contact comme 'valid' (contact_ws_status)
+    // 3. Bascule TOUTES les factures 'skipped' qui ont un contact valide vers 'pending'
+    // 4. Efface l'erreur et réinitialise les tentatives uniquement si la facture était 'skipped'
+    const res = await query(
+      `UPDATE mysql_invoices_all AS inv
+          SET telephone = wvc.whatsapp_phone,
+              contact_ws_status = 'valid',
+              whatsapp_status = CASE 
+                WHEN inv.whatsapp_status = 'skipped' THEN 'pending'
+                ELSE inv.whatsapp_status
+              END,
+              whatsapp_error = CASE 
+                WHEN inv.whatsapp_status = 'skipped' THEN NULL
+                ELSE inv.whatsapp_error
+              END,
+              whatsapp_attempts = CASE 
+                WHEN inv.whatsapp_status = 'skipped' THEN 0
+                ELSE inv.whatsapp_attempts
+              END
+         FROM whatsapp_valid_contacts AS wvc
+        WHERE inv.numero_contrat::text = wvc.contract_number::text
+          AND inv.imported_at > NOW() - ($1 || ' days')::interval
+          AND (
+            inv.whatsapp_status = 'skipped'
+            OR inv.telephone IS NULL
+            OR regexp_replace(inv.telephone, '[^0-9]', '', 'g') <> regexp_replace(wvc.whatsapp_phone, '[^0-9]', '', 'g')
+            OR inv.contact_ws_status IS NULL
+            OR inv.contact_ws_status <> 'valid'
+          )`,
+      [String(WINDOW_DAYS)]
+    );
+
+    logger.info(`[PHONE-SYNC] ✅ ${res.rowCount} factures synchronisées et remises en attente en ${Date.now() - t0}ms`);
+    process.exit(0);
+  } catch (err) {
+    logger.error('[PHONE-SYNC] Erreur:', err.message);
+    process.exit(1);
+  }
+})();

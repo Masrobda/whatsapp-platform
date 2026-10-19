@@ -1,0 +1,137 @@
+// /var/www/numericexport/api/src/scripts/invoice-reconcile.cron.js
+require('dotenv').config();
+const { query, pool } = require('../config/database');
+const logger = require('../utils/logger');
+
+// ── Helper de log : écrit À LA FOIS dans Winston ET sur la console ──
+// (le console.log est indispensable pour les runs manuels où
+//  le transport Console de Winston est désactivé en prod)
+const log = {
+  info: (msg) => { logger.info(msg); console.log(`[INFO] ${msg}`); },
+  warn: (msg) => { logger.warn(msg); console.warn(`[WARN] ${msg}`); },
+  error: (msg) => { logger.error(msg); console.error(`[ERROR] ${msg}`); },
+};
+
+const CLIENT_TABLE = process.env.RECONCILE_CLIENT_TABLE
+  || 'messages_client_6576a32e_96e3_416a_a137_465c03a6265a';
+
+const INVOICE_TEMPLATE = process.env.INVOICE_TEMPLATE_NAMES
+  || 'next_soc03_facture_fr_033';
+
+(async () => {
+  const startedAt = Date.now();
+  const summary = {
+    orphans_invoices:    0,
+    links_restored:      0,
+    invoices_reset:      0,
+    messages_cleaned:    0,
+    client_msgs_cleaned: 0,
+    errors:              0,
+  };
+
+  try {
+    console.log('🚀 [RECONCILE] Démarrage...');
+
+    // ═══════════════════════════════════════════════════════════
+    // ÉTAPE 1 — Compter les factures 'queued' orphelines
+    // ═══════════════════════════════════════════════════════════
+    const orphan = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM mysql_invoices_all
+        WHERE whatsapp_status = 'queued'
+          AND whatsapp_message_id IS NULL
+          AND whatsapp_sent_at < NOW() - INTERVAL '30 minutes'`
+    );
+    summary.orphans_invoices = orphan.rows[0].n;
+    log.info(`[RECONCILE] Étape 1 : ${summary.orphans_invoices} factures orphelines`);
+
+    if (summary.orphans_invoices > 0) {
+      log.warn(`[RECONCILE] ${summary.orphans_invoices} factures 'queued' orphelines détectées`);
+
+      // ÉTAPE 2 — Restaurer les liens
+      const fixed = await query(
+        `UPDATE mysql_invoices_all AS inv
+            SET whatsapp_message_id = m.id
+           FROM messages AS m
+          WHERE inv.whatsapp_status = 'queued'
+            AND inv.whatsapp_message_id IS NULL
+            AND inv.whatsapp_sent_at < NOW() - INTERVAL '30 minutes'
+            AND m.recipient_phone IN (
+              inv.telephone,
+              (SELECT whatsapp_phone FROM whatsapp_valid_contacts
+                WHERE contract_number = inv.numero_contrat LIMIT 1)
+            )
+            AND m.template_params->>'5' = inv.numero_facture
+            AND m.created_at BETWEEN inv.whatsapp_sent_at - INTERVAL '5 minutes'
+                                AND inv.whatsapp_sent_at + INTERVAL '5 minutes'`
+      );
+      summary.links_restored = fixed.rowCount;
+      log.info(`[RECONCILE] Étape 2 : ${summary.links_restored} liens restaurés`);
+
+      // ÉTAPE 3 — Reset en 'pending'
+      const reset = await query(
+        `UPDATE mysql_invoices_all
+            SET whatsapp_status     = 'pending',
+                whatsapp_message_id = NULL,
+                whatsapp_sent_at    = NULL,
+                whatsapp_attempts   = 0,
+                whatsapp_error      = 'Réconciliation : message introuvable'
+          WHERE whatsapp_status = 'queued'
+            AND whatsapp_message_id IS NULL
+            AND whatsapp_sent_at < NOW() - INTERVAL '30 minutes'`
+      );
+      summary.invoices_reset = reset.rowCount;
+      log.warn(`[RECONCILE] Étape 3 : ${summary.invoices_reset} factures reset en pending`);
+    } else {
+      log.info('[RECONCILE] Étape 1 : aucune facture orpheline dans mysql_invoices_all');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ÉTAPE 4 — Nettoyer les messages orphelins
+    // ═══════════════════════════════════════════════════════════
+    const cleanedGlobal = await query(
+      `DELETE FROM messages
+        WHERE wa_status = 'queued'
+          AND template_name = $1
+          AND wati_local_id IS NULL
+          AND created_at < NOW() - INTERVAL '2 hours'
+          AND NOT EXISTS (
+            SELECT 1 FROM mysql_invoices_all inv
+             WHERE inv.whatsapp_message_id = messages.id
+          )`,
+      [INVOICE_TEMPLATE]
+    );
+    summary.messages_cleaned = cleanedGlobal.rowCount;
+    log.warn(`[RECONCILE] Étape 4a : ${summary.messages_cleaned} messages orphelins supprimés (messages)`);
+
+    const cleanedClient = await query(
+      `DELETE FROM ${CLIENT_TABLE}
+        WHERE wa_status = 'queued'
+          AND template_name = $1
+          AND wati_local_id IS NULL
+          AND created_at < NOW() - INTERVAL '2 hours'
+          AND NOT EXISTS (
+            SELECT 1 FROM mysql_invoices_all inv
+             WHERE inv.whatsapp_message_id = ${CLIENT_TABLE}.id
+          )`,
+      [INVOICE_TEMPLATE]
+    );
+    summary.client_msgs_cleaned = cleanedClient.rowCount;
+    log.warn(`[RECONCILE] Étape 4b : ${summary.client_msgs_cleaned} messages orphelins supprimés (${CLIENT_TABLE})`);
+
+    // ═══════════════════════════════════════════════════════════
+    // RÉSUMÉ FINAL
+    // ═══════════════════════════════════════════════════════════
+    const durationMs = Date.now() - startedAt;
+    log.info(`[RECONCILE] ✓ terminé en ${durationMs}ms — ${JSON.stringify(summary)}`);
+    console.log('✅ [RECONCILE] Terminé avec succès');
+  } catch (err) {
+    log.error(`[RECONCILE] Erreur: ${err.message}`);
+    console.error(err.stack);
+    process.exitCode = 1;
+  } finally {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    try { await pool.end(); } catch (_) {}
+    console.log('🔚 [RECONCILE] Fin du script');
+  }
+})();

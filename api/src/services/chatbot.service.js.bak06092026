@@ -1,0 +1,335 @@
+// src/services/chatbot.service.js
+//
+// Moteur de conversation (state machine) du chatbot WhatsApp Socadel.
+// Complètement INDÉPENDANT de la messagerie transactionnelle/campagnes B2B :
+// ne touche ni aux tables messages_client_*, ni au système de session B2B
+// (session.service.js), ni aux webhooks clients (client_webhooks).
+//
+// Une ligne dans bot_conversations = une conversation en cours avec un
+// numéro WhatsApp. Le state machine est piloté uniquement par (state, texte reçu).
+//
+// ⚠️ Hypothèses à valider avec vous :
+//   - Un contrat introuvable en base consomme une tentative (comme un format invalide).
+//   - Une réponse ni "oui" ni "non" à la confirmation ne consomme PAS de tentative
+//     (simple reprompt), seul un "NON" explicite en consomme une.
+//   - Le parcours "Dernière facture" n'a pas de verrou 3 tentatives (non spécifié).
+
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const CONTRACT_REGEX = /^20\d{7}$/;
+const MAX_ATTEMPTS = 3;
+const LOCK_MINUTES = 15;
+
+const MESSAGES = {
+  fr: {
+    welcome: () =>
+      `Bienvenue chez Socadel 👋\nJe suis ravi(e) de vous aider aujourd'hui.\n\n` +
+      `Si vous souhaitez communiquer en français, tapez 1\n` +
+      `If you'd like to continue in English, type 2\n\n1️⃣ Français\n2️⃣ English`,
+    langInvalid: () => `Choix invalide. Tapez 1 pour Français ou 2 pour English.`,
+    mainMenu: (name) =>
+      `Cher(e) ${name}, pour vous aider rapidement et efficacement, veuillez choisir parmi les options suivantes :\n\n` +
+      `1️⃣ Facture Digitale\n2️⃣ Dernière facture`,
+    menuInvalid: () => `Choix invalide. Veuillez taper :\n1️⃣ Facture Digitale\n2️⃣ Dernière facture.`,
+    invoicePrompt: () =>
+      `SOCADEL Distribution Digitale des Factures 📄\n` +
+      `Veuillez saisir votre n° de contrat (9 chiffres, début 20).\nEx: 203456789`,
+    formatError: (attempt) =>
+      `Format incorrect. Le numéro de contrat doit avoir 9 chiffres et commencer par 20. (tentative ${attempt}/${MAX_ATTEMPTS})`,
+    contractNotFound: (attempt) =>
+      `Numéro de contrat introuvable. Veuillez vérifier et réessayer. (tentative ${attempt}/${MAX_ATTEMPTS})`,
+    confirm: (contract, name) =>
+      `Contrat ${contract} - ${name}. Confirmez-vous ?\n✅ OUI (activer) | ❌ NON (modifier)`,
+    confirmInvalid: () => `Merci de répondre par OUI ou NON.`,
+    confirmDeny: (attempt) =>
+      `Si ce nom est incorrect, saisissez à nouveau le numéro de contrat (tentative ${attempt}/${MAX_ATTEMPTS})`,
+    locked: () => `Trop d'erreurs consécutives. Votre accès est bloqué pour ${LOCK_MINUTES} min.`,
+    stillLocked: (min) =>
+      `Vous avez atteint la limite de tentatives. Par mesure de sécurité, veuillez réessayer dans ${min} minute(s).`,
+    subscribeSuccess: (name) =>
+      `${name}, votre abonnement est activé. Vous recevrez désormais vos factures mensuelles sur WhatsApp via nos numéros officiels de distribution. ` +
+      `Merci pour votre engagement écoresponsable.\n\nPour toute autre besoin, veuillez contacter notre service client au 8010.`,
+    lastInvoicePrompt: () =>
+      `Veuillez saisir votre n° de contrat (9 chiffres, début 20) pour recevoir votre dernière facture.`,
+    lastInvoiceAck: () =>
+      `Merci, nous traitons votre demande. Vous recevrez votre dernière facture sous peu.`,
+    invoiceAlreadySent: () =>
+  `Cette facture vous a déjà été envoyée. Vous la retrouverez dans votre historique WhatsApp.\n\nPour toute autre question, n'hésitez pas à nous contacter.`,
+  },
+  en: {
+    welcome: () =>
+      `Welcome to Socadel 👋\nI'm happy to help you today.\n\n` +
+      `Si vous souhaitez communiquer en français, tapez 1\n` +
+      `If you'd like to continue in English, type 2\n\n1️⃣ Français\n2️⃣ English`,
+    langInvalid: () => `Invalid choice. Type 1 for Français or 2 for English.`,
+    mainMenu: (name) =>
+      `Dear ${name}, to help you quickly and efficiently, please choose one of the following options:\n\n` +
+      `1️⃣ Digital Invoice\n2️⃣ Latest invoice`,
+    menuInvalid: () => `Invalid choice. Please type :\n1️⃣ Digital Invoice \n2️⃣ Latest invoice.`,
+    invoicePrompt: () =>
+      `SOCADEL Digital Invoice Distribution 📄\n` +
+      `Please enter your contract number (9 digits, starting with 20).\nEx: 203456789`,
+    formatError: (attempt) =>
+      `Invalid format. The contract number must have 9 digits and start with 20. (attempt ${attempt}/${MAX_ATTEMPTS})`,
+    contractNotFound: (attempt) =>
+      `Contract number not found. Please check and try again. (attempt ${attempt}/${MAX_ATTEMPTS})`,
+    confirm: (contract, name) =>
+      `Contract ${contract} - ${name}. Do you confirm?\n✅ YES (activate) | ❌ NO (edit)`,
+    confirmInvalid: () => `Please reply with YES or NO.`,
+    confirmDeny: (attempt) =>
+      `If this name is incorrect, please re-enter your contract number (attempt ${attempt}/${MAX_ATTEMPTS})`,
+    locked: () => `Too many consecutive errors. Your access is locked for ${LOCK_MINUTES} min.`,
+    stillLocked: (min) =>
+      `You've reached the attempt limit. For security reasons, please try again in ${min} minute(s).`,
+    subscribeSuccess: (name) =>
+      `${name}, your subscription is now active. You will now receive your monthly invoices on WhatsApp via our official distribution numbers. ` +
+      `Thank you for your eco-responsible commitment.\n\nFor any other request, please contact our customer service at 8010.`,
+    lastInvoicePrompt: () =>
+      `Please enter your contract number (9 digits, starting with 20) to receive your latest invoice.`,
+    lastInvoiceAck: () =>
+      `Thank you, we are processing your request. You will receive your latest invoice shortly.`,
+    invoiceAlreadySent: () =>
+  `This invoice has already been sent to you. You can find it in your WhatsApp history.\n\nFor any other questions, feel free to contact us.`, 
+ },
+};
+
+function normalizeInput(text) {
+  return (text || '')
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '') // enlève emojis/ponctuation
+    .trim();
+}
+
+function isYes(input) {
+  return ['oui', 'yes', '1', 'o', 'y'].includes(input);
+}
+function isNo(input) {
+  return ['non', 'no', '2', 'n'].includes(input);
+}
+
+// ============================================================
+// ACCÈS CONVERSATION
+// ============================================================
+async function getOrCreateConversation(phone, botNumber) {
+  const existing = await query(`SELECT * FROM bot_conversations WHERE phone = $1`, [phone]);
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const created = await query(
+    `INSERT INTO bot_conversations (phone, bot_number, state)
+     VALUES ($1, $2, 'LANG_SELECT')
+     RETURNING *`,
+    [phone, botNumber]
+  );
+  return created.rows[0];
+}
+
+// NOTE : les clés de `fields` viennent toujours de notre propre code (jamais
+// de l'utilisateur), donc l'interpolation de nom de colonne ici est sûre.
+async function updateConversation(phone, fields) {
+  const setClauses = [];
+  const values = [];
+  for (const [key, value] of Object.entries(fields)) {
+    values.push(value);
+    setClauses.push(`${key} = $${values.length}`);
+  }
+  values.push(phone);
+  await query(
+    `UPDATE bot_conversations SET ${setClauses.join(', ')}, updated_at = NOW(), last_message_at = NOW()
+     WHERE phone = $${values.length}`,
+    values
+  );
+}
+
+function remainingLockMinutes(lockedUntil) {
+  if (!lockedUntil) return 0;
+  const ms = new Date(lockedUntil).getTime() - Date.now();
+  return ms > 0 ? Math.ceil(ms / 60000) : 0;
+}
+
+// ============================================================
+// LOOKUP CONTRAT
+// ============================================================
+async function findContract(contractNumber) {
+  const result = await query(
+    `SELECT contract_number, client_name FROM contracts WHERE contract_number = $1 AND is_active = true`,
+    [contractNumber]
+  );
+  return result.rows[0] || null;
+}
+
+async function activateContact(contractNumber, clientName, phone) {
+  await query(
+    `INSERT INTO whatsapp_valid_contacts (contract_number, client_name, whatsapp_phone)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (contract_number) DO UPDATE SET 
+       client_name = EXCLUDED.client_name,
+       whatsapp_phone = EXCLUDED.whatsapp_phone,
+       activated_at = NOW()`,
+    [contractNumber, clientName, phone]
+  );
+}
+
+// ============================================================
+// GESTION COMMUNE DES ÉCHECS (format invalide / contrat introuvable / NON)
+// Compte partagé de tentatives pour tout le parcours "Facture Digitale"
+// ============================================================
+async function handleInvoiceAttemptFailure(phone, conversation, t, errorMessageFn, repromptFn, backToState) {
+  const attempts = (conversation.invoice_attempts || 0) + 1;
+
+  if (attempts >= MAX_ATTEMPTS) {
+    const lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60000);
+    await updateConversation(phone, {
+      invoice_attempts: attempts,
+      locked_until: lockedUntil,
+      state: backToState || conversation.state,
+    });
+    return { reply: t.locked() };
+  }
+
+  await updateConversation(phone, {
+    invoice_attempts: attempts,
+    state: backToState || conversation.state,
+  });
+
+  return { reply: `${errorMessageFn(attempts)}\n\n${repromptFn()}` };
+}
+
+// ============================================================
+// MOTEUR PRINCIPAL — traite un message entrant et renvoie la réponse
+// ============================================================
+async function processIncomingText({ phone, text, senderName, botNumber }) {
+  const conversation = await getOrCreateConversation(phone, botNumber);
+  // ⚠️ AJOUT : réinitialiser le verrou si le délai est écoulé
+  if (conversation.locked_until && new Date(conversation.locked_until) <= new Date()) {
+    await updateConversation(phone, { locked_until: null, invoice_attempts: 0 });
+    conversation.locked_until = null;
+    conversation.invoice_attempts = 0;
+  }
+  const lang = conversation.language || 'fr';
+  const t = MESSAGES[lang] || MESSAGES.fr;
+  const input = normalizeInput(text);
+  const displayName = conversation.contact_name || senderName || 'Client';
+
+  // Première fois qu'on voit ce numéro : toujours démarrer par la sélection de
+  // langue, peu importe le texte envoyé (ex: "Bonjour" venant du lien QR code).
+  // ⚠️ requiresTemplate: true ici — aucun ticket WATI n'existe encore pour ce
+  // contact, un envoi en texte libre échouerait avec "Ticket has been expired."
+  // Le worker doit envoyer ce premier message via un template approuvé.
+  if (conversation.state === 'LANG_SELECT' && !conversation.language) {
+    if (input === '1' || input === '2') {
+      const language = input === '1' ? 'fr' : 'en';
+      await updateConversation(phone, { language, contact_name: displayName, state: 'MAIN_MENU' });
+      return { reply: MESSAGES[language].mainMenu(displayName), requiresTemplate: true };
+    }
+    await updateConversation(phone, { contact_name: displayName });
+    return { reply: MESSAGES.fr.welcome(), requiresTemplate: true };
+  }
+
+  switch (conversation.state) {
+    case 'LANG_SELECT': {
+      if (input === '1' || input === '2') {
+        const language = input === '1' ? 'fr' : 'en';
+        await updateConversation(phone, { language, state: 'MAIN_MENU' });
+        return { reply: MESSAGES[language].mainMenu(displayName) };
+      }
+      return { reply: t.langInvalid() };
+    }
+
+    case 'MAIN_MENU': {
+      if (input === '1') {
+        const lockLeft = remainingLockMinutes(conversation.locked_until);
+        if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+
+        await updateConversation(phone, { state: 'INVOICE_CONTRACT_INPUT', invoice_attempts: 0 });
+        return { reply: t.invoicePrompt() };
+      }
+      if (input === '2') {
+        await updateConversation(phone, { state: 'LAST_INVOICE_CONTRACT_INPUT' });
+        return { reply: t.lastInvoicePrompt() };
+      }
+      return { reply: t.menuInvalid() };
+    }
+
+    case 'INVOICE_CONTRACT_INPUT': {
+      const lockLeft = remainingLockMinutes(conversation.locked_until);
+      if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+
+      if (!CONTRACT_REGEX.test(input)) {
+        return handleInvoiceAttemptFailure(phone, conversation, t, t.formatError, t.invoicePrompt);
+      }
+
+      const contract = await findContract(input);
+      if (!contract) {
+        return handleInvoiceAttemptFailure(phone, conversation, t, t.contractNotFound, t.invoicePrompt);
+      }
+
+      await updateConversation(phone, {
+        state: 'INVOICE_CONFIRM',
+        draft_contract_number: contract.contract_number,
+        draft_client_name: contract.client_name,
+      });
+      return { reply: t.confirm(contract.contract_number, contract.client_name) };
+    }
+
+    case 'INVOICE_CONFIRM': {
+      const lockLeft = remainingLockMinutes(conversation.locked_until);
+      if (lockLeft > 0) return { reply: t.stillLocked(lockLeft) };
+
+      if (isYes(input)) {
+        await activateContact(conversation.draft_contract_number, conversation.draft_client_name, phone);
+        const name = conversation.draft_client_name;
+        await updateConversation(phone, {
+          state: 'MAIN_MENU',
+          invoice_attempts: 0,
+          draft_contract_number: null,
+          draft_client_name: null,
+        });
+        return { reply: t.subscribeSuccess(name) };
+      }
+
+      if (isNo(input)) {
+        return handleInvoiceAttemptFailure(
+          phone, conversation, t, t.confirmDeny, t.invoicePrompt, 'INVOICE_CONTRACT_INPUT'
+        );
+      }
+
+      return { reply: t.confirmInvalid() };
+    }
+   
+case 'LAST_INVOICE_CONTRACT_INPUT': {
+  if (!CONTRACT_REGEX.test(input)) {
+    return { reply: t.formatError(1) };
+  }
+
+  let replyMessage;
+  try {
+    const lastInvoiceService = require('./last-invoice.service');
+    const result = await lastInvoiceService.requestLastInvoice(
+      input,
+      phone,
+      botNumber  // ou votre numéro émetteur
+    );
+    if (result.success) {
+      replyMessage = t.lastInvoiceAck();
+    } else {
+      replyMessage = result.message || t.lastInvoiceAck(); // fallback
+    }
+  } catch (err) {
+    logger.error('[CHATBOT] Erreur intégration dernière facture:', err.message);
+    replyMessage = t.lastInvoiceAck();
+  }
+
+  await updateConversation(phone, { state: 'MAIN_MENU' });
+  return { reply: replyMessage };
+}
+
+  }
+}
+
+module.exports = {
+  processIncomingText,
+  MESSAGES,
+};

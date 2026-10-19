@@ -1,0 +1,65 @@
+const authRoutes = require('./auth.routes');
+const orderRoutes = require('./order.routes');
+const messageRoutes = require('./message.routes');
+const webhookRoutes = require('./webhook.routes');
+const clientRoutes = require('./client.routes');
+const whatsappRoutes = require('./whatsapp.routes');
+const notificationRoutes = require('./notification.routes');
+const adminRoutes = require('./admin.routes');
+const bspRoutes = require('./bsp.routes');
+const invoiceDisbursementRoutes = require('./invoice-disbursement.routes');
+const queueRoutes = require('./queue.routes');
+const statsRoutes = require('./stats.routes');
+const templateRoutes = require('./template.routes');
+
+/**
+ * Enregistrement de toutes les routes v1
+ */
+async function v1Routes(fastify, options) {
+  // Routes d'authentification
+  fastify.register(authRoutes, { prefix: '/auth' });
+
+  // Routes de commandes
+  fastify.register(orderRoutes, { prefix: '/orders' });
+
+  // Routes de messages
+  fastify.register(messageRoutes, { prefix: '/messages' });
+
+  // Routes webhook
+  fastify.register(webhookRoutes, { prefix: '/webhook' });
+
+  fastify.register(adminRoutes, { prefix: '/admin' });
+
+  // Routes client
+  fastify.register(clientRoutes, { prefix: '/client' });
+
+  fastify.register(whatsappRoutes, { prefix: '/whatsapp' });
+
+  fastify.register(queueRoutes, { prefix: '/queue' });
+
+  fastify.register(statsRoutes, { prefix: '/stats' });
+
+  fastify.register(notificationRoutes, { prefix: '/notifications' });
+
+  fastify.register(require('./invitations.routes'), { prefix: '/invitations' });
+
+  // Routes BSP
+  fastify.register(bspRoutes, { prefix: '/bsp' });
+  
+  // Routes Factures & Décaissements
+  fastify.register(invoiceDisbursementRoutes, { prefix: '/invoice-disbursements' });
+
+  fastify.register(require('./monitoring.routes'), { prefix: '/monitoring' });
+
+  // Route de health check
+  fastify.get('/health', async (request, reply) => {
+    return {
+      success: true,
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    };
+  });
+}
+
+module.exports = v1Routes;

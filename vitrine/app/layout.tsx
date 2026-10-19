@@ -1,0 +1,35 @@
+import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import "./globals.css";
+import WhatsAppWidget from "@/components/WhatsAppWidget";
+
+const inter = Inter({ subsets: ["latin"] });
+
+export const metadata: Metadata = {
+  title: "NEXT LTD - Numeric EXport Technologies | WhatsApp Business API",
+  description: "Solution professionnelle d'intégration WhatsApp Business API. Conseil, développement et services IT au Cameroun.",
+  keywords: "WhatsApp Business API, 360dialog, Cameroun, développement web, API, intégration, marketing digital",
+  authors: [{ name: "NEXT LTD" }],
+  openGraph: {
+    title: "NEXT LTD - WhatsApp Business API",
+    description: "Intégrez WhatsApp Business dans vos applications avec NEXT LTD",
+    type: "website",
+    locale: "fr_FR",
+  },
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="fr" className="scroll-smooth">
+      <head />
+      <body className={inter.className}>
+        {children}
+        <WhatsAppWidget />
+      </body>
+    </html>
+  );
+}

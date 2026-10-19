@@ -1,0 +1,126 @@
+async function uploadFileHandler(req, rep) {
+    try {
+        const { spaceId } = req.params;
+        const status = await getSpaceStatus(spaceId);
+
+        if (!status.exists) return rep.status(404).send({ success: false, message: "Espace introuvable" });
+        if (status.isExpired) return rep.status(403).send({ success: false, message: "Abonnement expiré. Veuillez renouveler." });
+        if (!status.isActive) return rep.status(403).send({ success: false, message: "Espace désactivé." });
+        if (!status.hasQuota) return rep.status(403).send({ success: false, message: "Espace disque saturé." });
+
+        const data = await req.file();
+        if (!data) return rep.status(400).send({ success: false, message: "Aucun fichier reçu" });
+
+        const clientFolder = path.join(STORAGE_PATH, spaceId);
+        await fs.ensureDir(clientFolder);
+
+        const targetPath = path.join(clientFolder, `${Date.now()}-${uuidv4()}${path.extname(data.filename)}`);
+        await pipeline(data.file, fs.createWriteStream(targetPath));
+
+        return rep.send({ success: true, message: "Fichier sauvegardé" });
+    } catch (err) {
+        logger.error('Erreur upload:', err);
+        return rep.status(500).send({ success: false, message: "Erreur serveur" });
+    }
+}
+
+async function downloadFileHandler(req, rep) {
+    const { spaceId, filename } = req.params;
+    const filePath = path.join(STORAGE_PATH, spaceId, filename);
+    if (!await fs.pathExists(filePath)) return rep.status(404).send({ success: false, message: "Fichier non trouvé" });
+    return rep.sendFile(`${spaceId}/${filename}`, STORAGE_PATH);
+}
+
+async function deleteFileHandler(req, rep) {
+    try {
+        const { spaceId, filename } = req.params;
+        const status = await getSpaceStatus(spaceId);
+        if (status.isExpired || !status.isActive) return rep.status(403).send({ success: false, message: "Accès restreint." });
+
+        const filePath = path.join(STORAGE_PATH, spaceId, filename);
+        if (await fs.pathExists(filePath)) {
+            await fs.remove(filePath);
+            return rep.send({ success: true, message: "Fichier supprimé" });
+        }
+        return rep.status(404).send({ success: false, message: "Fichier introuvable" });
+    } catch (err) {
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+async function getStorageDetailHandler(req, rep) {
+    const { spaceId } = req.params;
+    const status = await getSpaceStatus(spaceId);
+    if (!status.exists) return rep.status(404).send({ success: false, message: "Inexistant" });
+    const files = await fs.readdir(path.join(STORAGE_PATH, spaceId)).catch(() => []);
+    return rep.send({ success: true, ...status, fileCount: files.length, files });
+}
+
+// --- HANDLERS (ADMIN) ---
+
+async function updateStorageSizeHandler(req, rep) {
+    const { spaceId } = req.params;
+    const { size_gb } = req.body;
+    const bytes = parseInt(size_gb) * 1024 * 1024 * 1024;
+    await query('UPDATE storage_spaces SET size_limit_bytes = $1, updated_at = now() WHERE id = $2', [bytes, spaceId]);
+    return rep.send({ success: true, message: "Quota mis à jour" });
+}
+
+async function updateExpirationHandler(req, rep) {
+    const { spaceId } = req.params;
+    const { expires_at } = req.body;
+    await query('UPDATE storage_spaces SET expires_at = $1, updated_at = now() WHERE id = $2', [expires_at, spaceId]);
+    return rep.send({ success: true, message: "Date d'expiration mise à jour" });
+}
+
+async function renewStorageSpaceHandler(req, rep) {
+    const { spaceId } = req.params;
+    const { months = 12 } = req.body;
+    
+    const check = await query('SELECT expires_at FROM storage_spaces WHERE id = $1', [spaceId]);
+    if (check.rowCount === 0) return rep.status(404).send({ success: false });
+
+    const current = check.rows[0].expires_at;
+    const start = (current && new Date(current) > new Date()) ? new Date(current) : new Date();
+    const newDate = new Date(start);
+    newDate.setMonth(newDate.getMonth() + parseInt(months));
+
+    await query('UPDATE storage_spaces SET expires_at = $1, is_active = true, updated_at = now() WHERE id = $2', [newDate, spaceId]);
+    return rep.send({ success: true, message: `Renouvelé jusqu'au ${newDate.toISOString()}` });
+}
+
+async function reassignStorageSpaceHandler(req, rep) {
+    const { spaceId } = req.params;
+    const { clientId } = req.body;
+    const result = await query('UPDATE storage_spaces SET client_id = $1, updated_at = now() WHERE id = $2', [clientId, spaceId]);
+    if (result.rowCount === 0) return rep.status(404).send({ success: false });
+    return rep.send({ success: true, message: "Espace réassigné" });
+}
+
+async function blockStorageSpaceHandler(req, rep) {
+    await query('UPDATE storage_spaces SET is_active = false, updated_at = now() WHERE id = $1', [req.params.spaceId]);
+    return rep.send({ success: true, message: "Bloqué" });
+}
+
+async function activateStorageSpaceHandler(req, rep) {
+    await query('UPDATE storage_spaces SET is_active = true, updated_at = now() WHERE id = $1', [req.params.spaceId]);
+    return rep.send({ success: true, message: "Activé" });
+}
+
+async function getAllStorageSpacesHandler(req, rep) {
+    const res = await query('SELECT * FROM storage_spaces ORDER BY created_at DESC');
+    return rep.send({ success: true, spaces: res.rows });
+}
+
+// Autres Placeholders
+async function requestStorageHandler(req, rep) { return rep.send({ success: true }); }
+async function updateFileHandler(req, rep) { return rep.send({ success: true }); }
+async function deleteStorageSpaceHandler(req, rep) { return rep.send({ success: true }); }
+
+module.exports = {
+    requestStorageHandler, getStorageDetailHandler, uploadFileHandler,
+    downloadFileHandler, deleteFileHandler, updateFileHandler,
+    getAllStorageSpacesHandler, renewStorageSpaceHandler, blockStorageSpaceHandler,
+    deleteStorageSpaceHandler, activateStorageSpaceHandler, reassignStorageSpaceHandler,
+    updateStorageSizeHandler, updateExpirationHandler
+};

@@ -1,0 +1,1559 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  FiRefreshCw,
+  FiDownload,
+  FiSearch,
+  FiCheck,
+  FiX,
+  FiLogOut,
+  FiFileText
+} from 'react-icons/fi';
+import StatsTab from './StatsTab';
+
+import {
+  captureGps,
+  enqueueOffline,
+  loadQueue,
+  flushOfflineQueue,
+  isProbablyOffline
+} from '../../lib/socadel-offline';
+
+type Contact = {
+  id: string;
+  service_no: string;
+  noms: string;
+  ref_geo: string;
+  itineraires: string;
+  meter_no: string;
+  numero_telephone: string;
+  check_status: string | null;
+  check_date: string | null;
+  api_status: string | null;
+  api_date: string | null;
+  statut: string | null;
+  responsable: string | null;
+  activated_at: string | null;
+  rapport: string | null;
+  identite: string | null;
+};
+
+type Progress = {
+  total: number;
+  checked: number;
+  remaining: number;
+  percent: number;
+};
+
+type ItineraryDesc = {
+  itineraires: string;
+  desc_itin: string;
+};
+
+// Helper pour formater les dates avec heure
+const formatDateTime = (dateStr: string | null) => {
+  if (!dateStr) return '—';
+  try {
+    return new Date(dateStr).toLocaleString('fr-FR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  } catch {
+    return '—';
+  }
+};
+
+/* ─────────────────────────────────────────────
+   Enregistrement rapide RELEVEUR
+   → quick-lookup + quick-register
+   → +237 figé côté téléphone
+   → GPS pré-capturé + file hors-ligne
+   → clic sur un résultat = recherche exacte
+   → modification du numéro sur ligne déjà checkée
+   ───────────────────────────────────────────── */
+function QuickRegisterForm({ token }: { token: string }) {
+  const [q, setQ] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState('');
+  const [msg, setMsg] = useState('');
+
+  type ContractLine = {
+    id: string;
+    itineraires: string | null;
+    ref_geo: string | null;
+    check_status: string | null;
+    check_date: string | null;
+    statut: string | null;
+    numero_telephone: string | null;
+    rapport: string | null;
+    identite: string | null;
+    region: string | null;
+    division: string | null;
+    agence: string | null;
+  };
+
+  type ContractCard = {
+    service_no: string;
+    meter_no: string | null;
+    noms: string | null;
+    primary_whatsapp: string | null;
+    has_valid_whatsapp: boolean;
+    can_edit: boolean;
+    all_checked: boolean;
+    is_subscribed?: boolean;
+    lines?: ContractLine[];
+  };
+
+  const [contracts, setContracts] = useState<ContractCard[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+
+  const [confirmExisting, setConfirmExisting] = useState(false);
+  const [phoneDigits, setPhoneDigits] = useState('');
+  const [smsOnly, setSmsOnly] = useState(false);
+  const [identite, setIdentite] = useState('proprietaire');
+  const [rapport, setRapport] = useState<'MRA' | 'OK'>('MRA');
+
+  // Modale « Modifier le numéro » (ligne déjà checkée)
+  const [phoneEdit, setPhoneEdit] = useState<{
+    open: boolean;
+    lineId: string | null;
+    current: string | null;
+    digits: string;
+  }>({ open: false, lineId: null, current: null, digits: '' });
+  const [phoneSaving, setPhoneSaving] = useState(false);
+  const [phoneEditMsg, setPhoneEditMsg] = useState('');
+  const [phoneEditErr, setPhoneEditErr] = useState('');
+
+  // GPS pré-capturé (fire-and-forget)
+  const gpsRef = useRef<{
+    gps_lat: number;
+    gps_lng: number;
+    gps_accuracy: number;
+    gps_captured_at: string;
+  } | null>(null);
+
+  const selectedContracts = contracts.filter((c) => selected.includes(c.service_no));
+  const hasValidWa = selectedContracts.some((c) => c.has_valid_whatsapp);
+  const primaryPhones = [
+    ...new Set(
+      selectedContracts.map((c) => c.primary_whatsapp).filter(Boolean) as string[]
+    )
+  ];
+
+  const phoneRequired =
+    !smsOnly && !(confirmExisting && hasValidWa && primaryPhones.length === 1);
+
+  // Capture GPS en arrière-plan au montage
+  useEffect(() => {
+    let cancelled = false;
+    captureGps(5000).then((pos) => {
+      if (!cancelled && pos) gpsRef.current = pos;
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Recherche.
+   * @param termOverride — si fourni, remplace q (utilisé au clic sur un résultat)
+   */
+  const search = async (termOverride?: string) => {
+    setErr('');
+    setMsg('');
+    setContracts([]);
+    setSelected([]);
+    setConfirmExisting(false);
+    setPhoneDigits('');
+
+    const term = (termOverride ?? q).trim();
+    if (termOverride !== undefined) setQ(termOverride);
+
+    if (term.length < 3) {
+      setErr('Saisissez au moins 3 caractères (contrat ou compteur)');
+      return;
+    }
+
+    // Rafraîchit GPS en arrière-plan (non bloquant)
+    captureGps(5000).then((pos) => {
+      if (pos) gpsRef.current = pos;
+    });
+
+    setLoading(true);
+    try {
+      const res = await fetch(
+        `/api/v1/socadel/quick-lookup?q=${encodeURIComponent(term)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const json = await res.json();
+
+      if (res.status === 409 || json.code === 'ALREADY_CHECKED') {
+        setErr(json.message || 'Client(s) déjà checké(s)');
+        setContracts(json.data?.contracts || json.contracts || []);
+        return;
+      }
+      if (!json.success && !json.found) {
+        setErr(json.message || 'Aucun client trouvé');
+        return;
+      }
+
+      const list: ContractCard[] = json.contracts || [];
+      setContracts(list);
+      const editable = list.filter((c) => c.can_edit);
+      setSelected(editable.map((c) => c.service_no));
+      if (!editable.length) {
+        setErr('Client non trouvé.');
+      }
+    } catch {
+      setErr('Erreur réseau');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggle = (sn: string) => {
+    setSelected((prev) =>
+      prev.includes(sn) ? prev.filter((x) => x !== sn) : [...prev, sn]
+    );
+  };
+
+  const submit = async () => {
+    setErr('');
+    setMsg('');
+    if (!selected.length) {
+      setErr('Sélectionnez au moins un contrat');
+      return;
+    }
+
+    const body: Record<string, unknown> = {
+      contracts: selected,
+      confirm_existing_whatsapp:
+        confirmExisting && hasValidWa && primaryPhones.length === 1,
+      sms_only: smsOnly,
+      identite,
+      rapport: smsOnly ? 'OK' : rapport
+    };
+
+    if (phoneRequired || smsOnly || (confirmExisting && primaryPhones.length > 1)) {
+      const digits = phoneDigits.replace(/\D/g, '');
+      if (digits.length !== 9) {
+        setErr('Numéro : 9 chiffres après +237');
+        return;
+      }
+      body.phone = `+237${digits}`;
+      if (primaryPhones.length > 1) {
+        body.confirm_existing_whatsapp = false;
+      }
+    }
+
+    let gps = gpsRef.current;
+    if (!gps) {
+      gps = await captureGps(2000);
+      if (gps) gpsRef.current = gps;
+    }
+    if (gps) Object.assign(body, gps);
+
+    if (isProbablyOffline()) {
+      enqueueOffline(body);
+      setMsg(
+        'Hors ligne : enregistrement mis en file. Envoi automatique dès le retour du réseau.'
+      );
+      resetAfterSuccess();
+      return;
+    }
+
+    setSaving(true);
+    try {
+      let res: Response;
+      try {
+        res = await fetch('/api/v1/socadel/quick-register', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify(body)
+        });
+      } catch {
+        enqueueOffline(body);
+        setMsg(
+          'Erreur réseau : enregistrement mis en file hors-ligne. Synchronisation automatique.'
+        );
+        resetAfterSuccess();
+        return;
+      }
+
+      if (!res.ok && (res.status >= 500 || res.status === 0 || res.status === 408)) {
+        enqueueOffline(body);
+        setMsg('Réseau instable : mis en file hors-ligne. Synchronisation automatique.');
+        resetAfterSuccess();
+        return;
+      }
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.success) {
+        setErr(json.message || 'Échec enregistrement');
+        return;
+      }
+
+      setMsg(
+        json.message ||
+          (json.data?.invoice_queued
+            ? `Enregistré${gps ? ' (GPS OK)' : ' (GPS indisponible)'}. Facture en cours d’envoi.`
+            : `Enregistré${gps ? ' (GPS OK)' : ''}.`)
+      );
+      resetAfterSuccess();
+    } catch {
+      setErr('Erreur réseau');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  function resetAfterSuccess() {
+    setContracts([]);
+    setSelected([]);
+    setQ('');
+    setPhoneDigits('');
+    setConfirmExisting(false);
+    setSmsOnly(false);
+  }
+
+  // ── Modifier le numéro d'une ligne déjà checkée ──
+  const openPhoneEdit = (line: ContractLine) => {
+    setPhoneEditErr('');
+    setPhoneEditMsg('');
+    const currentDigits = (line.numero_telephone || '')
+      .replace(/^\+?237/, '')
+      .replace(/\D/g, '');
+    setPhoneEdit({
+      open: true,
+      lineId: line.id,
+      current: line.numero_telephone,
+      digits: currentDigits.slice(0, 9)
+    });
+  };
+
+  const submitPhoneEdit = async () => {
+    setPhoneEditErr('');
+    setPhoneEditMsg('');
+    if (!phoneEdit.lineId) return;
+
+    const digits = phoneEdit.digits.replace(/\D/g, '');
+    if (digits.length !== 9) {
+      setPhoneEditErr('Le numéro doit contenir 9 chiffres après +237.');
+      return;
+    }
+
+    setPhoneSaving(true);
+    try {
+      const res = await fetch('/api/v1/socadel/update-phone', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          contact_id: phoneEdit.lineId,
+          phone: `+237${digits}`
+        })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.success) {
+        setPhoneEditErr(json.message || 'Échec de la modification');
+        return;
+      }
+      setPhoneEditMsg(
+        json.invoice_queued
+          ? 'Numéro modifié. Facture renvoyée automatiquement.'
+          : 'Numéro modifié.'
+      );
+      const lastQ = q;
+      setTimeout(() => {
+        setPhoneEdit({ open: false, lineId: null, current: null, digits: '' });
+        setPhoneEditMsg('');
+        if (lastQ) search(lastQ);
+      }, 1600);
+    } catch {
+      setPhoneEditErr('Erreur réseau');
+    } finally {
+      setPhoneSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4 max-w-lg mx-auto pb-16">
+      <div>
+        <h2 className="text-lg font-semibold text-blue-900">Enregistrement rapide</h2>
+        <p className="text-sm text-slate-500 mt-1">
+          Recherche par n° de contrat ou compteur — confirmation WhatsApp — validation.
+        </p>
+      </div>
+
+      <div className="bg-white p-4 rounded-xl border border-blue-100 shadow-sm space-y-3">
+        <label className="text-sm font-semibold text-blue-800">
+          Contrat ou compteur
+        </label>
+        <div className="flex gap-2">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && search()}
+            placeholder="Ex: 201345890"
+            className="flex-1 border border-blue-200 rounded-xl px-4 py-2.5 text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
+          />
+          <button
+            type="button"
+            onClick={() => search()}
+            disabled={loading}
+            className="px-4 py-2.5 bg-blue-700 text-white rounded-xl text-sm font-semibold inline-flex items-center gap-1 disabled:bg-blue-400"
+          >
+            <FiSearch size={14} /> {loading ? '…' : 'OK'}
+          </button>
+        </div>
+      </div>
+
+      {err && (
+        <p className="text-red-600 text-sm bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+          {err}
+        </p>
+      )}
+      {msg && (
+        <p className="text-emerald-700 text-sm bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+          {msg}
+        </p>
+      )}
+
+      {contracts.length > 0 && (
+        <div className="space-y-4">
+          <div className="space-y-2">
+            {contracts.map((c) => {
+              const checkedLines = (c.lines || []).filter(
+                (l) => l.check_status === 'OK'
+              );
+              return (
+                <div
+                  key={c.service_no}
+                  role={c.can_edit ? 'button' : undefined}
+                  tabIndex={c.can_edit ? 0 : -1}
+                  onClick={() => c.can_edit && search(c.service_no)}
+                  onKeyDown={(e) => {
+                    if (c.can_edit && (e.key === 'Enter' || e.key === ' ')) {
+                      search(c.service_no);
+                    }
+                  }}
+                  className={`w-full text-left flex flex-col gap-2 p-3 rounded-xl border transition
+                    ${
+                      c.can_edit
+                        ? 'border-blue-100 bg-white hover:border-blue-400 hover:bg-blue-50 cursor-pointer'
+                        : 'border-slate-100 bg-slate-50 opacity-90'
+                    }`}
+                  title={
+                    c.can_edit
+                      ? 'Cliquer pour filtrer sur ce contrat'
+                      : 'Déjà checké'
+                  }
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="font-semibold text-slate-800 truncate">
+                        {c.noms || 'Client'} — {c.service_no}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        Compteur : {c.meter_no || '—'}
+                        {c.is_subscribed ? ' · Abonné digital' : ''}
+                        {c.all_checked ? ' · Déjà checké' : ''}
+                      </p>
+                      {c.primary_whatsapp && (
+                        <p className="text-xs text-emerald-700 mt-0.5">
+                          WhatsApp : {c.primary_whatsapp}
+                        </p>
+                      )}
+                    </div>
+                    {c.can_edit && (
+                      <FiSearch size={16} className="text-blue-500 shrink-0" />
+                    )}
+                  </div>
+
+                  {checkedLines.length > 0 && (
+                    <div className="space-y-1">
+                      {checkedLines.map((l) => (
+                        <div
+                          key={l.id}
+                          className="flex items-center justify-between text-xs bg-emerald-50 border border-emerald-100 rounded-lg px-2 py-1.5"
+                        >
+                          <span className="text-emerald-800 font-mono truncate">
+                            ✓ {l.numero_telephone || '—'}
+                            {l.ref_geo ? ` · ${l.ref_geo}` : ''}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openPhoneEdit(l);
+                            }}
+                            className="text-blue-700 underline font-medium ml-2 shrink-0"
+                          >
+                            Modifier le numéro
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {hasValidWa && !smsOnly && (
+            <label className="flex items-start gap-2 p-3 rounded-lg bg-blue-50 border border-blue-100">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={confirmExisting}
+                onChange={(e) => setConfirmExisting(e.target.checked)}
+              />
+              <span className="text-sm text-slate-700">
+                Confirmer le WhatsApp existant pour les factures
+                {primaryPhones.length === 1 && (
+                  <strong className="block text-blue-700 font-mono">
+                    {primaryPhones[0]}
+                  </strong>
+                )}
+                {primaryPhones.length > 1 && (
+                  <span className="block text-amber-700 text-xs mt-1">
+                    Plusieurs numéros : saisissez celui à utiliser ci-dessous.
+                  </span>
+                )}
+              </span>
+            </label>
+          )}
+
+          {(phoneRequired || smsOnly || (confirmExisting && primaryPhones.length > 1)) && (
+            <div className="bg-white p-4 rounded-xl border border-blue-100 space-y-2">
+              <p className="text-sm font-semibold text-blue-800">
+                {smsOnly ? 'Numéro SMS' : 'Numéro WhatsApp'}
+              </p>
+              <div className="flex items-center gap-2 border border-blue-200 rounded-lg px-3 py-2 focus-within:ring-2 focus-within:ring-blue-500">
+                <span className="font-mono text-slate-600 select-none">+237</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={9}
+                  value={phoneDigits}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/\D/g, '');
+                    if (v.length <= 9) setPhoneDigits(v);
+                  }}
+                  placeholder="XXXXXXXXX"
+                  className="flex-1 outline-none font-mono text-base bg-transparent"
+                />
+              </div>
+            </div>
+          )}
+
+          <label className="flex items-center gap-2 px-1">
+            <input
+              type="checkbox"
+              checked={smsOnly}
+              onChange={(e) => {
+                setSmsOnly(e.target.checked);
+                if (e.target.checked) setConfirmExisting(false);
+              }}
+            />
+            <span className="text-sm text-slate-700">SMS uniquement (pas de WhatsApp)</span>
+          </label>
+
+          <div className="bg-white p-4 rounded-xl border border-blue-100 space-y-3">
+            <label className="block">
+              <span className="text-sm font-semibold text-blue-800">Identité</span>
+              <select
+                value={identite}
+                onChange={(e) => setIdentite(e.target.value)}
+                className="mt-1 w-full border border-blue-200 rounded-xl px-4 py-2.5 text-sm"
+              >
+                <option value="proprietaire">Propriétaire</option>
+                <option value="relation">Relation</option>
+                <option value="locataire">Locataire</option>
+                <option value="bailleur">Bailleur</option>
+              </select>
+            </label>
+
+            {!smsOnly && (
+              <label className="block">
+                <span className="text-sm font-semibold text-blue-800">Rapport</span>
+                <select
+                  value={rapport}
+                  onChange={(e) => setRapport(e.target.value as 'MRA' | 'OK')}
+                  disabled={true}
+                  className="mt-1 w-full border border-blue-200 rounded-xl px-4 py-2.5 text-sm"
+                >
+                  <option value="MRA">MRA</option>
+                  <option value="OK">OK</option>
+                </select>
+              </label>
+            )}
+
+            <button
+              type="button"
+              onClick={submit}
+              disabled={saving || !selected.length}
+              className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-xl disabled:bg-emerald-400"
+            >
+              {saving ? 'Enregistrement…' : 'Valider l’enregistrement'}
+            </button>
+            <p className="text-xs text-slate-500">
+              Check automatique. Facture WhatsApp envoyée si canal WhatsApp.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modale modification numéro ── */}
+      {phoneEdit.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-xl">
+            <h3 className="text-lg font-semibold text-blue-900 mb-2">
+              Modifier le numéro
+            </h3>
+            <p className="text-sm text-slate-600 mb-4">
+              Saisissez les <strong>9 chiffres</strong> après <strong>+237</strong>. La
+              facture sera renvoyée automatiquement au nouveau numéro.
+            </p>
+
+            {phoneEdit.current && (
+              <p className="text-xs text-slate-500 mb-3">
+                Numéro actuel :{' '}
+                <span className="font-mono text-slate-700">{phoneEdit.current}</span>
+              </p>
+            )}
+
+            <div className="flex items-center gap-2 border border-blue-200 rounded-lg px-3 py-2 focus-within:ring-2 focus-within:ring-blue-500">
+              <span className="text-base font-mono text-slate-600 select-none">+237</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={9}
+                value={phoneEdit.digits}
+                onChange={(e) => {
+                  const v = e.target.value.replace(/\D/g, '');
+                  if (v.length <= 9) {
+                    setPhoneEdit((prev) => ({ ...prev, digits: v }));
+                  }
+                }}
+                placeholder="XXXXXXXXX"
+                className="flex-1 outline-none bg-transparent font-mono text-base"
+                autoFocus
+              />
+            </div>
+
+            {phoneEditErr && (
+              <p className="mt-3 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+                {phoneEditErr}
+              </p>
+            )}
+            {phoneEditMsg && (
+              <p className="mt-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                {phoneEditMsg}
+              </p>
+            )}
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() =>
+                  setPhoneEdit({ open: false, lineId: null, current: null, digits: '' })
+                }
+                className="px-4 py-2 text-sm text-slate-600 hover:text-slate-800"
+                disabled={phoneSaving}
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                onClick={submitPhoneEdit}
+                disabled={phoneSaving}
+                className="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white rounded-lg text-sm font-medium disabled:opacity-60"
+              >
+                {phoneSaving ? 'Enregistrement…' : 'Valider'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   Vue principale Releveur
+   ───────────────────────────────────────────── */
+export default function ReleveurView({
+  token,
+  onLogout
+}: {
+  token: string;
+  onLogout: () => void;
+}) {
+  const [mainTab, setMainTab] = useState<'itineraire' | 'enregistrement' | 'stats'>('itineraire');
+
+  const [itineraryInput, setItineraryInput] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [data, setData] = useState<Contact[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [checkingAll] = useState(false);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [limit] = useState(50);
+  const [filters, setFilters] = useState({ meter_no: '', service_no: '' });
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [descs, setDescs] = useState<ItineraryDesc[]>([]);
+  const [pendingOffline, setPendingOffline] = useState(0);
+
+  useEffect(() => {
+    if (!token) return;
+
+    const sync = async () => {
+      const n = loadQueue().length;
+      setPendingOffline(n);
+      if (!n || isProbablyOffline()) return;
+      const r = await flushOfflineQueue(token);
+      setPendingOffline(r.remaining);
+      if (r.sent > 0) {
+        console.log(`[offline] ${r.sent} envoi(s) synchronisé(s), reste ${r.remaining}`);
+      }
+    };
+
+    sync();
+    window.addEventListener('online', sync);
+    const id = window.setInterval(sync, 60_000);
+    return () => {
+      window.removeEventListener('online', sync);
+      window.clearInterval(id);
+    };
+  }, [token]);
+
+  useEffect(() => {
+    const tick = () => setPendingOffline(loadQueue().length);
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const [phoneModal, setPhoneModal] = useState<{
+    isOpen: boolean;
+    id: string | null;
+    currentPhone: string | null;
+    inputDigits: string;
+  }>({
+    isOpen: false,
+    id: null,
+    currentPhone: null,
+    inputDigits: ''
+  });
+
+  const applyItineraries = () => {
+    const list = itineraryInput
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (list.length === 0) {
+      alert('Saisissez au moins un numéro d’itinéraire');
+      return;
+    }
+
+    const unique = [...new Set(list)];
+    setSelected(unique);
+    setPage(1);
+    loadMeta(unique);
+  };
+
+  const fetchData = useCallback(async () => {
+    if (!token || selected.length === 0) {
+      setData([]);
+      setTotal(0);
+      return;
+    }
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        itineraires: selected.join(','),
+        page: String(page),
+        limit: String(limit)
+      });
+      if (filters.meter_no) params.set('meter_no', filters.meter_no);
+      if (filters.service_no) params.set('service_no', filters.service_no);
+
+      const res = await fetch(`/api/v1/socadel/data?${params}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        onLogout();
+        return;
+      }
+      const json = await res.json();
+      if (json.success) {
+        setData(json.data);
+        setTotal(json.pagination.total);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [token, selected, page, limit, filters, onLogout]);
+
+  const loadMeta = async (list: string[]) => {
+    if (!token || !list.length) {
+      setDescs([]);
+      setProgress(null);
+      return;
+    }
+    const q = list.join(',');
+    try {
+      const [dRes, pRes] = await Promise.all([
+        fetch(`/api/v1/socadel/itinerary-desc?itineraires=${q}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        }),
+        fetch(`/api/v1/socadel/progress?itineraires=${q}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+      ]);
+      const dJson = await dRes.json();
+      const pJson = await pRes.json();
+      if (dJson.success) setDescs(dJson.data);
+      if (pJson.success) setProgress(pJson.global);
+    } catch (e) {
+      console.error('Erreur chargement métadonnées', e);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+    loadMeta(selected);
+  }, [fetchData, selected]);
+
+  const handleCheck = async (id: string, current: string | null) => {
+    if (!token) return;
+    const next = current === 'OK' ? null : 'OK';
+    try {
+      const res = await fetch('/api/v1/socadel/update-check', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id, check_status: next })
+      });
+      const json = await res.json();
+      if (json.success) {
+        setData((prev) =>
+          prev.map((r) =>
+            r.id === id
+              ? {
+                  ...r,
+                  check_status: json.data.check_status,
+                  check_date: json.data.check_date,
+                  responsable: json.data.responsable
+                }
+              : r
+          )
+        );
+        loadMeta(selected);
+      } else {
+        alert(json.message || 'Erreur');
+      }
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+  const exportPDF = async () => {
+    if (!token || selected.length === 0) return;
+    try {
+      const res = await fetch(
+        `/api/v1/socadel/export-pdf?itineraires=${selected.join(',')}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) throw new Error('Erreur export');
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `bordereau_${new Date().toISOString().slice(0, 10)}.pdf`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+      alert('Impossible de générer le PDF');
+    }
+  };
+
+  const exportCSV = async () => {
+    if (!token || selected.length === 0) return;
+    try {
+      const params = new URLSearchParams({
+        itineraires: selected.join(',')
+      });
+      if (filters.meter_no) params.set('meter_no', filters.meter_no);
+      if (filters.service_no) params.set('service_no', filters.service_no);
+
+      const res = await fetch(`/api/v1/socadel/export-csv?${params}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || 'Erreur export CSV');
+      }
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `export_socadel_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+      alert(e instanceof Error ? e.message : 'Impossible de générer le CSV');
+    }
+  };
+
+  const handleIdentite = async (id: string, identite: string) => {
+    if (!token) return;
+    try {
+      const res = await fetch('/api/v1/socadel/update-identite', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id, identite })
+      });
+      const json = await res.json();
+      if (!json.success) {
+        alert(json.message || 'Erreur');
+        return;
+      }
+      setData((prev) =>
+        prev.map((r) =>
+          r.id === id ? { ...r, identite: json.data.identite } : r
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+  const handleRapport = async (
+    id: string,
+    rapport: 'OK' | 'MRA',
+    currentPhone: string | null
+  ) => {
+    if (!token) return;
+
+    if (rapport === 'MRA') {
+      setPhoneModal({
+        isOpen: true,
+        id,
+        currentPhone,
+        inputDigits: ''
+      });
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/v1/socadel/update-rapport', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id, rapport })
+      });
+      const json = await res.json();
+      if (!json.success) {
+        alert(json.message || 'Erreur');
+        return;
+      }
+      setData((prev) =>
+        prev.map((r) =>
+          r.id === id
+            ? {
+                ...r,
+                rapport: json.data.rapport,
+                numero_telephone: json.data.numero_telephone ?? r.numero_telephone,
+                responsable: json.data.responsable
+              }
+            : r
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+  const submitPhoneModal = async () => {
+    const { id, inputDigits } = phoneModal;
+    if (!id || !token) return;
+
+    const digits = inputDigits.replace(/\D/g, '');
+    if (digits.length !== 9) {
+      alert('Veuillez saisir exactement 9 chiffres après +237.');
+      return;
+    }
+    const fullPhone = `+237${digits}`;
+
+    try {
+      const res = await fetch('/api/v1/socadel/update-rapport', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          id,
+          rapport: 'MRA',
+          numero_telephone: fullPhone
+        })
+      });
+      const json = await res.json();
+      if (!json.success) {
+        alert(json.message || 'Erreur');
+        return;
+      }
+      setData((prev) =>
+        prev.map((r) =>
+          r.id === id
+            ? {
+                ...r,
+                rapport: json.data.rapport,
+                numero_telephone: json.data.numero_telephone ?? r.numero_telephone,
+                responsable: json.data.responsable
+              }
+            : r
+        )
+      );
+      setPhoneModal({ isOpen: false, id: null, currentPhone: null, inputDigits: '' });
+    } catch (e) {
+      console.error(e);
+      alert('Erreur réseau');
+    }
+  };
+
+  const itineraireContent = (
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded-xl shadow-sm border border-blue-100">
+        <div className="mb-3">
+          <span className="text-sm font-semibold text-blue-800">Itinéraires</span>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Saisissez le(s) numéro(s) d’itinéraire que vous connaissez (séparés par virgule ou espace).
+          </p>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-3">
+          <input
+            type="text"
+            value={itineraryInput}
+            onChange={(e) => setItineraryInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && applyItineraries()}
+            placeholder="Ex: 117187, 110708, 3493"
+            className="flex-1 border border-blue-200 rounded-xl px-4 py-2.5 text-sm
+                       focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none
+                       font-mono"
+          />
+          <button
+            onClick={applyItineraries}
+            className="px-5 py-2.5 bg-blue-700 hover:bg-blue-800 text-white
+                       rounded-xl text-sm font-semibold transition whitespace-nowrap"
+          >
+            Valider
+          </button>
+        </div>
+
+        {selected.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-500">Actifs :</span>
+            {selected.map((it) => (
+              <span
+                key={it}
+                className="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-100
+                           text-blue-800 rounded-full text-xs font-medium font-mono"
+              >
+                {it}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = selected.filter((i) => i !== it);
+                    setSelected(next);
+                    setItineraryInput(next.join(', '));
+                    setPage(1);
+                  }}
+                  className="hover:text-red-600 ml-0.5"
+                  aria-label="Retirer"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setSelected([]);
+                setItineraryInput('');
+                setData([]);
+                setTotal(0);
+                setPage(1);
+                setProgress(null);
+                setDescs([]);
+              }}
+              className="text-xs text-red-600 hover:underline ml-1"
+            >
+              Tout effacer
+            </button>
+          </div>
+        )}
+
+        {descs.length > 0 && (
+          <div className="mt-4 bg-white p-4 rounded-xl border border-blue-100 text-sm space-y-1">
+            <p className="font-semibold text-blue-800 mb-2">Description des itinéraires</p>
+            {descs.map((d) => (
+              <p key={d.itineraires} className="text-slate-700">
+                <span className="font-mono font-medium text-blue-700">n° {d.itineraires}</span>
+                {' — '}
+                {d.desc_itin || '—'}
+              </p>
+            ))}
+          </div>
+        )}
+
+        {progress && selected.length > 0 && (
+          <div className="mt-4 bg-white p-4 rounded-xl border border-blue-100 shadow-sm">
+            <div className="flex justify-between text-sm text-blue-800 mb-2">
+              <span className="font-semibold">Progression des checks</span>
+              <span>
+                {progress.checked} / {progress.total} ({progress.percent} %)
+              </span>
+            </div>
+            <div className="h-2.5 bg-blue-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-600 rounded-full transition-all"
+                style={{ width: `${Math.min(progress.percent, 100)}%` }}
+              />
+            </div>
+            <p className="text-xs text-slate-500 mt-2">
+              Restant : {progress.remaining} client{progress.remaining > 1 ? 's' : ''}
+            </p>
+          </div>
+        )}
+
+        <div className="mt-4 flex flex-wrap gap-2 justify-end">
+          <button
+            onClick={exportPDF}
+            disabled={selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600
+                       hover:bg-blue-700 disabled:bg-blue-300 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiDownload size={14} />
+            PDF
+          </button>
+          <button
+            onClick={exportCSV}
+            disabled={selected.length === 0}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600
+                       hover:bg-indigo-700 disabled:bg-indigo-300 text-white
+                       rounded-lg text-sm font-medium transition"
+          >
+            <FiFileText size={14} />
+            CSV
+          </button>
+        </div>
+      </div>
+
+      {selected.length > 0 && (
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-blue-100 flex flex-wrap gap-3 items-end">
+          <div>
+            <label className="block text-xs font-medium text-blue-800 mb-1">Meter No</label>
+            <input
+              type="text"
+              value={filters.meter_no}
+              onChange={(e) => setFilters((p) => ({ ...p, meter_no: e.target.value }))}
+              placeholder="Rechercher…"
+              className="border border-blue-200 rounded-lg px-3 py-2 text-sm
+                         focus:ring-2 focus:ring-blue-400 outline-none w-40"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-blue-800 mb-1">Service No</label>
+            <input
+              type="text"
+              value={filters.service_no}
+              onChange={(e) => setFilters((p) => ({ ...p, service_no: e.target.value }))}
+              placeholder="Rechercher…"
+              className="border border-blue-200 rounded-lg px-3 py-2 text-sm
+                         focus:ring-2 focus:ring-blue-400 outline-none w-40"
+            />
+          </div>
+          <button
+            onClick={() => {
+              setPage(1);
+              fetchData();
+            }}
+            className="inline-flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700
+                       text-white px-4 py-2 rounded-lg text-sm font-medium transition"
+          >
+            <FiSearch size={14} />
+            Filtrer
+          </button>
+          <div className="ml-auto text-sm text-blue-700 font-medium self-center">
+            {total} ligne{total > 1 ? 's' : ''}
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl shadow-sm border border-blue-100 overflow-hidden">
+        {selected.length === 0 ? (
+          <div className="p-12 text-center text-slate-400">
+            <p className="text-lg font-medium text-slate-500 mb-1">
+              Saisissez un ou plusieurs itinéraires
+            </p>
+            <p className="text-sm">
+              Entrez les numéros que vous connaissez, puis cliquez sur Valider.
+            </p>
+          </div>
+        ) : loading ? (
+          <div className="p-12 text-center text-blue-500">Chargement…</div>
+        ) : data.length === 0 ? (
+          <div className="p-12 text-center text-slate-400">
+            Aucune donnée pour les itinéraires / filtres sélectionnés
+          </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-blue-100 text-sm">
+                <thead className="bg-blue-50 sticky top-0">
+                  <tr>
+                    {[
+                      'ITINERAIRE',
+                      'REF GEO',
+                      'METER NO',
+                      'TÉLÉPHONE',
+                      'NOMS',
+                      'CONTRAT',
+                      'CHECK',
+                      'CHECK DATE',
+                      'RAPPORT',
+                      'IDENTITÉ',
+                      'API',
+                      'API DATE',
+                      'DATE ABONNEMENT',
+                      'STATUT',
+                      'RESPONSABLE'
+                    ].map((h) => (
+                      <th
+                        key={h}
+                        className="px-3 py-3 text-left text-[10px] font-semibold
+                                   text-blue-800 uppercase tracking-wider whitespace-nowrap"
+                      >
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-blue-50">
+                  {data.map((row) => {
+                    const locked = row.check_status === 'OK';
+                    return (
+                      <tr key={row.id} className="hover:bg-blue-50/40 transition">
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.itineraires}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.ref_geo}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.meter_no}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.numero_telephone}
+                        </td>
+                        <td
+                          className="px-3 py-2 whitespace-nowrap font-mono text-xs truncate"
+                          title={row.noms}
+                        >
+                          {row.noms}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.service_no}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          <span
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full
+                                        text-xs font-medium
+                              ${
+                                row.check_status === 'OK'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : 'bg-slate-100 text-slate-400'
+                              }`}
+                            title={
+                              row.check_status === 'OK'
+                                ? 'Check automatique — non modifiable'
+                                : 'En attente de check'
+                            }
+                          >
+                            {row.check_status === 'OK' ? (
+                              <FiCheck size={12} />
+                            ) : (
+                              <FiX size={12} />
+                            )}
+                            {row.check_status || '—'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+                          {formatDateTime(row.check_date)}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          <select
+                            value={row.rapport === 'MRA' ? 'MRA' : 'OK'}
+                            onChange={(e) =>
+                              handleRapport(
+                                row.id,
+                                e.target.value as 'OK' | 'MRA',
+                                row.numero_telephone
+                              )
+                            }
+                            disabled={locked}
+                            className={`text-xs font-medium rounded-lg border px-2 py-1 outline-none cursor-pointer
+                              ${
+                                row.rapport === 'MRA'
+                                  ? 'border-amber-300 bg-amber-50 text-amber-800'
+                                  : 'border-blue-200 bg-blue-50 text-blue-800'
+                              }
+                              ${locked ? 'opacity-60 cursor-not-allowed' : ''}`}
+                          >
+                            <option value="OK">OK</option>
+                            <option value="MRA">MRA</option>
+                          </select>
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          <select
+                            value={row.identite || 'proprietaire'}
+                            onChange={(e) => handleIdentite(row.id, e.target.value)}
+                            disabled={locked}
+                            className={`text-xs font-medium rounded-lg border px-2 py-1 outline-none cursor-pointer
+                              ${
+                                row.identite === 'relation'
+                                  ? 'border-violet-300 bg-violet-50 text-violet-800'
+                                  : row.identite === 'locataire'
+                                  ? 'border-yellow-300 bg-yellow-50 text-yellow-800'
+                                  : row.identite === 'bailleur'
+                                  ? 'border-rose-300 bg-rose-50 text-rose-800'
+                                  : 'border-blue-200 bg-blue-50 text-blue-800'
+                              }
+                              ${locked ? 'opacity-60 cursor-not-allowed' : ''}`}
+                          >
+                            <option value="proprietaire">Propriétaire</option>
+                            <option value="relation">Relation</option>
+                            <option value="locataire">Locataire</option>
+                            <option value="bailleur">Bailleur</option>
+                          </select>
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-xs font-medium
+                              ${
+                                row.api_status === 'OK'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : row.api_status === 'NOK'
+                                  ? 'bg-red-100 text-red-700'
+                                  : 'bg-slate-100 text-slate-500'
+                              }`}
+                          >
+                            {row.api_status || '—'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+                          {formatDateTime(row.api_date)}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-600">
+                          {formatDateTime(row.activated_at)}
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-xs font-medium
+                              ${
+                                row.statut === 'ABONNE'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : 'bg-red-100 text-red-700'
+                              }`}
+                          >
+                            {row.statut || 'NON ABONNE'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 whitespace-nowrap font-mono text-xs">
+                          {row.responsable || 'AUTRES'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {total > limit && (
+              <div className="flex justify-between items-center px-4 py-3 bg-blue-50/60 border-t border-blue-100">
+                <span className="text-sm text-blue-800">
+                  {total} ligne{total > 1 ? 's' : ''} — page {page} /{' '}
+                  {Math.ceil(total / limit)}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => p - 1)}
+                    className="px-3 py-1.5 border border-blue-300 rounded-lg text-sm
+                               disabled:opacity-40 hover:bg-blue-50 transition"
+                  >
+                    Précédent
+                  </button>
+                  <button
+                    disabled={page * limit >= total}
+                    onClick={() => setPage((p) => p + 1)}
+                    className="px-3 py-1.5 border border-blue-300 rounded-lg text-sm
+                               disabled:opacity-40 hover:bg-blue-50 transition"
+                  >
+                    Suivant
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-blue-100 sticky top-0 z-20">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img src="/socad.png" alt="Socadel" className="h-9" />
+            <div>
+              <h1 className="text-lg font-bold text-blue-900 leading-tight">
+                Campagne de collecte WhatsApp
+              </h1>
+              <p className="text-xs text-blue-600/70">Socadel</p>
+            </div>
+          </div>
+          <button
+            onClick={onLogout}
+            className="inline-flex items-center gap-1.5 text-sm text-blue-700
+                       hover:text-blue-900 font-medium transition"
+          >
+            <FiLogOut size={15} />
+            Déconnexion
+          </button>
+        </div>
+
+        {pendingOffline > 0 && (
+          <div className="bg-amber-50 text-amber-900 text-xs px-3 py-2 text-center border-b border-amber-100">
+            {pendingOffline} enregistrement(s) en attente de réseau — sync auto à la reconnexion
+          </div>
+        )}
+
+        <nav className="max-w-[1600px] mx-auto px-4 sm:px-6 flex gap-1 pb-3 overflow-x-auto">
+          {[
+            { id: 'itineraire' as const, label: 'Itinéraires' },
+            { id: 'enregistrement' as const, label: 'Enregistrement' },
+            { id: 'stats' as const, label: 'Stats' }
+          ].map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setMainTab(t.id)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition ${
+                mainTab === t.id
+                  ? 'bg-blue-700 text-white'
+                  : 'text-slate-600 bg-slate-100 hover:bg-slate-200'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+        {mainTab === 'itineraire' && itineraireContent}
+        {mainTab === 'enregistrement' && <QuickRegisterForm token={token} />}
+        {mainTab === 'stats' && <StatsTab token={token} mode="releveur" />}
+      </main>
+
+      {phoneModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-xl">
+            <h3 className="text-lg font-semibold text-blue-900 mb-2">
+              Saisie du numéro WhatsApp
+            </h3>
+            <p className="text-sm text-slate-600 mb-4">
+              Veuillez entrer les <strong>9 chiffres</strong> après l’indicatif{' '}
+              <strong>+237</strong>.
+            </p>
+            <div className="flex items-center gap-2 border border-blue-200 rounded-lg px-3 py-2 focus-within:ring-2 focus-within:ring-blue-500">
+              <span className="text-base font-mono text-slate-600 select-none">+237</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={9}
+                value={phoneModal.inputDigits}
+                onChange={(e) => {
+                  const val = e.target.value.replace(/\D/g, '');
+                  if (val.length <= 9) {
+                    setPhoneModal((prev) => ({ ...prev, inputDigits: val }));
+                  }
+                }}
+                placeholder="XXXXXXXXX"
+                className="flex-1 outline-none bg-transparent font-mono text-base"
+                autoFocus
+              />
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() =>
+                  setPhoneModal({
+                    isOpen: false,
+                    id: null,
+                    currentPhone: null,
+                    inputDigits: ''
+                  })
+                }
+                className="px-4 py-2 text-sm text-slate-600 hover:text-slate-800 transition"
+              >
+                Annuler
+              </button>
+              <button
+                onClick={submitPhoneModal}
+                className="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white rounded-lg text-sm font-medium transition"
+              >
+                Valider
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

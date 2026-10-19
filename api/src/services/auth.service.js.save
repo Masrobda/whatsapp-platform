@@ -1,0 +1,135 @@
+        role: user.role,
+        permissions: user.permissions
+      }
+    };
+
+  } catch (error) {
+    logger.error('Erreur login utilisateur:', error);
+    throw error;
+  }
+}
+
+/**
+ * Demande de réinitialisation de mot de passe
+ */
+async function forgotPassword(email, userType = 'client') {
+  try {
+    // Vérifier que l'email existe
+    const table = userType === 'client' ? 'clients' : 'users';
+    const result = await query(
+      `SELECT id, email FROM ${table} WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      // Pour des raisons de sécurité, on ne révèle pas si l'email existe
+      return {
+        success: true,
+        message: 'Si cette adresse email existe, un lien de réinitialisation a été envoyé.'
+      };
+    }
+
+    // Générer un token de réinitialisation
+    const resetToken = generateResetToken();
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 1); // Expire dans 1 heure
+
+    // Enregistrer le token
+    await query(
+      `INSERT INTO password_resets (email, token, user_type, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [email, resetToken, userType, expiresAt]
+    );
+
+    // Envoyer l'email
+    await sendResetPasswordEmail(email, resetToken);
+
+    logger.info('Reset password demandé:', email);
+
+    return {
+      success: true,
+      message: 'Si cette adresse email existe, un lien de réinitialisation a été envoyé.'
+    };
+
+  } catch (error) {
+    logger.error('Erreur forgot password:', error);
+    throw error;
+  }
+}
+
+/**
+ * Réinitialisation du mot de passe
+ */
+async function resetPassword(token, newPassword) {
+  try {
+    // Vérifier le token
+    const result = await query(
+      `SELECT email, user_type, expires_at, used 
+       FROM password_resets 
+       WHERE token = $1`,
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      throw {
+        statusCode: 400,
+        code: 'INVALID_TOKEN',
+        message: 'Token de réinitialisation invalide ou expiré'
+      };
+    }
+
+    const resetData = result.rows[0];
+
+    // Vérifications
+    if (resetData.used) {
+      throw {
+        statusCode: 400,
+        code: 'TOKEN_USED',
+        message: 'Ce token a déjà été utilisé'
+      };
+    }
+
+    if (new Date() > new Date(resetData.expires_at)) {
+      throw {
+        statusCode: 400,
+        code: 'TOKEN_EXPIRED',
+        message: 'Ce token a expiré. Demandez un nouveau lien de réinitialisation.'
+      };
+    }
+
+    // Hash du nouveau mot de passe
+    const password_hash = await hashPassword(newPassword);
+
+    // Mettre à jour le mot de passe
+    const table = resetData.user_type === 'client' ? 'clients' : 'users';
+    await query(
+      `UPDATE ${table} SET password_hash = $1 WHERE email = $2`,
+      [password_hash, resetData.email]
+    );
+
+    // Marquer le token comme utilisé
+    await query(
+      'UPDATE password_resets SET used = true WHERE token = $1',
+      [token]
+    );
+
+    logger.info('Mot de passe réinitialisé:', resetData.email);
+
+    return {
+      success: true,
+      message: 'Votre mot de passe a été réinitialisé avec succès. Vous pouvez maintenant vous connecter.'
+    };
+
+  } catch (error) {
+    logger.error('Erreur reset password:', error);
+    throw error;
+  }
+}
+
+module.exports = {
+  registerClient,
+  loginClient,
+  loginUser,
+  forgotPassword,
+  resetPassword,
+};

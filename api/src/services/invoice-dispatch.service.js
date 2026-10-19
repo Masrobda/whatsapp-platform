@@ -1,0 +1,389 @@
+// /var/www/numericexport/api/src/services/invoice-dispatch.service.js
+'use strict';
+
+const { query } = require('../config/database');
+const { sendMessage } = require('./message.service');
+const logger = require('../utils/logger');
+
+// ============================================================
+// CONFIGURATION (surchargeable via .env)
+// ============================================================
+const CONFIG = {
+  batchSize:     parseInt(process.env.INVOICE_BATCH_SIZE     || '500',   10),
+  concurrency:   parseInt(process.env.INVOICE_CONCURRENCY    || '25',    10),
+  maxAttempts:   parseInt(process.env.INVOICE_MAX_ATTEMPTS   || '3',     10),
+  maxRuntimeMs:  parseInt(process.env.INVOICE_MAX_RUNTIME_MS || '600000',10), // 10 min par run
+  staleMinutes:  parseInt(process.env.INVOICE_STALE_MINUTES  || '15',    10),
+  logEveryN:     parseInt(process.env.INVOICE_LOG_EVERY      || '500',   10),
+
+  templateName:  process.env.INVOICE_TEMPLATE_NAMES || 'next_soc03_facture_fr_033',
+  templateLang:  process.env.INVOICE_TEMPLATE_LANG || 'fr',
+  brandName:     process.env.INVOICE_BRAND_NAME    || 'SOCADEL',
+  channelNumber: process.env.INVOICE_CHANNEL_NUMBER|| '+237654347627',
+};
+
+// ============================================================
+// HELPERS DE FORMATAGE
+// ============================================================
+function formatAmount(v) {
+  const n = Number(v ?? 0);
+  return n
+    .toLocaleString('fr-FR', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+    .replace(/\u202f|\u00a0/g, ' ');
+}
+
+function formatDateFR(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return '';
+  const dd = String(dt.getDate()).padStart(2, '0');
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  return `${dd}/${mm}/${dt.getFullYear()}`;
+}
+
+// ============================================================
+// CLAIM ATOMIQUE PAR LOT (SKIP LOCKED)
+// ============================================================
+async function claimNextBatch(batchSize = CONFIG.batchSize) {
+  const { rows } = await query(
+    `UPDATE mysql_invoices_all
+        SET whatsapp_status   = 'processing',
+            whatsapp_attempts = whatsapp_attempts + 1
+      WHERE id IN (
+        SELECT id
+          FROM mysql_invoices_all
+         WHERE whatsapp_status = 'pending'
+           AND whatsapp_attempts < $1
+         ORDER BY imported_at ASC
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+      )
+      RETURNING id, numero_facture, numero_contrat, nom_client,
+                montant, unpaid_bills_amount, due_date, lien_pdf,
+                telephone, contact_ws_status`,
+    [CONFIG.maxAttempts, batchSize]
+  );
+  return rows;
+}
+
+// ============================================================
+// RÉSOLUTION TÉLÉPHONES PAR LOT — WVC PRIORITAIRE
+//   1. whatsapp_valid_contacts (numéro confirmé WhatsApp)
+//   2. Fallback : mysql_invoices_all.telephone si contact_ws_status='valid'
+//   3. Sinon : skipped
+// ============================================================
+
+/**
+ * Retourne true si le numéro est exploitable (non null, non vide,
+ * contient au moins 8 chiffres après nettoyage).
+ */
+function isValidPhone(phone) {
+  if (phone === null || phone === undefined) return false;
+  const s = String(phone).trim();
+  if (s === '') return false;
+  // Au moins 8 chiffres → numéro plausible
+  const digits = s.replace(/\D/g, '');
+  return digits.length >= 8;
+}
+
+async function resolvePhonesBatch(invoices) {
+  if (invoices.length === 0) return [];
+
+  // 1 seule requête pour TOUS les contrats du lot
+  const contracts = invoices.map(i => i.numero_contrat);
+
+  const { rows } = await query(
+    `SELECT contract_number, whatsapp_phone
+       FROM whatsapp_valid_contacts
+      WHERE contract_number = ANY($1)`,
+    [contracts]
+  );
+  const wvcMap = new Map(rows.map(r => [r.contract_number, r.whatsapp_phone]));
+
+  return invoices.map(inv => {
+    // ── 1. PRIORITÉ : whatsapp_valid_contacts ──
+    const wvcPhone = wvcMap.get(inv.numero_contrat);
+    if (isValidPhone(wvcPhone)) {
+      return { ...inv, recipient_phone: String(wvcPhone).trim(), phone_source: 'wvc' };
+    }
+
+    // ── 2. FALLBACK : téléphone de la facture (si valid) ──
+    if (inv.contact_ws_status === 'valid' && isValidPhone(inv.telephone)) {
+      return { ...inv, recipient_phone: String(inv.telephone).trim(), phone_source: 'invoice' };
+    }
+
+    // ── 3. Aucun numéro valide → skipped ──
+    return { ...inv, recipient_phone: null, phone_source: null };
+  });
+}
+
+
+// ============================================================
+// TRAITEMENT D'UNE FACTURE (appelée en parallèle)
+// Retourne { status, invoice, messageId?, error? }
+// ============================================================
+async function processOneInvoice(inv, clientId) {
+  // ── 1. Vérifier le téléphone (null / vide / espaces / invalide) ──
+  if (!inv.recipient_phone || String(inv.recipient_phone).trim() === '') {
+    return {
+      status: 'skipped',
+      invoice: inv,
+      error: 'Aucun numéro WhatsApp valide (téléphone null ou vide)',
+    };
+  }
+
+  // Sécurité supplémentaire : validité minimale
+  const digits = String(inv.recipient_phone).replace(/\D/g, '');
+  if (digits.length < 8) {
+    return {
+      status: 'skipped',
+      invoice: inv,
+      error: `Numéro invalide (trop court) : "${inv.recipient_phone}"`,
+    };
+  }
+
+  // ── 2. Vérifier le PDF ──
+  if (!inv.lien_pdf || !inv.lien_pdf.startsWith('http')) {
+    return {
+      status: 'skipped',
+      invoice: inv,
+      error: 'URL PDF invalide',
+    };
+  }
+
+  // 🔒 Idempotence : 'queued' AVANT sendMessage
+  await query(
+    `UPDATE mysql_invoices_all SET whatsapp_status = 'queued' WHERE id = $1`,
+    [inv.id]
+  );
+
+  try {
+    const result = await sendMessage(clientId, {
+      phoneNumber:      CONFIG.channelNumber,
+      recipient_phone:  inv.recipient_phone,
+      message_type:     'template',
+      template_name:    CONFIG.templateName,
+      template_language:CONFIG.templateLang,
+      template_params: {
+        '1': inv.lien_pdf,
+        '2': CONFIG.brandName,
+        '3': inv.nom_client,
+        '4': inv.numero_contrat,
+        '5': inv.numero_facture,
+        '6': formatAmount(inv.montant),
+        '7': formatAmount(inv.unpaid_bills_amount),
+        '8': formatDateFR(inv.due_date),
+      },
+      invoice_data: {
+        pdfUrl: inv.lien_pdf,
+        number: inv.numero_facture,
+      },
+    });
+
+    const messageId = result?.data?.message_id || null;
+    return { status: 'queued', invoice: inv, messageId };
+
+  } catch (err) {
+    const msg = String(err?.message || err).slice(0, 500);
+    return { status: 'failed', invoice: inv, error: msg };
+  }
+}
+
+// ============================================================
+// PERSISTANCE DES RÉSULTATS PAR LOT (UNNEST, zéro N+1)
+// ============================================================
+async function persistResults(results) {
+  const queued  = results.filter(r => r.status === 'queued' && r.messageId);
+  const skipped = results.filter(r => r.status === 'skipped');
+  const failed  = results.filter(r => r.status === 'failed');
+  const promises = [];
+
+  // ── queued ─────────────────────────────────────────────
+  if (queued.length > 0) {
+    const ids   = queued.map(r => r.invoice.id);
+    const msgIds = queued.map(r => r.messageId);
+    promises.push(
+      query(
+        `UPDATE mysql_invoices_all AS m
+            SET whatsapp_status     = 'queued',
+                whatsapp_sent_at    = NOW(),
+                whatsapp_message_id = u.msg_id,
+                whatsapp_error      = NULL
+           FROM UNNEST($1::int[], $2::uuid[]) AS u(inv_id, msg_id)
+          WHERE m.id = u.inv_id`,
+        [ids, msgIds]
+      )
+    );
+  }
+
+  // ── skipped ────────────────────────────────────────────
+  if (skipped.length > 0) {
+    const ids    = skipped.map(r => r.invoice.id);
+    const errors = skipped.map(r => r.error || 'skipped');
+    promises.push(
+      query(
+        `UPDATE mysql_invoices_all AS m
+            SET whatsapp_status = 'skipped',
+                whatsapp_error  = u.err
+           FROM UNNEST($1::int[], $2::text[]) AS u(inv_id, err)
+          WHERE m.id = u.inv_id`,
+        [ids, errors]
+      )
+    );
+  }
+
+  // ── failed : retryable si attempts < max, sinon failed définitif
+  if (failed.length > 0) {
+    const ids    = failed.map(r => r.invoice.id);
+    const errors = failed.map(r => r.error || 'unknown');
+    promises.push(
+      query(
+        `UPDATE mysql_invoices_all AS m
+            SET whatsapp_status = CASE
+                  WHEN m.whatsapp_attempts >= $3 THEN 'failed'
+                  ELSE 'pending'
+                END,
+                whatsapp_error = u.err
+           FROM UNNEST($1::int[], $2::text[]) AS u(inv_id, err)
+          WHERE m.id = u.inv_id`,
+        [ids, errors, CONFIG.maxAttempts]
+      )
+    );
+  }
+
+  await Promise.all(promises);
+}
+
+// ============================================================
+// WORKER POOL : traite un batch en parallèle borné
+// ============================================================
+async function processBatchWithConcurrency(invoices, clientId, concurrency) {
+  const results = new Array(invoices.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= invoices.length) return;
+      try {
+        results[idx] = await processOneInvoice(invoices[idx], clientId);
+      } catch (err) {
+        // Filet de sécurité : une facture ne doit jamais faire planter le batch
+        results[idx] = {
+          status: 'failed',
+          invoice: invoices[idx],
+          error: String(err?.message || err).slice(0, 500),
+        };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, invoices.length) }, worker)
+  );
+
+  return results;
+}
+
+// ============================================================
+// BOUCLE PRINCIPALE DE DISPATCH
+// ============================================================
+async function dispatchPendingInvoices(clientId, opts = {}) {
+  if (!clientId) throw new Error('clientId requis');
+
+  const startedAt   = Date.now();
+  const maxRuntime  = opts.maxRuntimeMs ?? CONFIG.maxRuntimeMs;
+  const batchSize   = opts.batchSize     ?? CONFIG.batchSize;
+  const concurrency = opts.concurrency   ?? CONFIG.concurrency;
+
+  const totals = {
+    processed: 0, queued: 0, skipped: 0, failed: 0, batches: 0,
+    startedAt: new Date().toISOString(),
+  };
+
+  logger.info(
+    `[INVOICE-DISPATCH] ▶ start client=${clientId} batch=${batchSize} ` +
+    `concurrency=${concurrency} maxRuntime=${maxRuntime}ms`
+  );
+
+  while (Date.now() - startedAt < maxRuntime) {
+    // 1. Claim par lot
+    const batch = await claimNextBatch(batchSize);
+    if (batch.length === 0) {
+      logger.info('[INVOICE-DISPATCH] ✓ plus rien à traiter');
+      break;
+    }
+
+    // 2. Résolution téléphones par lot (1 seule requête)
+    const enriched = await resolvePhonesBatch(batch);
+
+    // 3. Traitement parallèle borné
+    const results = await processBatchWithConcurrency(
+      enriched, clientId, concurrency
+    );
+
+    // 4. Persistance par lot (UNNEST)
+    await persistResults(results);
+
+    // 5. Stats + log de progression
+    for (const r of results) totals[r.status] = (totals[r.status] || 0) + 1;
+    totals.processed += results.length;
+    totals.batches++;
+
+    if (totals.processed % CONFIG.logEveryN < batchSize) {
+      logger.info(
+        `[INVOICE-DISPATCH] progress processed=${totals.processed} ` +
+        `queued=${totals.queued} skipped=${totals.skipped} failed=${totals.failed}`
+      );
+    }
+  }
+
+  totals.durationMs = Date.now() - startedAt;
+  totals.finishedAt = new Date().toISOString();
+  logger.info(`[INVOICE-DISPATCH] ■ done ${JSON.stringify(totals)}`);
+  return totals;
+}
+
+// ============================================================
+// RÉCUPÉRATION DES 'processing' ORPHELINS
+// (crash entre claim et persistance)
+// ============================================================
+async function requeueStaleProcessing(minutes = CONFIG.staleMinutes) {
+  const { rowCount } = await query(
+    `UPDATE mysql_invoices_all
+        SET whatsapp_status = 'pending',
+            whatsapp_error  = COALESCE(whatsapp_error, '')
+                              || ' [requeued: stale processing]'
+      WHERE whatsapp_status = 'processing'
+        AND imported_at < NOW() - ($1 || ' minutes')::interval`,
+    [String(minutes)]
+  );
+  if (rowCount > 0) {
+    logger.warn(`[INVOICE] ${rowCount} factures requeued (processing stale > ${minutes}min)`);
+  }
+  return rowCount;
+}
+
+// ============================================================
+// STATS POUR MONITORING
+// ============================================================
+async function getInvoiceStats() {
+  const { rows } = await query(
+    `SELECT whatsapp_status, COUNT(*)::int AS count
+       FROM mysql_invoices_all
+      GROUP BY whatsapp_status`
+  );
+  return rows.reduce((acc, r) => ({ ...acc, [r.whatsapp_status]: r.count }), {});
+}
+
+module.exports = {
+  dispatchPendingInvoices,
+  claimNextBatch,
+  resolvePhonesBatch,
+  processOneInvoice,
+  processBatchWithConcurrency,
+  persistResults,
+  requeueStaleProcessing,
+  getInvoiceStats,
+  CONFIG,
+};

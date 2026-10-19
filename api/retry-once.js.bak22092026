@@ -1,0 +1,62 @@
+require('dotenv').config();
+const { query } = require('./src/config/database');
+const {
+  enqueueMissingInvoices,
+  processRetryBatch
+} = require('./src/services/socadel-invoice-retry.service');
+
+const CONTRACTS = [
+  '204938935','203570554','203540594','204933883','200273590',
+  '201213804','200838243','200838151','204910724','204926519',
+  '203725404','203766838','201843334','204885310','203209778',
+  '203745232','204417166','203424387','200841775','204739728',
+  '204720861','201033757','200282413','201033381','204939241',
+  '204942701','204418605','200855032','203607884','203459810',
+  '204701277','203714607','204926702','204712168','204936992',
+  '204720111','201775010','200836798','200836525','200837002',
+  '203297130','201516885','203709629','201162344','201162346',
+  '201162340','204911847','203412953','203451206','200857952'
+];
+
+(async () => {
+  try {
+    // 1) WhatsApp valid contacts (bloque le ré-enqueue)
+    const delWac = await query(
+      `DELETE FROM whatsapp_valid_contacts w
+       USING socadel_contacts sc
+       WHERE w.contract_number = sc.service_no
+         AND sc.service_no     = ANY($1::text[])
+         AND sc.check_status   = 'OK'
+         AND regexp_replace(COALESCE(w.whatsapp_phone,''),    '[^0-9]', '', 'g')
+           = regexp_replace(COALESCE(sc.numero_telephone,''), '[^0-9]', '', 'g')`,
+      [CONTRACTS]
+    );
+    console.log('whatsapp_valid_contacts supprimés :', delWac.rowCount);
+
+    // 2) File existante
+    const delQueue = await query(
+      `DELETE FROM socadel_invoice_retry_queue
+       WHERE contract_number = ANY($1::text[])`,
+      [CONTRACTS]
+    );
+    console.log('queue supprimée :', delQueue.rowCount);
+
+    // 3) Ré-enqueue
+    const enq = await enqueueMissingInvoices();
+    console.log('[enqueue]', enq);
+
+    // 4) Traitement immédiat d'un lot (répète tant qu'il reste du travail)
+    let loops = 0;
+    while (loops < 10) {
+      loops++;
+      const proc = await processRetryBatch();
+      console.log(`[process #${loops}]`, proc);
+      if (proc.processed === 0) break;
+    }
+
+    process.exit(0);
+  } catch (e) {
+    console.error('ERREUR:', e);
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,247 @@
+// src/routes/v1/template.routes.js
+const {
+  createTemplateHandler,
+  submitTemplateHandler,
+  refreshTemplateHandler,
+  getTemplatesHandler,
+  getTemplateByIdHandler,
+  updateTemplateHandler,
+  deleteTemplateHandler,
+  duplicateTemplateHandler,
+  previewTemplateHandler,
+  manualStatusUpdateHandler
+} = require('../../controllers/template.controller');
+
+const { authenticateJWT } = require('../../middlewares/auth.middleware');
+const { requireRole, ROLES } = require('../../middlewares/role.middleware');
+
+const { query } = require('../../config/database');
+const templateService = require('../../services/template.service');
+const logger = require('../../utils/logger');
+
+async function templateRoutes(fastify, options) {
+  
+  // 🔥 ROUTE POUR RÉCUPÉRER LE TEMPLATE PAR DÉFAUT DU CLIENT
+  fastify.get('/client/default', {
+    preHandler: [authenticateJWT]
+  }, async (request, reply) => {
+    try {
+      console.log('=== DEBUG TEMPLATE DEFAULT ===');
+      console.log('User from token:', request.user);
+      
+      const clientId = request.user.id;
+      console.log('Client ID:', clientId);
+
+      if (!clientId) {
+        return reply.code(401).send({
+          success: false,
+          message: 'Client ID non trouvé dans le token'
+        });
+      }
+
+      const result = await query(
+        `SELECT t.id, t.name, t.language, t.category, t.body_content, t.variables
+         FROM templates t
+         JOIN client_templates ct ON ct.template_id = t.id
+         WHERE ct.client_id = $1
+           AND ct.is_active = true
+           AND t.status = 'approved'
+         ORDER BY ct.assigned_at ASC
+         LIMIT 1`,
+        [clientId]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.code(404).send({
+          success: false,
+          message: 'Aucun template par défaut trouvé pour ce client'
+        });
+      }
+
+      return reply.send({
+        success: true,
+        template: result.rows[0]
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur récupération template par défaut:', error);
+      logger.error('Erreur récupération template par défaut:', error);
+      return reply.code(500).send({
+        success: false,
+        message: 'Erreur lors de la récupération du template par défaut',
+        error: error.message
+      });
+    }
+  });
+
+  // GET /api/v1/templates/client - Liste des templates du client
+  fastify.get('/client', {
+    preHandler: [authenticateJWT]
+  }, async (request, reply) => {
+    try {
+      console.log('=== DEBUG TEMPLATES CLIENT ===');
+      console.log('User from token:', request.user);
+
+      const clientId = request.user.id;
+      console.log('Client ID:', clientId);
+
+      if (!clientId) {
+        return reply.code(401).send({
+          success: false,
+          message: 'Client ID non trouvé dans le token'
+        });
+      }
+
+      const { page = 1, limit = 10 } = request.query;
+      const offset = (page - 1) * limit;
+
+      // Récupérer les templates approuvés auxquels le client a accès
+      const templates = await query(`
+        SELECT t.*
+        FROM templates t
+        INNER JOIN client_templates ct ON ct.template_id = t.id
+        WHERE ct.client_id = $1
+          AND ct.is_active = true
+          AND t.status = 'approved'
+        ORDER BY t.created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [clientId, limit, offset]);
+
+      // Compter le total
+      const totalResult = await query(`
+        SELECT COUNT(*) as total
+        FROM templates t
+        INNER JOIN client_templates ct ON ct.template_id = t.id
+        WHERE ct.client_id = $1
+          AND ct.is_active = true
+          AND t.status = 'approved'
+      `, [clientId]);
+
+      console.log(`Templates trouvés: ${templates.rows.length}`);
+
+      return reply.send({
+        success: true,
+        templates: templates.rows,
+        pagination: {
+          total: parseInt(totalResult.rows[0].total),
+          page: parseInt(page),
+          limit: parseInt(limit),
+          pages: Math.ceil(parseInt(totalResult.rows[0].total) / limit)
+        }
+      });
+
+    } catch (error) {
+      console.error('Erreur détaillée récupération templates client:', error);
+      logger.error('Erreur récupération templates client:', error);
+      return reply.code(500).send({
+        success: false,
+        message: 'Erreur lors de la récupération des templates',
+        error: error.message
+      });
+    }
+  });
+
+  // GET /api/v1/templates - Liste des templates (avec pagination)
+  fastify.get('/', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL, ROLES.VIEWER)]
+  }, getTemplatesHandler);
+
+  // GET /api/v1/templates/:id - Détail d'un template
+  fastify.get('/:id', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL, ROLES.VIEWER)]
+  }, getTemplateByIdHandler);
+
+  // POST /api/v1/templates - Créer un template
+  fastify.post('/', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, createTemplateHandler);
+
+  // PUT /api/v1/templates/:id - Mettre à jour un template
+  fastify.put('/:id', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, updateTemplateHandler);
+
+  // DELETE /api/v1/templates/:id - Supprimer un template
+  fastify.delete('/:id', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN)]
+  }, deleteTemplateHandler);
+
+  // POST /api/v1/templates/:id/submit - Soumettre à Meta
+  fastify.post('/:id/submit', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, submitTemplateHandler);
+
+  // POST /api/v1/templates/:id/refresh - Rafraîchir statut
+  fastify.post('/:id/refresh', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, refreshTemplateHandler);
+
+  // POST /api/v1/templates/:id/duplicate - Dupliquer
+  fastify.post('/:id/duplicate', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, duplicateTemplateHandler);
+
+  // POST /api/v1/templates/:id/manual-status - Mise à jour manuelle du statut
+  fastify.post('/:id/manual-status', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL)]
+  }, manualStatusUpdateHandler);
+
+  // POST /api/v1/templates/:id/preview - Prévisualiser
+  fastify.post('/:id/preview', {
+    preHandler: [authenticateJWT, requireRole(ROLES.ADMIN, ROLES.COMMERCIAL, ROLES.VIEWER)]
+  }, previewTemplateHandler);
+
+  // POST /api/v1/templates/client/preview/:templateId - Prévisualisation client
+  fastify.post('/client/preview/:templateId', {
+    preHandler: [authenticateJWT]
+  }, async (request, reply) => {
+    try {
+      const clientId = request.user.id;
+      const { templateId } = request.params;
+      const { variables } = request.body;
+
+      console.log(`[PREVIEW] Client ${clientId} tente de prévisualiser template ${templateId}`);
+
+      // Vérifier que le client a accès à ce template
+      const accessCheck = await query(`
+        SELECT COUNT(*) as count
+        FROM client_templates
+        WHERE client_id = $1 AND template_id = $2 AND is_active = true
+      `, [clientId, templateId]);
+
+      if (accessCheck.rows[0].count === 0) {
+        return reply.code(403).send({
+          success: false,
+          message: "Vous n'avez pas accès à ce template"
+        });
+      }
+
+      // Récupérer le template
+      const template = await templateService.getTemplateById(templateId);
+
+      // Générer la prévisualisation
+      const preview = templateService.previewTemplate(template, variables || {});
+
+      return reply.send({
+        success: true,
+        preview
+      });
+
+    } catch (error) {
+      logger.error('Erreur prévisualisation client:', error);
+      console.error('Détail erreur:', {
+        message: error.message,
+        stack: error.stack,
+        statusCode: error.statusCode
+      });
+
+      const statusCode = error.statusCode || 500;
+      return reply.code(statusCode).send({
+        success: false,
+        message: error.message || 'Erreur lors de la prévisualisation'
+      });
+    }
+  });
+}
+
+module.exports = templateRoutes;

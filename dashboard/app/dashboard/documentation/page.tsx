@@ -1,0 +1,1695 @@
+// app/dashboard/documentation/page.tsx
+'use client';
+
+import { useEffect, useState, useRef } from 'react';
+import { client as clientAPI } from '@/lib/api';
+import { preludeAPI } from '@/lib/api/prelude';
+import Card, { CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
+import Button from '@/components/ui/Button';
+import Tabs from '@/components/ui/Tabs';
+import Pagination from '@/components/ui/Pagination';
+import {
+  FiCopy, FiCheck, FiEye, FiEyeOff, FiSmartphone, FiMessageSquare,
+  FiGlobe, FiCode, FiLink, FiMail, FiAlertCircle, FiPackage,
+  FiHardDrive, FiUpload, FiDownload, FiShield, FiLock, FiClock,
+  FiPlay, FiZap, FiCheckCircle, FiXCircle, FiLoader, FiInfo,
+  FiArrowRight, FiSend, FiRadio, FiKey, FiTerminal, FiBell
+} from 'react-icons/fi';
+import { copyToClipboard } from '@/lib/utils';
+import Cookies from 'js-cookie';
+
+// ============================================================
+// TYPES
+// ============================================================
+interface Credentials { api_token: string; }
+interface StorageSpace {
+  id: string;
+  size_limit_formatted: string;
+  current_usage_formatted: string;
+  quota_total?: number;
+  quota_used?: number;
+  is_active?: boolean;
+}
+
+// ============================================================
+// COMPONENT
+// ============================================================
+export default function DocumentationPage() {
+  const [credentials, setCredentials] = useState<Credentials | null>(null);
+  const [templates, setTemplates] = useState<any[]>([]);
+  const [preferences, setPreferences] = useState<any>(null);
+  const [storageSpace, setStorageSpace] = useState<StorageSpace | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState('quickstart');
+
+  // Pagination templates
+  const [templatePage, setTemplatePage] = useState(1);
+  const [templateTotal, setTemplateTotal] = useState(0);
+  const [templateLoading, setTemplateLoading] = useState(false);
+
+  // Live tester state
+  const [testLoading, setTestLoading] = useState(false);
+  const [testResult, setTestResult] = useState<any>(null);
+  const [testRecipient, setTestRecipient] = useState('');
+  const [testSenderPhone, setTestSenderPhone] = useState('');
+  const [testTemplateName, setTestTemplateName] = useState('');
+  const [testTemplateParams, setTestTemplateParams] = useState('{"name": "Test"}');
+  const [testMessageType, setTestMessageType] = useState<'template'|'text'>('template');
+  const [testTextContent, setTestTextContent] = useState('');
+  const [testInvoiceUrl, setTestInvoiceUrl] = useState('');
+  const [testInvoiceNumber, setTestInvoiceNumber] = useState('');
+  const [includeInvoice, setIncludeInvoice] = useState(false);
+
+  useEffect(() => { loadData(); }, []);
+  useEffect(() => { if (activeTab === 'templates') loadTemplates(); }, [activeTab, templatePage]);
+
+  // ── DATA LOADERS ──────────────────────────────────────────
+  const loadData = async () => {
+    try {
+      const [credsResp, prefsResp] = await Promise.all([
+        clientAPI.getCredentials(),
+        preludeAPI.getPreferences().catch(() => ({ data: null }))
+      ]);
+      setCredentials(credsResp.credentials);
+      setPreferences(prefsResp.data);
+
+      const connectionToken = Cookies.get('token') || localStorage.getItem('token');
+      if (connectionToken) await loadStorageSpace(connectionToken);
+    } catch (error) {
+      console.error('❌ Erreur chargement données:', error);
+    }
+  };
+
+  const loadStorageSpace = async (token: string) => {
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+      const response = await fetch(`${baseUrl}/storage/client/storage`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' }
+      });
+      const data = await response.json();
+      if (data.success && data.id) setStorageSpace(data);
+      else setStorageSpace(null);
+    } catch (error) {
+      console.error('❌ Erreur fetch stockage:', error);
+    }
+  };
+
+  const loadTemplates = async () => {
+    setTemplateLoading(true);
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+      const connectionToken = Cookies.get('token') || localStorage.getItem('token');
+      if (!connectionToken) { setTemplateLoading(false); return; }
+      const response = await fetch(`${apiUrl}/templates/client?page=${templatePage}&limit=10`, {
+        headers: { 'Authorization': `Bearer ${connectionToken}`, 'Content-Type': 'application/json' }
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      setTemplates(data.templates || []);
+      setTemplateTotal(data.pagination?.total || 0);
+    } catch (error) {
+      console.error('❌ Erreur chargement templates:', error);
+    } finally {
+      setTemplateLoading(false);
+    }
+  };
+
+  // ── LIVE TESTER ───────────────────────────────────────────
+  const runLiveTest = async () => {
+    if (!credentials?.api_token) return;
+    setTestLoading(true);
+    setTestResult(null);
+    try {
+      let params: any;
+      try { params = JSON.parse(testTemplateParams); } catch { params = {}; }
+
+      const body: any = {
+        phoneNumber: testSenderPhone || '+237691234567',
+        recipient_phone: testRecipient,
+        message_type: testMessageType,
+      };
+
+      if (testMessageType === 'template') {
+        body.template_name = testTemplateName;
+        body.template_params = params;
+        if (includeInvoice && testInvoiceUrl) {
+          body.invoice_data = { pdfUrl: testInvoiceUrl, number: testInvoiceNumber || '001' };
+        }
+      } else {
+        body.message_content = testTextContent;
+      }
+
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+      const start = Date.now();
+      const response = await fetch(`${apiUrl}/messages/send`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${credentials.api_token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+      const elapsed = Date.now() - start;
+      const data = await response.json();
+      setTestResult({ ok: response.ok, status: response.status, data, elapsed, body });
+    } catch (err: any) {
+      setTestResult({ ok: false, status: 0, data: { error: err.message }, elapsed: 0, body: {} });
+    } finally {
+      setTestLoading(false);
+    }
+  };
+
+  const handleCopy = async (text: string, field: string) => {
+    const success = await copyToClipboard(text);
+    if (success) {
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(null), 2000);
+    }
+  };
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.numericexport.com/api/v1';
+  const storageApiUrl = 'https://numericexport.cloud/api/v1';
+  const TOKEN = credentials?.api_token || 'YOUR_API_TOKEN';
+
+  // ============================================================
+  // SHARED COMPONENT — Code Block
+  // ============================================================
+  const CodeBlock = ({ code, lang, id }: { code: string; lang?: string; id: string }) => (
+    <div className="relative">
+      <Button
+        size="sm"
+        variant="outline"
+        className="absolute top-2 right-2 z-10 bg-gray-700 text-white border-gray-600 hover:bg-gray-600"
+        onClick={() => handleCopy(code, id)}
+      >
+        {copiedField === id ? <FiCheck className="text-green-400" /> : <FiCopy />}
+      </Button>
+      <pre className="bg-[#0d1117] text-white p-4 rounded-lg overflow-x-auto text-sm leading-relaxed">
+        <code className={lang ? `language-${lang}` : ''}>{code}</code>
+      </pre>
+    </div>
+  );
+
+  // ============================================================
+  // BADGE
+  // ============================================================
+  const MethodBadge = ({ method }: { method: string }) => {
+    const colors: Record<string, string> = {
+      GET: 'bg-blue-100 text-blue-700',
+      POST: 'bg-green-100 text-green-700',
+      DELETE: 'bg-red-100 text-red-700',
+      PUT: 'bg-orange-100 text-orange-700',
+      PATCH: 'bg-purple-100 text-purple-700',
+    };
+    return (
+      <span className={`px-2 py-0.5 rounded text-xs font-bold ${colors[method] || 'bg-gray-100 text-gray-700'}`}>
+        {method}
+      </span>
+    );
+  };
+
+  // ============================================================
+  // EVENT BADGE
+  // ============================================================
+  const EventBadge = ({ event }: { event: string }) => {
+    const colors: Record<string, string> = {
+      'message.sent':      'bg-blue-100 text-blue-800',
+      'message.delivered': 'bg-green-100 text-green-800',
+      'message.read':      'bg-purple-100 text-purple-800',
+      'message.failed':    'bg-red-100 text-red-800',
+      'message.incoming':  'bg-yellow-100 text-yellow-800',
+    };
+    return (
+      <span className={`px-2 py-1 rounded-full text-xs font-semibold font-mono ${colors[event] || 'bg-gray-100 text-gray-700'}`}>
+        {event}
+      </span>
+    );
+  };
+
+  // ============================================================
+  // TAB: QUICKSTART
+  // ============================================================
+  const QuickStartTab = () => (
+    <div className="space-y-6">
+      {/* Credentials */}
+      <Card>
+        <CardHeader>
+          <CardTitle>🔐 Vos identifiants API</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-dark mb-2">API Token</label>
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <input
+                    type={showToken ? 'text' : 'password'}
+                    value={credentials?.api_token || 'Chargement...'}
+                    readOnly
+                    className="w-full px-4 py-2.5 border border-gray-300 rounded-lg bg-gray-50 font-mono text-sm"
+                  />
+                  <button
+                    onClick={() => setShowToken(!showToken)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-dark"
+                  >
+                    {showToken ? <FiEyeOff /> : <FiEye />}
+                  </button>
+                </div>
+                <Button variant="outline" onClick={() => handleCopy(credentials?.api_token || '', 'token')}>
+                  {copiedField === 'token' ? <FiCheck /> : <FiCopy />}
+                </Button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-dark mb-2">URL de base (Messages)</label>
+              <div className="flex gap-2">
+                <input type="text" value={apiUrl} readOnly
+                  className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg bg-gray-50 font-mono text-sm" />
+                <Button variant="outline" onClick={() => handleCopy(apiUrl, 'url')}>
+                  {copiedField === 'url' ? <FiCheck /> : <FiCopy />}
+                </Button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-dark mb-2">URL de base (Stockage)</label>
+              <div className="flex gap-2">
+                <input type="text" value={storageApiUrl} readOnly
+                  className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg bg-gray-50 font-mono text-sm" />
+                <Button variant="outline" onClick={() => handleCopy(storageApiUrl, 'storage-url')}>
+                  {copiedField === 'storage-url' ? <FiCheck /> : <FiCopy />}
+                </Button>
+              </div>
+            </div>
+
+            {storageSpace ? (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                <label className="block text-sm font-medium text-blue-800 mb-2">🆔 Votre Storage ID par défaut</label>
+                <div className="flex gap-2">
+                  <input type="text" value={storageSpace.id} readOnly
+                    className="flex-1 px-4 py-2.5 border border-blue-300 rounded-lg bg-white font-mono text-sm" />
+                  <Button variant="outline" onClick={() => handleCopy(storageSpace.id, 'storage-id')}>
+                    {copiedField === 'storage-id' ? <FiCheck /> : <FiCopy />}
+                  </Button>
+                </div>
+                <p className="text-xs text-blue-600 mt-2">
+                  Quota : {storageSpace.size_limit_formatted} – Utilisé : {storageSpace.current_usage_formatted}
+                </p>
+              </div>
+            ) : (
+              <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                <p className="text-sm text-yellow-800 flex items-center gap-2">
+                  <FiAlertCircle className="text-yellow-500" />
+                  Aucun espace de stockage actif. Souscrivez à une offre (à partir de 10 GB).
+                </p>
+              </div>
+            )}
+
+            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+              <p className="text-sm text-yellow-800 flex items-start gap-2">
+                <FiAlertCircle className="text-yellow-500 mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>⚠️ Important :</strong> Le champ <code className="bg-yellow-100 px-1 rounded">phoneNumber</code> correspond
+                  à votre numéro WhatsApp émetteur attribué. Il doit être actif et approuvé par Meta.
+                </span>
+              </p>
+            </div>
+
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <p className="text-sm text-blue-800 flex items-start gap-2">
+                <FiSmartphone className="text-blue-500 mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>Communication hybride WhatsApp + SMS :</strong>{' '}
+                  Si WhatsApp n'est pas disponible, le message bascule automatiquement en SMS (selon vos préférences).
+                </span>
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Préférences */}
+      {preferences && (
+        <Card>
+          <CardHeader><CardTitle>🎯 Vos préférences de communication</CardTitle></CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Canal préféré</label>
+                <p className="text-lg font-semibold flex items-center gap-2 mt-1">
+                  {preferences.preferred_channel === 'whatsapp' ? <><FiSmartphone className="text-[#2d7a3e]" /> WhatsApp</> : <><FiMessageSquare className="text-[#1976d2]" /> SMS</>}
+                </p>
+              </div>
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Fallback automatique</label>
+                <p className="text-lg font-semibold mt-1">
+                  {preferences.allow_fallback ? <span className="text-[#2d7a3e]">✅ Activé</span> : <span className="text-gray-500">❌ Désactivé</span>}
+                </p>
+              </div>
+              <div className="bg-gray-50 p-4 rounded-lg">
+                <label className="text-xs text-gray-500">Limite quotidienne</label>
+                <p className="text-lg font-semibold mt-1">{preferences.daily_message_limit} messages</p>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mt-4">Modifiables dans l'onglet "Configuration" du dashboard.</p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Quick curl */}
+      <Card>
+        <CardHeader><CardTitle>⚡ Envoi rapide (cURL)</CardTitle></CardHeader>
+        <CardContent>
+          <CodeBlock id="curl-quick" lang="bash" code={`curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "welcome_template",
+    "template_params": {"name": "Jean"}
+  }'`} />
+          <p className="text-xs text-gray-500 mt-2">
+            <code className="text-yellow-600">phoneNumber</code> = votre numéro émetteur WhatsApp.
+          </p>
+        </CardContent>
+      </Card>
+
+      {/* Steps overview */}
+      <Card>
+        <CardHeader><CardTitle>🗺️ Flux d'intégration en 4 étapes</CardTitle></CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {[
+              { step: '1', icon: <FiKey />, title: 'Authentification', desc: 'Ajoutez Authorization: Bearer <TOKEN> à chaque requête.' },
+              { step: '2', icon: <FiSend />, title: 'Envoi de message', desc: 'POST /messages/send avec votre template et les params.' },
+              { step: '3', icon: <FiBell />, title: 'Webhook entrant', desc: 'Configurez votre URL pour recevoir les mises à jour de statut.' },
+              { step: '4', icon: <FiShield />, title: 'Vérification', desc: 'Validez la signature X-Webhook-Signature sur chaque event.' },
+            ].map(s => (
+              <div key={s.step} className="flex items-start gap-3 p-4 border rounded-lg">
+                <div className="w-8 h-8 rounded-full bg-[#2d7a3e] text-white flex items-center justify-center text-sm font-bold flex-shrink-0">{s.step}</div>
+                <div>
+                  <div className="flex items-center gap-2 font-semibold mb-1">{s.icon}{s.title}</div>
+                  <p className="text-sm text-gray-600">{s.desc}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: ENDPOINTS
+  // ============================================================
+  const EndpointsTab = () => (
+    <div className="space-y-6">
+
+      {/* ── Messages ── */}
+      <Card>
+        <CardHeader><CardTitle>📨 Messages</CardTitle></CardHeader>
+        <CardContent className="space-y-6">
+
+          {/* POST /messages/send — simple template */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <MethodBadge method="POST" />
+              <code className="text-sm font-mono font-semibold">/messages/send</code>
+              <span className="text-xs text-gray-500 ml-auto">Envoyer un message (template texte)</span>
+            </div>
+            <div className="p-4 space-y-4">
+              <p className="text-sm text-gray-700">Envoie un message WhatsApp via un template approuvé. Les <code>template_params</code> sont un objet clé/valeur correspondant aux variables nommées du template.</p>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Corps de la requête</p>
+                <CodeBlock id="ep-send-simple" lang="json" code={`{
+  "phoneNumber":      "+237691234567",     // Votre numéro WhatsApp émetteur (obligatoire)
+  "recipient_phone":  "+237600000000",     // Numéro destinataire format E.164 (obligatoire)
+  "message_type":     "template",          // "template" | "text" | "media"
+  "template_name":    "welcome_template",  // Nom exact du template approuvé par Meta
+  "template_params":  {                    // Variables nommées du template
+    "name": "Jean"
+  }
+}`} />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Exemple cURL</p>
+                <CodeBlock id="ep-curl-simple" lang="bash" code={`curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237674000000",
+    "message_type": "template",
+    "template_name": "next_new_chat_v1",
+    "template_params": {"name": "Test Final"}
+  }'`} />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Réponse (succès)</p>
+                <CodeBlock id="ep-send-resp" lang="json" code={`{
+  "success": true,
+  "message_id": "550e8400-e29b-41d4-a716-446655440000",
+  "wa_message_id": "wamid.HBgNMjM3Njc0ODU1NzkwFQIAERgSM...",
+  "status": "queued",
+  "channel": "whatsapp"
+}`} />
+              </div>
+            </div>
+          </div>
+
+          {/* POST /messages/send — template + media / facture */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <MethodBadge method="POST" />
+              <code className="text-sm font-mono font-semibold">/messages/send</code>
+              <span className="text-xs text-gray-500 ml-auto">Envoyer un message avec pièce jointe (facture PDF)</span>
+            </div>
+            <div className="p-4 space-y-4">
+              <p className="text-sm text-gray-700">Même endpoint, mais avec le champ optionnel <code>invoice_data</code> pour joindre un document PDF (facture, contrat, etc.) hébergé publiquement.</p>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Corps de la requête</p>
+                <CodeBlock id="ep-send-media" lang="json" code={`{
+  "phoneNumber":     "+237691234567",
+  "recipient_phone": "+237600000000",
+  "message_type":    "template",
+  "template_name":   "next_001_facture_en_01",
+  "template_params": {
+    "entreprise":      "ACME SARL",
+    "name":            "John",
+    "numero_contrat":  "CTR-2026",
+    "numero_facture":  "BILL-001",
+    "montant":         "50 000",
+    "unpaid":          "50 000",
+    "deadline":        "30/05/2026"
+  },
+  "invoice_data": {             // Optionnel : document PDF joint au message
+    "pdfUrl": "https://votreserveur.com/factures/BILL-001.pdf",
+    "number": "001"
+  }
+}`} />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Exemple cURL</p>
+                <CodeBlock id="ep-curl-media" lang="bash" code={`curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237656939193",
+    "message_type": "template",
+    "template_name": "next_001_facture_en_01",
+    "template_params": {
+      "entreprise": "NEXT LTD",
+      "name": "John",
+      "numero_contrat": "CTR-2026",
+      "numero_facture": "BILL-001",
+      "montant": "50 000",
+      "unpaid": "50 000",
+      "deadline": "30/05/2026"
+    },
+    "invoice_data": {
+      "pdfUrl": "https://votreserveur.com/factures/BILL-001.pdf",
+      "number": "001"
+    }
+  }'`} />
+              </div>
+
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                <p className="text-sm text-blue-800">
+                  <strong>💡 Note :</strong> Le <code>pdfUrl</code> doit être accessible publiquement (sans authentification).
+                  Utilisez notre module Stockage ou tout CDN public.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* GET /messages */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <MethodBadge method="GET" />
+              <code className="text-sm font-mono font-semibold">/messages</code>
+              <span className="text-xs text-gray-500 ml-auto">Historique des messages (paginé)</span>
+            </div>
+            <div className="p-4">
+              <p className="text-sm text-gray-700 mb-3">Récupère l'historique de vos messages avec filtres.</p>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">
+                {[
+                  ['page', 'Numéro de page (défaut: 1)'],
+                  ['limit', 'Résultats par page (défaut: 20)'],
+                  ['status', 'queued | sent | delivered | read | failed'],
+                  ['recipient_phone', 'Filtrer par destinataire'],
+                  ['start_date', 'Date début (ISO 8601)'],
+                  ['end_date', 'Date fin (ISO 8601)'],
+                ].map(([p, d]) => (
+                  <div key={p} className="bg-gray-50 p-2 rounded border">
+                    <code className="text-[#2d7a3e] font-semibold">{p}</code>
+                    <p className="text-gray-500 mt-1">{d}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* GET /messages/:id */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <MethodBadge method="GET" />
+              <code className="text-sm font-mono font-semibold">/messages/:id</code>
+              <span className="text-xs text-gray-500 ml-auto">Détail d'un message</span>
+            </div>
+            <div className="p-4">
+              <CodeBlock id="ep-get-msg" lang="json" code={`{
+  "id":              "550e8400-e29b-41d4-a716-446655440000",
+  "recipient_phone": "+237674000000",
+  "wa_status":       "delivered",
+  "wa_message_id":   "wamid.HBgN...",
+  "sent_at":         "2026-05-03T10:00:00.000Z",
+  "delivered_at":    "2026-05-03T10:00:05.000Z",
+  "read_at":         null,
+  "failed_at":       null,
+  "template_name":   "welcome_template",
+  "channel":         "whatsapp"
+}`} />
+            </div>
+          </div>
+
+          {/* GET /messages/stats/summary */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <MethodBadge method="GET" />
+              <code className="text-sm font-mono font-semibold">/messages/stats/summary</code>
+              <span className="text-xs text-gray-500 ml-auto">Statistiques d'envoi</span>
+            </div>
+            <div className="p-4">
+              <p className="text-sm text-gray-700">Paramètre <code>period</code> : <code>7days</code> | <code>30days</code> | <code>90days</code></p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Templates ── */}
+      <Card>
+        <CardHeader><CardTitle>📋 Templates</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          {[
+            { method: 'GET', path: '/templates', desc: 'Lister tous vos templates WhatsApp approuvés.' },
+            { method: 'POST', path: '/templates', desc: 'Créer un nouveau template (soumis à approbation Meta).' },
+            { method: 'POST', path: '/templates/:id/submit', desc: 'Soumettre un template existant à Meta pour approbation.' },
+          ].map(e => (
+            <div key={e.path} className="flex items-start gap-3 border rounded-lg p-4">
+              <MethodBadge method={e.method} />
+              <div>
+                <code className="text-sm font-mono font-semibold">{e.path}</code>
+                <p className="text-sm text-gray-600 mt-1">{e.desc}</p>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      {/* ── Stockage ── */}
+      <Card>
+        <CardHeader><CardTitle>🗄️ Stockage Cloud</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          {[
+            { method: 'POST', path: `/storage/client/storage/{spaceId}/upload`, desc: 'Uploader un fichier (multipart/form-data).', note: `Base URL: ${storageApiUrl}` },
+            { method: 'GET', path: `/storage/client/storage/{spaceId}/files/{filename}`, desc: 'Télécharger un fichier.', note: `Base URL: ${storageApiUrl}` },
+            { method: 'GET', path: `/storage/client/storage/{spaceId}`, desc: 'Quota et détails de votre espace.', note: `Base URL: ${storageApiUrl}` },
+            { method: 'DELETE', path: `/storage/client/storage/{spaceId}/files/{filename}`, desc: 'Supprimer un fichier.', note: `Base URL: ${storageApiUrl}` },
+          ].map(e => (
+            <div key={e.path} className="flex items-start gap-3 border rounded-lg p-4">
+              <MethodBadge method={e.method} />
+              <div>
+                <code className="text-sm font-mono font-semibold">{e.path}</code>
+                <p className="text-sm text-gray-600 mt-1">{e.desc}</p>
+                {e.note && <p className="text-xs text-gray-400 mt-1">{e.note}</p>}
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      {/* ── Codes HTTP ── */}
+      <Card>
+        <CardHeader><CardTitle>⚠️ Codes HTTP de réponse</CardTitle></CardHeader>
+        <CardContent>
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="bg-gray-50">
+                {['Code', 'Signification', 'Action recommandée'].map(h => (
+                  <th key={h} className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase border-b">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ['200', 'Succès', 'Tout est OK, traiter la réponse'],
+                ['400', 'Requête invalide', 'Vérifiez le format JSON et les champs obligatoires'],
+                ['401', 'Non authentifié', 'Token absent, expiré ou mal formé'],
+                ['403', 'Accès refusé', 'Ressource appartenant à un autre client'],
+                ['404', 'Ressource introuvable', 'ID de message ou de template invalide'],
+                ['429', 'Trop de requêtes', 'Rate limit atteint, attendez et réessayez'],
+                ['500', 'Erreur serveur', 'Contactez le support'],
+              ].map(([code, sig, action]) => (
+                <tr key={code} className="border-b last:border-0 hover:bg-gray-50">
+                  <td className="px-4 py-3 font-mono font-bold text-gray-700">{code}</td>
+                  <td className="px-4 py-3">{sig}</td>
+                  <td className="px-4 py-3 text-gray-500">{action}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: TEMPLATES
+  // ============================================================
+  const TemplatesTab = () => (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader><CardTitle>📋 Vos templates disponibles</CardTitle></CardHeader>
+        <CardContent>
+          {templateLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#2d7a3e]" />
+            </div>
+          ) : templates.length === 0 ? (
+            <div className="text-center py-12 text-gray-500">
+              <FiPackage className="text-5xl mx-auto mb-4 opacity-30" />
+              <p>Aucun template disponible</p>
+              <p className="text-sm mt-2">Créez vos templates dans l'onglet "Templates"</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {templates.map(template => (
+                <div key={template.id} className="border rounded-lg p-4 hover:border-[#2d7a3e] transition-colors">
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <h3 className="font-bold text-dark">{template.name}</h3>
+                      <p className="text-xs text-gray-500">ID: {template.id}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                      template.status === 'approved' ? 'bg-green-100 text-green-700' :
+                      template.status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                      'bg-red-100 text-red-700'
+                    }`}>{template.status}</span>
+                  </div>
+
+                  {template.body_content && (
+                    <div className="bg-gray-50 p-3 rounded-lg text-sm mb-3">
+                      <p className="text-gray-700 whitespace-pre-wrap">{template.body_content}</p>
+                    </div>
+                  )}
+
+                  {template.variables && template.variables.length > 0 && (
+                    <div className="mb-3">
+                      <p className="text-xs font-medium text-gray-500 mb-1">Variables attendues :</p>
+                      <div className="flex flex-wrap gap-2">
+                        {template.variables.map((v: number) => (
+                          <span key={v} className="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">{'{{' + v + '}}'}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <CodeBlock id={`template-${template.id}`} code={JSON.stringify({
+                    phoneNumber: '+237691234567',
+                    recipient_phone: '+237600000000',
+                    message_type: 'template',
+                    template_name: template.name,
+                    template_params: Object.fromEntries((template.variables || []).map((v: number) => [`param_${v}`, `valeur_${v}`]))
+                  }, null, 2)} lang="json" />
+                </div>
+              ))}
+              {templateTotal > 10 && (
+                <Pagination currentPage={templatePage} totalPages={Math.ceil(templateTotal / 10)} onPageChange={setTemplatePage} />
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: WEBHOOKS — Complete, based on actual controller code
+  // ============================================================
+  const WebhooksTab = () => (
+    <div className="space-y-6">
+
+      {/* Overview */}
+      <Card>
+        <CardHeader><CardTitle>🔔 Webhooks — Vue d'ensemble</CardTitle></CardHeader>
+        <CardContent>
+          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-5 mb-4">
+            <h3 className="font-semibold text-blue-900 mb-2 flex items-center gap-2"><FiRadio /> Comment fonctionnent les webhooks ?</h3>
+            <p className="text-sm text-blue-800 leading-relaxed">
+              Lorsque votre message change de statut (envoyé, délivré, lu, échec) ou qu'un contact vous répond,
+              notre système envoie automatiquement une requête HTTP POST vers l'URL de votre choix.
+              Vous n'avez pas besoin de poller l'API — les événements arrivent en temps réel.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+            {[
+              { event: 'message.sent',      label: 'Envoyé',        color: 'blue' },
+              { event: 'message.delivered', label: 'Délivré',       color: 'green' },
+              { event: 'message.read',      label: 'Lu',            color: 'purple' },
+              { event: 'message.failed',    label: 'Échec',         color: 'red' },
+              { event: 'message.incoming',  label: 'Réponse reçue', color: 'yellow' },
+            ].map(e => (
+              <div key={e.event} className="text-center p-3 border rounded-lg">
+                <EventBadge event={e.event} />
+                <p className="text-xs text-gray-500 mt-2">{e.label}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+            <ul className="text-sm text-yellow-800 space-y-1">
+              <li>✅ Répondez toujours avec <strong>HTTP 200</strong> dès la réception (avant traitement)</li>
+              <li>⏱️ Timeout client : <strong>10 secondes</strong> — traitez de manière asynchrone si besoin</li>
+              <li>🔁 En cas d'échec (non-200 ou timeout) : jusqu'à 3 nouvelles tentatives</li>
+              <li>🔒 Vérifiez toujours la signature <code>X-Webhook-Signature</code></li>
+            </ul>
+          </div>
+        </CardContent>
+      </Card>
+      
+       {/* ── NOUVEAU : CHECKLIST RAPIDE ── */}
+    <Card className="border-2 border-[#2d7a3e]/20 bg-[#f0f7f3]/30">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <span className="text-2xl">✅</span>
+          Checklist de mise en place
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {[
+              { step: '1', title: 'Créez un endpoint HTTP(S)', desc: 'Par exemple, /webhook/numericexport sur votre serveur. Assurez-vous qu\'il est accessible publiquement en HTTPS.' },
+              { step: '2', title: 'Copiez le code d\'exemple', desc: 'Choisissez le langage de votre choix (Node.js, Python, PHP) et adaptez le code fourni ci-dessous.' },
+              { step: '3', title: 'Définissez votre secret', desc: 'Stockez une clé secrète dans une variable d\'environnement (ex: WEBHOOK_SECRET). Utilisez le même secret dans le dashboard.' },
+              { step: '4', title: 'Configurez le webhook', desc: 'Dans Paramètres → Webhooks, créez un webhook avec votre URL publique, le secret, et sélectionnez les événements.' },
+              { step: '5', title: 'Testez la connectivité', desc: 'Cliquez sur "Tester" – vous devriez recevoir un événement message.test avec un statut HTTP 200.' },
+              { step: '6', title: 'Surveillez les logs', desc: 'Consultez les logs de votre serveur pour confirmer la réception des événements réels (message.sent, delivered, read...).' },
+            ].map((item) => (
+              <div key={item.step} className="flex items-start gap-4 p-4 bg-white rounded-xl border shadow-sm hover:shadow-md transition-shadow">
+                <div className="w-10 h-10 rounded-full bg-[#2d7a3e] text-white flex items-center justify-center text-sm font-bold flex-shrink-0">
+                  {item.step}
+                </div>
+                <div>
+                  <h4 className="font-semibold text-dark">{item.title}</h4>
+                  <p className="text-sm text-gray-600 mt-1">{item.desc}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mt-2">
+            <p className="text-sm text-blue-800 flex items-start gap-2">
+              <FiInfo className="text-blue-500 mt-0.5 flex-shrink-0" />
+              <span>
+                <strong>💡 Astuce :</strong> Pendant le développement, vous pouvez utiliser <strong>ngrok</strong> pour exposer votre serveur local.
+                Une fois testé, remplacez l’URL ngrok par votre URL de production définitive.
+              </span>
+            </p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+
+      {/* Events detail */}
+      <Card>
+        <CardHeader><CardTitle>📦 Payloads reçus par événement</CardTitle></CardHeader>
+        <CardContent className="space-y-6">
+
+          {/* message.sent / delivered / read / failed */}
+          {[
+            {
+              event: 'message.sent',
+              title: 'Message envoyé à WhatsApp',
+              desc: 'Déclenché dès que votre message est accepté par les serveurs WhatsApp.',
+            },
+            {
+              event: 'message.delivered',
+              title: 'Message délivré au destinataire',
+              desc: 'Le téléphone du destinataire a bien reçu le message.',
+            },
+            {
+              event: 'message.read',
+              title: 'Message lu par le destinataire',
+              desc: 'Le destinataire a ouvert et vu le message (confirmations de lecture activées).',
+            },
+            {
+              event: 'message.failed',
+              title: 'Échec d\'envoi',
+              desc: 'Le message n\'a pas pu être délivré (numéro invalide, WhatsApp désactivé, etc.).',
+            },
+          ].map(ev => (
+            <div key={ev.event} className="border rounded-lg overflow-hidden">
+              <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+                <EventBadge event={ev.event} />
+                <div>
+                  <p className="font-semibold text-sm">{ev.title}</p>
+                  <p className="text-xs text-gray-500">{ev.desc}</p>
+                </div>
+              </div>
+              <div className="p-4">
+                <CodeBlock id={`wh-payload-${ev.event}`} lang="json" code={`// Headers reçus par votre endpoint
+// POST https://votre-serveur.com/votre-endpoint
+// Content-Type: application/json
+// X-Webhook-Signature: <hmac-sha256>
+
+{
+  "event":     "${ev.event}",
+  "timestamp": "2026-05-03T10:00:00.000Z",
+  "data": {
+    "message_id":    "550e8400-e29b-41d4-a716-446655440000",
+    "status":        "${ev.event.replace('message.', '')}",
+    "recipient":     "+237674000000",
+    "wa_message_id": "wamid.HBgNMjM3Njc0ODU1NzkwFQIAERgSM...",
+    "sent_at":       "2026-05-03T10:00:00.000Z",
+    "delivered_at":  ${ev.event === 'message.delivered' || ev.event === 'message.read' ? '"2026-05-03T10:00:05.000Z"' : 'null'},
+    "read_at":       ${ev.event === 'message.read' ? '"2026-05-03T10:01:12.000Z"' : 'null'}
+  }
+}`} />
+              </div>
+            </div>
+          ))}
+
+          {/* message.incoming */}
+          <div className="border rounded-lg overflow-hidden">
+            <div className="flex items-center gap-3 p-4 bg-gray-50 border-b">
+              <EventBadge event="message.incoming" />
+              <div>
+                <p className="font-semibold text-sm">Message reçu d'un contact</p>
+                <p className="text-xs text-gray-500">Déclenché quand un de vos contacts vous répond sur WhatsApp.</p>
+              </div>
+            </div>
+            <div className="p-4">
+              <CodeBlock id="wh-payload-incoming" lang="json" code={`{
+  "event":     "message.incoming",
+  "timestamp": "2026-05-03T10:00:00.000Z",
+  "data": {
+    "from":        "+237674000000",
+    "sender_name": "Jean Dupont",
+    "message":     "Bonjour, j'ai reçu ma facture. Merci !",
+    "received_at": "2026-05-03T10:00:00.000Z"
+  }
+}`} />
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mt-3">
+                <p className="text-sm text-blue-800">
+                  <strong>💡 STOP automatique :</strong> Si le message contient les mots «stop», «arrêter», «unsubscribe»
+                  ou similaires, le contact est automatiquement ajouté à la liste opt-out et les envois futurs vers ce numéro sont bloqués.
+                </p>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Signature verification */}
+      <Card>
+        <CardHeader><CardTitle>🔐 Vérification de signature</CardTitle></CardHeader>
+        <CardContent>
+          <p className="text-sm text-gray-700 mb-4">
+            Chaque webhook est signé avec votre secret via HMAC-SHA256. Vérifiez toujours cette signature
+            pour vous assurer que la requête provient bien de notre système.
+          </p>
+
+          <div className="mb-2 text-xs font-semibold text-gray-500 uppercase">Header envoyé</div>
+          <CodeBlock id="wh-sig-header" lang="bash" code={`X-Webhook-Signature: a3f5c2d1e4b7891a2c3d4e5f6a7b8c9d0e1f2a3b...
+# = HMAC-SHA256(webhook_secret, JSON.stringify(payload))`} />
+
+          <Tabs tabs={[
+            {
+              id: 'sig-node', label: 'Node.js', content: (
+                <CodeBlock id="wh-sig-node" lang="javascript" code={`const crypto = require('crypto');
+
+function verifySignature(payload, receivedSig, secret) {
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(JSON.stringify(payload))
+    .digest('hex');
+  // Comparaison sécurisée (protection timing attack)
+  return crypto.timingSafeEqual(
+    Buffer.from(expected),
+    Buffer.from(receivedSig)
+  );
+}
+
+// Dans votre handler Express
+app.post('/webhook', express.json(), (req, res) => {
+  const sig = req.headers['x-webhook-signature'];
+  if (!verifySignature(req.body, sig, process.env.WEBHOOK_SECRET)) {
+    return res.status(401).json({ error: 'Signature invalide' });
+  }
+  // Traitement...
+  res.sendStatus(200);
+});`} />
+              )
+            },
+            {
+              id: 'sig-python', label: 'Python', content: (
+                <CodeBlock id="wh-sig-python" lang="python" code={`import hmac, hashlib, json
+from flask import Flask, request, abort
+
+app = Flask(__name__)
+WEBHOOK_SECRET = "your-webhook-secret"
+
+def verify_signature(payload: dict, received: str) -> bool:
+    expected = hmac.new(
+        WEBHOOK_SECRET.encode(),
+        json.dumps(payload, separators=(',', ':')).encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, received)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    sig = request.headers.get('X-Webhook-Signature', '')
+    if not verify_signature(request.json, sig):
+        abort(401)
+    # Traitement...
+    return '', 200`} />
+              )
+            },
+            {
+              id: 'sig-php', label: 'PHP', content: (
+                <CodeBlock id="wh-sig-php" lang="php" code={`<?php
+$secret  = getenv('WEBHOOK_SECRET');
+$payload = file_get_contents('php://input');
+$data    = json_decode($payload, true);
+
+$received = $_SERVER['HTTP_X_WEBHOOK_SIGNATURE'] ?? '';
+$expected = hash_hmac('sha256', json_encode($data), $secret);
+
+if (!hash_equals($expected, $received)) {
+    http_response_code(401);
+    exit('Signature invalide');
+}
+
+// Traitement de l'événement
+$event = $data['event'];
+switch ($event) {
+    case 'message.delivered':
+        // Marquer comme délivré dans votre DB
+        break;
+    case 'message.read':
+        // Marquer comme lu
+        break;
+    case 'message.incoming':
+        // Enregistrer la réponse du contact
+        break;
+}
+
+http_response_code(200);
+?>`} />
+              )
+            },
+          ]} />
+        </CardContent>
+      </Card>
+
+      {/* Implementation example */}
+      <Card>
+        <CardHeader><CardTitle>🛠️ Implémentation complète d'un endpoint webhook</CardTitle></CardHeader>
+        <CardContent>
+          <Tabs tabs={[
+            {
+              id: 'impl-node', label: 'Node.js (Express)', content: (
+                <CodeBlock id="wh-impl-node" lang="javascript" code={`const express = require('express');
+const crypto  = require('crypto');
+const app     = express();
+
+app.use(express.json());
+
+app.post('/webhook/numericexport', (req, res) => {
+  // 1. Répondre immédiatement pour éviter le timeout
+  res.sendStatus(200);
+
+  // 2. Vérifier la signature
+  const sig      = req.headers['x-webhook-signature'];
+  const expected = crypto
+    .createHmac('sha256', process.env.WEBHOOK_SECRET)
+    .update(JSON.stringify(req.body))
+    .digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    console.error('Signature invalide');
+    return;
+  }
+
+  // 3. Traiter l'événement
+  const { event, timestamp, data } = req.body;
+
+  switch (event) {
+    case 'message.sent':
+      console.log(\`✉️  Envoyé  → \${data.recipient} [\${data.message_id}]\`);
+      break;
+
+    case 'message.delivered':
+      console.log(\`📬 Délivré → \${data.recipient} à \${data.delivered_at}\`);
+      // db.updateMessage(data.message_id, { status: 'delivered', delivered_at: data.delivered_at });
+      break;
+
+    case 'message.read':
+      console.log(\`👁️  Lu      → \${data.recipient} à \${data.read_at}\`);
+      // db.updateMessage(data.message_id, { status: 'read', read_at: data.read_at });
+      break;
+
+    case 'message.failed':
+      console.error(\`❌ Échec   → \${data.recipient} [\${data.message_id}]\`);
+      // notifyAdmin(data);
+      break;
+
+    case 'message.incoming':
+      console.log(\`💬 Réponse de \${data.from}: "\${data.message}"\`);
+      // saveIncomingMessage(data);
+      break;
+
+    default:
+      console.log(\`ℹ️  Événement inconnu: \${event}\`);
+  }
+});
+
+app.listen(3000, () => console.log('Webhook server listening on :3000'));`} />
+              )
+            },
+            {
+              id: 'impl-python', label: 'Python (FastAPI)', content: (
+                <CodeBlock id="wh-impl-python" lang="python" code={`from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+import hmac, hashlib, json, os
+
+app = FastAPI()
+SECRET = os.environ["WEBHOOK_SECRET"]
+
+def verify(body: dict, sig: str) -> bool:
+    expected = hmac.new(
+        SECRET.encode(), json.dumps(body).encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig or "")
+
+async def process_event(body: dict):
+    event = body["event"]
+    data  = body["data"]
+
+    if event == "message.sent":
+        print(f"✉️  Envoyé  → {data['recipient']}")
+    elif event == "message.delivered":
+        print(f"📬 Délivré → {data['recipient']} à {data['delivered_at']}")
+        # await db.update_status(data["message_id"], "delivered")
+    elif event == "message.read":
+        print(f"👁️  Lu     → {data['recipient']} à {data['read_at']}")
+    elif event == "message.failed":
+        print(f"❌ Échec   → {data['recipient']}")
+    elif event == "message.incoming":
+        print(f"💬 Réponse de {data['from']}: {data['message']!r}")
+
+@app.post("/webhook/numericexport")
+async def webhook(request: Request, bg: BackgroundTasks):
+    body = await request.json()
+    sig  = request.headers.get("x-webhook-signature", "")
+    if not verify(body, sig):
+        raise HTTPException(status_code=401, detail="Signature invalide")
+    bg.add_task(process_event, body)   # traitement asynchrone
+    return {"status": "ok"}`} />
+              )
+            },
+          ]} />
+        </CardContent>
+      </Card>
+
+      {/* Configure webhook URL */}
+      <Card>
+        <CardHeader><CardTitle>⚙️ Configurer votre URL webhook</CardTitle></CardHeader>
+        <CardContent>
+          <p className="text-sm text-gray-700 mb-4">
+            Rendez-vous dans votre dashboard sous <strong>Paramètres → Webhooks</strong> et renseignez :
+          </p>
+          <div className="space-y-3">
+            {[
+              { field: 'URL', desc: 'URL HTTPS de votre endpoint (ex: https://votre-app.com/webhook/numericexport)', required: true },
+              { field: 'Secret', desc: 'Clé secrète pour signer les payloads. Conservez-la en variable d\'environnement.', required: true },
+              { field: 'Événements', desc: 'Sélectionnez les événements à recevoir : message.sent, message.delivered, message.read, message.failed, message.incoming', required: true },
+            ].map(f => (
+              <div key={f.field} className="flex items-start gap-3 p-3 bg-gray-50 rounded-lg">
+                <div className="min-w-[90px]">
+                  <span className="font-semibold text-sm">{f.field}</span>
+                  {f.required && <span className="ml-1 text-red-500 text-xs">*</span>}
+                </div>
+                <p className="text-sm text-gray-600">{f.desc}</p>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: LIVE TESTER
+  // ============================================================
+  const TestingTab = () => (
+    <div className="space-y-6">
+      <div className="bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200 rounded-lg p-5">
+        <div className="flex items-center gap-2 mb-2">
+          <FiZap className="text-[#2d7a3e] text-lg" />
+          <h3 className="font-semibold text-green-900">Testeur en temps réel</h3>
+        </div>
+        <p className="text-sm text-green-800">
+          Envoyez un vrai message depuis ce panneau sans écrire une seule ligne de code.
+          Votre token API est utilisé automatiquement.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Formulaire */}
+        <Card>
+          <CardHeader><CardTitle>🔧 Paramètres</CardTitle></CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Numéro émetteur (phoneNumber) <span className="text-red-500">*</span></label>
+              <input
+                type="text"
+                value={testSenderPhone}
+                onChange={e => setTestSenderPhone(e.target.value)}
+                placeholder="+237691234567"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-[#2d7a3e] focus:ring-1 focus:ring-[#2d7a3e] outline-none"
+              />
+              <p className="text-xs text-gray-500 mt-1">Votre numéro WhatsApp émetteur attribué</p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Numéro destinataire <span className="text-red-500">*</span></label>
+              <input
+                type="text"
+                value={testRecipient}
+                onChange={e => setTestRecipient(e.target.value)}
+                placeholder="+237674000000"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-[#2d7a3e] focus:ring-1 focus:ring-[#2d7a3e] outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Type de message</label>
+              <div className="flex gap-3">
+                {(['template', 'text'] as const).map(t => (
+                  <button
+                    key={t}
+                    onClick={() => setTestMessageType(t)}
+                    className={`px-4 py-2 rounded-lg text-sm border transition-colors ${testMessageType === t ? 'bg-[#2d7a3e] text-white border-[#2d7a3e]' : 'border-gray-300 text-gray-700 hover:border-[#2d7a3e]'}`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {testMessageType === 'template' ? (
+              <>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Nom du template <span className="text-red-500">*</span></label>
+                  <input
+                    type="text"
+                    value={testTemplateName}
+                    onChange={e => setTestTemplateName(e.target.value)}
+                    placeholder="next_new_chat_v1"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-[#2d7a3e] focus:ring-1 focus:ring-[#2d7a3e] outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Paramètres (JSON)</label>
+                  <textarea
+                    value={testTemplateParams}
+                    onChange={e => setTestTemplateParams(e.target.value)}
+                    rows={4}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:border-[#2d7a3e] focus:ring-1 focus:ring-[#2d7a3e] outline-none"
+                    placeholder={'{"name": "Jean"}'}
+                  />
+                </div>
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={includeInvoice}
+                      onChange={e => setIncludeInvoice(e.target.checked)}
+                      className="rounded"
+                    />
+                    Joindre une facture PDF (invoice_data)
+                  </label>
+                </div>
+                {includeInvoice && (
+                  <div className="space-y-3 p-3 bg-orange-50 border border-orange-200 rounded-lg">
+                    <div>
+                      <label className="block text-xs font-medium text-orange-800 mb-1">URL du PDF</label>
+                      <input
+                        type="text"
+                        value={testInvoiceUrl}
+                        onChange={e => setTestInvoiceUrl(e.target.value)}
+                        placeholder="https://votreserveur.com/facture.pdf"
+                        className="w-full px-3 py-2 border border-orange-300 rounded-lg text-sm outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-orange-800 mb-1">Numéro de facture</label>
+                      <input
+                        type="text"
+                        value={testInvoiceNumber}
+                        onChange={e => setTestInvoiceNumber(e.target.value)}
+                        placeholder="001"
+                        className="w-full px-3 py-2 border border-orange-300 rounded-lg text-sm outline-none"
+                      />
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div>
+                <label className="block text-sm font-medium mb-1">Contenu du message</label>
+                <textarea
+                  value={testTextContent}
+                  onChange={e => setTestTextContent(e.target.value)}
+                  rows={3}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-[#2d7a3e] focus:ring-1 focus:ring-[#2d7a3e] outline-none"
+                  placeholder="Votre message texte..."
+                />
+              </div>
+            )}
+
+            <Button
+              onClick={runLiveTest}
+              disabled={testLoading || !testRecipient}
+              className="w-full flex items-center justify-center gap-2"
+            >
+              {testLoading ? (
+                <><FiLoader className="animate-spin" /> Envoi en cours...</>
+              ) : (
+                <><FiPlay /> Envoyer le message test</>
+              )}
+            </Button>
+          </CardContent>
+        </Card>
+
+        {/* Résultat */}
+        <Card>
+          <CardHeader><CardTitle>📊 Résultat</CardTitle></CardHeader>
+          <CardContent>
+            {!testResult && !testLoading && (
+              <div className="flex flex-col items-center justify-center h-64 text-gray-400">
+                <FiTerminal className="text-5xl mb-4 opacity-30" />
+                <p className="text-sm">Remplissez le formulaire et cliquez "Envoyer"</p>
+              </div>
+            )}
+            {testLoading && (
+              <div className="flex flex-col items-center justify-center h-64 text-gray-400">
+                <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#2d7a3e] mb-4" />
+                <p className="text-sm">Envoi en cours...</p>
+              </div>
+            )}
+            {testResult && (
+              <div className="space-y-4">
+                <div className={`flex items-center gap-3 p-3 rounded-lg ${testResult.ok ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'}`}>
+                  {testResult.ok
+                    ? <FiCheckCircle className="text-green-600 text-xl flex-shrink-0" />
+                    : <FiXCircle className="text-red-600 text-xl flex-shrink-0" />}
+                  <div>
+                    <p className={`font-semibold ${testResult.ok ? 'text-green-700' : 'text-red-700'}`}>
+                      {testResult.ok ? '✅ Succès' : '❌ Erreur'}
+                    </p>
+                    <p className="text-xs text-gray-500">HTTP {testResult.status} · {testResult.elapsed}ms</p>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Requête envoyée</p>
+                  <CodeBlock id="test-req" lang="json" code={JSON.stringify(testResult.body, null, 2)} />
+                </div>
+
+                <div>
+                  <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Réponse de l'API</p>
+                  <CodeBlock id="test-resp" lang="json" code={JSON.stringify(testResult.data, null, 2)} />
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: CODE EXAMPLES
+  // ============================================================
+  const CodeExamplesTab = () => {
+    const examples: Record<string, string> = {
+      curl: `curl -X POST ${apiUrl}/messages/send \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phoneNumber": "+237691234567",
+    "recipient_phone": "+237600000000",
+    "message_type": "template",
+    "template_name": "welcome_template",
+    "template_params": {"name": "Jean"}
+  }'`,
+
+      javascript: `// Node.js / Browser (fetch)
+const response = await fetch('${apiUrl}/messages/send', {
+  method: 'POST',
+  headers: {
+    'Authorization': 'Bearer ${TOKEN}',
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    phoneNumber: '+237691234567',
+    recipient_phone: '+237600000000',
+    message_type: 'template',
+    template_name: 'welcome_template',
+    template_params: { name: 'Jean' }
+  })
+});
+const data = await response.json();
+console.log(data);`,
+
+      python: `import requests
+
+r = requests.post(
+    '${apiUrl}/messages/send',
+    headers={
+        'Authorization': 'Bearer ${TOKEN}',
+        'Content-Type': 'application/json'
+    },
+    json={
+        'phoneNumber': '+237691234567',
+        'recipient_phone': '+237600000000',
+        'message_type': 'template',
+        'template_name': 'welcome_template',
+        'template_params': {'name': 'Jean'}
+    }
+)
+print(r.json())`,
+
+      php: `<?php
+$ch = curl_init('${apiUrl}/messages/send');
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST           => true,
+    CURLOPT_POSTFIELDS     => json_encode([
+        'phoneNumber'     => '+237691234567',
+        'recipient_phone' => '+237600000000',
+        'message_type'    => 'template',
+        'template_name'   => 'welcome_template',
+        'template_params' => ['name' => 'Jean']
+    ]),
+    CURLOPT_HTTPHEADER     => [
+        'Authorization: Bearer ${TOKEN}',
+        'Content-Type: application/json'
+    ]
+]);
+$result = json_decode(curl_exec($ch), true);
+curl_close($ch);
+print_r($result);
+?>`,
+
+      java: `import java.net.http.*;
+import java.net.URI;
+
+var client = HttpClient.newHttpClient();
+var json = """
+    {
+        "phoneNumber":    "+237691234567",
+        "recipient_phone":"+237600000000",
+        "message_type":   "template",
+        "template_name":  "welcome_template",
+        "template_params": {"name": "Jean"}
+    }
+    """;
+var request = HttpRequest.newBuilder()
+    .uri(URI.create("${apiUrl}/messages/send"))
+    .header("Authorization", "Bearer ${TOKEN}")
+    .header("Content-Type", "application/json")
+    .POST(HttpRequest.BodyPublishers.ofString(json))
+    .build();
+var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+System.out.println(response.body());`,
+
+      go: `package main
+
+import (
+    "bytes"; "encoding/json"; "fmt"; "net/http"
+)
+
+func main() {
+    data, _ := json.Marshal(map[string]any{
+        "phoneNumber":     "+237691234567",
+        "recipient_phone": "+237600000000",
+        "message_type":    "template",
+        "template_name":   "welcome_template",
+        "template_params": map[string]string{"name": "Jean"},
+    })
+    req, _ := http.NewRequest("POST", "${apiUrl}/messages/send", bytes.NewBuffer(data))
+    req.Header.Set("Authorization", "Bearer ${TOKEN}")
+    req.Header.Set("Content-Type", "application/json")
+    resp, _ := http.DefaultClient.Do(req)
+    defer resp.Body.Close()
+    var result map[string]any
+    json.NewDecoder(resp.Body).Decode(&result)
+    fmt.Println(result)
+}`,
+
+      powershell: `$token = "${TOKEN}"
+$body  = @{
+    phoneNumber     = "+237691234567"
+    recipient_phone = "+237600000000"
+    message_type    = "template"
+    template_name   = "welcome_template"
+    template_params = @{ name = "Jean" }
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Uri "${apiUrl}/messages/send" \\
+  -Method Post \\
+  -Headers @{ "Authorization" = "Bearer $token"; "Content-Type" = "application/json" } \\
+  -Body $body | ConvertTo-Json -Depth 10`,
+    };
+
+    return (
+      <Card>
+        <CardHeader><CardTitle>💻 Exemples par langage</CardTitle></CardHeader>
+        <CardContent>
+          <Tabs tabs={[
+            { id: 'curl', label: 'cURL', content: <CodeBlock id="ex-curl" code={examples.curl} lang="bash" /> },
+            { id: 'javascript', label: 'JavaScript', content: <CodeBlock id="ex-js" code={examples.javascript} lang="javascript" /> },
+            { id: 'python', label: 'Python', content: <CodeBlock id="ex-python" code={examples.python} lang="python" /> },
+            { id: 'php', label: 'PHP', content: <CodeBlock id="ex-php" code={examples.php} lang="php" /> },
+            { id: 'java', label: 'Java', content: <CodeBlock id="ex-java" code={examples.java} lang="java" /> },
+            { id: 'go', label: 'Go', content: <CodeBlock id="ex-go" code={examples.go} lang="go" /> },
+            { id: 'powershell', label: 'PowerShell', content: <CodeBlock id="ex-ps" code={examples.powershell} lang="powershell" /> },
+          ]} />
+        </CardContent>
+      </Card>
+    );
+  };
+
+  // ============================================================
+  // TAB: STORAGE
+  // ============================================================
+  const StorageTab = () => (
+    <div className="space-y-6">
+      {storageSpace && (
+        <Card>
+          <CardHeader><CardTitle>🆔 Votre espace de stockage</CardTitle></CardHeader>
+          <CardContent>
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="text-xs text-gray-500">Storage ID</label>
+                  <p className="font-mono text-sm">{storageSpace.id}</p>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500">Quota total</label>
+                  <p className="font-semibold">{storageSpace.quota_total || 50} Go</p>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500">Utilisé</label>
+                  <p className="font-semibold">{storageSpace.quota_used || 0} Go</p>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500">Statut</label>
+                  <p className={`font-semibold ${storageSpace.is_active ? 'text-green-600' : 'text-red-600'}`}>
+                    {storageSpace.is_active ? 'Actif' : 'Inactif'}
+                  </p>
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={() => handleCopy(storageSpace.id, 'storage-id-main')}>
+                {copiedField === 'storage-id-main' ? <FiCheck /> : <FiCopy />} Copier l'ID
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader><CardTitle>📤 Upload de fichiers</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <CodeBlock id="storage-upload" lang="bash" code={`curl -X POST "${storageApiUrl}/storage/client/storage/${storageSpace?.id || 'VOTRE_STORAGE_ID'}/upload" \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  -F "file=@/chemin/vers/mon-fichier.pdf"`} />
+          <div className="bg-yellow-50 p-3 rounded-lg">
+            <p className="text-sm text-yellow-800">Format <code>multipart/form-data</code> obligatoire. Champ : <code>file</code>.</p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle>📥 Téléchargement de fichiers</CardTitle></CardHeader>
+        <CardContent>
+          <CodeBlock id="storage-download" lang="bash" code={`curl -X GET "${storageApiUrl}/storage/client/storage/${storageSpace?.id || 'VOTRE_STORAGE_ID'}/files/mon-fichier.pdf" \\
+  -H "Authorization: Bearer ${TOKEN}" \\
+  --output "fichier_telecharge.pdf"`} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle>❌ Gestion des erreurs</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          {[
+            { title: 'Abonnement expiré', color: 'red', code: `{\n  "success": false,\n  "message": "Abonnement expiré. Veuillez renouveler.",\n  "code": "EXPIRED"\n}` },
+            { title: 'Espace bloqué', color: 'red', code: `{\n  "success": false,\n  "message": "Espace bloqué par l'administration.",\n  "code": "BLOCKED"\n}` },
+            { title: 'Espace plein', color: 'yellow', code: `{\n  "success": false,\n  "message": "Espace disque saturé.",\n  "code": "FULL",\n  "used": "45.2 GB",\n  "limit": "50 GB"\n}` },
+          ].map(e => (
+            <div key={e.title}>
+              <h4 className="font-medium text-gray-900 mb-2">{e.title}</h4>
+              <div className={`bg-${e.color}-50 border border-${e.color}-200 rounded-lg p-3`}>
+                <pre className={`text-sm text-${e.color}-800`}>{e.code}</pre>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle>🔒 Sécurité</CardTitle></CardHeader>
+        <CardContent>
+          <ul className="space-y-2 text-sm text-gray-700">
+            {[
+              '🔐 Toutes les communications chiffrées en TLS 1.3',
+              '🔑 Authentification par JWT avec expiration 24h',
+              '📁 Fichiers chiffrés AES-256 au repos',
+              '👤 Isolation stricte entre espaces clients',
+              '📊 Journalisation de toutes les actions',
+              '⏱️ Rate limiting : 100 requêtes/minute par IP',
+              '🛡️ Protection DDoS et injection',
+            ].map(item => <li key={item}>{item}</li>)}
+          </ul>
+        </CardContent>
+      </Card>
+    </div>
+  );
+
+  // ============================================================
+  // TAB: PRICING
+  // ============================================================
+  const PricingTab = () => (
+    <Card>
+      <CardHeader><CardTitle>💰 Tarification</CardTitle></CardHeader>
+      <CardContent>
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="border rounded-lg p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <FiSmartphone className="text-2xl text-[#2d7a3e]" />
+                <h3 className="font-bold">Messages WhatsApp</h3>
+              </div>
+              <p className="text-3xl font-bold text-[#2d7a3e] mb-2">À partir de 20 FCFA</p>
+              <p className="text-sm text-gray-500">Par message, selon le volume</p>
+              <ul className="mt-4 space-y-2 text-sm">
+                <li>✓ Conversation initiée par l'entreprise</li>
+                <li>✓ Template approuvé requis</li>
+                <li>✓ 24h de conversation gratuite</li>
+              </ul>
+            </div>
+            <div className="border rounded-lg p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <FiMessageSquare className="text-2xl text-[#1976d2]" />
+                <h3 className="font-bold">Messages SMS</h3>
+              </div>
+              <p className="text-3xl font-bold text-[#1976d2] mb-2">À partir de 15 FCFA</p>
+              <p className="text-sm text-gray-500">Par SMS, selon le pays</p>
+              <ul className="mt-4 space-y-2 text-sm">
+                <li>✓ Tous pays supportés</li>
+                <li>✓ Pas de template requis</li>
+                <li>✓ 160 caractères par SMS</li>
+              </ul>
+            </div>
+          </div>
+          <div className="bg-[#f0f7f3] p-4 rounded-lg">
+            <p className="text-sm text-[#1e5a2f]">
+              <strong>⚠️ Important :</strong> Les messages marketing sont facturés différemment des messages transactionnels.
+              Choisissez la bonne catégorie dans vos templates Meta.
+            </p>
+          </div>
+          <div className="bg-blue-50 p-4 rounded-lg">
+            <p className="text-sm text-blue-800">
+              <strong>💡 Fallback SMS :</strong> Si un message WhatsApp échoue, il peut basculer automatiquement en SMS
+              (tarif SMS appliqué dans ce cas).
+            </p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  // ============================================================
+  // TABS DEFINITION
+  // ============================================================
+  const tabs = [
+    { id: 'quickstart', label: 'Démarrage rapide', icon: <FiZap />,          content: <QuickStartTab /> },
+    { id: 'endpoints',  label: 'Endpoints',        icon: <FiGlobe />,        content: <EndpointsTab /> },
+    { id: 'webhooks',   label: 'Webhooks',          icon: <FiBell />,         content: <WebhooksTab /> },
+    { id: 'testing',    label: 'Tester en direct',  icon: <FiPlay />,         content: <TestingTab /> },
+    { id: 'templates',  label: 'Templates',         icon: <FiPackage />,      content: <TemplatesTab /> },
+    { id: 'storage',    label: 'Stockage',          icon: <FiHardDrive />,    content: <StorageTab /> },
+    { id: 'examples',   label: 'Exemples code',     icon: <FiCode />,         content: <CodeExamplesTab /> },
+    { id: 'pricing',    label: 'Tarifs',            icon: <FiMail />,         content: <PricingTab /> },
+  ];
+
+  // ============================================================
+  // RENDER
+  // ============================================================
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-dark">Documentation API</h1>
+        <p className="text-gray-500 mt-1">
+          Intégrez l'envoi de messages WhatsApp/SMS, les webhooks temps réel et le stockage de fichiers dans vos applications
+        </p>
+      </div>
+
+      <Tabs tabs={tabs} defaultTab={activeTab} onTabChange={setActiveTab} />
+
+      {/* Support */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
+        <h3 className="font-medium text-blue-800 mb-2">📞 Besoin d'aide ?</h3>
+        <p className="text-blue-700 mb-4">Notre équipe est disponible pour vous accompagner dans votre intégration.</p>
+        <div className="flex gap-4 flex-wrap">
+          <a href="mailto:api@numericexport.com"
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm">
+            Contacter le support API
+          </a>
+          <a href="/dashboard/messages/new"
+            className="px-4 py-2 border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-100 transition-colors text-sm">
+            Envoyer un message test
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}

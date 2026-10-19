@@ -1,0 +1,284 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+  LineChart,
+  Line,
+  Legend
+} from 'recharts';
+
+type StatsResponse = {
+  success: boolean;
+  stats: {
+    total: number;
+    with_phone: number;
+    abonne: number;
+    non_abonne: number;
+    checked: number;
+    api_ok: number;
+    api_nok: number;
+    terrain: number;
+    autres: number;
+    taux_abonnement: number;
+    taux_check: number;
+    taux_api_ok: number;
+  };
+  byRegion: { region: string; total: number; abonne: number; checked: number }[];
+  byDivision: { division: string; total: number; abonne: number }[];
+  byAgence: { agence: string; total: number; abonne: number }[];
+  byMrc: { mrc: string; total: number; abonne: number }[];
+  byItinerary: {
+    itineraires: string;
+    total: number;
+    abonne: number;
+    checked: number;
+  }[];
+  byDay: { jour: string; total: number; checked: number; abonne: number }[];
+};
+
+const COLORS = ['#1a6fb5', '#0f5a97', '#34d399', '#f87171', '#fbbf24', '#a78bfa'];
+
+export default function StatsTab({ token }: { token: string }) {
+  const [data, setData] = useState<StatsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch('/api/v1/socadel/stats', {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+      .then((res) => res.json())
+      .then((json) => {
+        if (json.success) setData(json);
+        else setError('Impossible de charger les statistiques');
+      })
+      .catch(() => setError('Erreur réseau'))
+      .finally(() => setLoading(false));
+  }, [token]);
+
+  if (loading) {
+    return (
+      <div className="p-12 text-center text-blue-500">
+        Chargement des statistiques…
+      </div>
+    );
+  }
+
+  if (error || !data) {
+    return (
+      <div className="p-12 text-center text-red-500">
+        {error || 'Erreur de chargement'}
+      </div>
+    );
+  }
+
+  const { stats, byRegion, byItinerary, byDay } = data;
+
+  const pieAbonne = [
+    { name: 'Abonné', value: stats.abonne },
+    { name: 'Non abonné', value: stats.non_abonne }
+  ];
+
+  const pieCheck = [
+    { name: 'Check OK', value: stats.checked },
+    { name: 'Non checké', value: stats.total - stats.checked }
+  ];
+
+  const kpiCards = [
+    { label: 'Total contacts', value: stats.total, color: 'text-blue-800' },
+    { label: 'Avec téléphone', value: stats.with_phone, color: 'text-blue-700' },
+    { label: 'Abonnés', value: stats.abonne, color: 'text-emerald-600' },
+    { label: 'Non abonnés', value: stats.non_abonne, color: 'text-red-600' },
+    { label: 'Check OK', value: stats.checked, color: 'text-blue-600' },
+    { label: 'API OK', value: stats.api_ok, color: 'text-emerald-600' },
+    {
+      label: 'Taux abonnement',
+      value: `${stats.taux_abonnement} %`,
+      color: 'text-blue-800'
+    },
+    {
+      label: 'Taux check',
+      value: `${stats.taux_check} %`,
+      color: 'text-blue-800'
+    }
+  ];
+
+  return (
+    <div className="space-y-6">
+      {/* KPI */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+        {kpiCards.map((k) => (
+          <div
+            key={k.label}
+            className="bg-white p-4 rounded-xl shadow-sm border border-blue-100"
+          >
+            <p className="text-[11px] font-medium text-blue-600/80 uppercase tracking-wide">
+              {k.label}
+            </p>
+            <p className={`text-xl font-bold mt-1 ${k.color}`}>{k.value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Graphiques principaux */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-white p-5 rounded-xl shadow-sm border border-blue-100">
+          <h3 className="text-sm font-semibold text-blue-800 mb-4">
+            Répartition abonnés / non abonnés
+          </h3>
+          <ResponsiveContainer width="100%" height={240}>
+            <PieChart>
+              <Pie
+                data={pieAbonne}
+                cx="50%"
+                cy="50%"
+                innerRadius={50}
+                outerRadius={85}
+                paddingAngle={3}
+                dataKey="value"
+                label={({ name, percent }) =>
+                  `${name} ${((percent ?? 0) * 100).toFixed(0)}%`
+                }
+              >
+                {pieAbonne.map((_, i) => (
+                  <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-white p-5 rounded-xl shadow-sm border border-blue-100">
+          <h3 className="text-sm font-semibold text-blue-800 mb-4">
+            Check terrain
+          </h3>
+          <ResponsiveContainer width="100%" height={240}>
+            <PieChart>
+              <Pie
+                data={pieCheck}
+                cx="50%"
+                cy="50%"
+                innerRadius={50}
+                outerRadius={85}
+                paddingAngle={3}
+                dataKey="value"
+                label={({ name, percent }) =>
+                  `${name} ${((percent ?? 0) * 100).toFixed(0)}%`
+                }
+              >
+                {pieCheck.map((_, i) => (
+                  <Cell key={i} fill={COLORS[(i + 2) % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Évolution journalière */}
+      {byDay.length > 0 && (
+        <div className="bg-white p-5 rounded-xl shadow-sm border border-blue-100">
+          <h3 className="text-sm font-semibold text-blue-800 mb-4">
+            Évolution journalière (30 derniers jours)
+          </h3>
+          <ResponsiveContainer width="100%" height={280}>
+            <LineChart data={byDay}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis
+                dataKey="jour"
+                tick={{ fontSize: 11 }}
+                tickFormatter={(v) =>
+                  new Date(v).toLocaleDateString('fr-FR', {
+                    day: '2-digit',
+                    month: '2-digit'
+                  })
+                }
+              />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip
+                labelFormatter={(v) =>
+                  new Date(v).toLocaleDateString('fr-FR')
+                }
+              />
+              <Legend />
+              <Line
+                type="monotone"
+                dataKey="checked"
+                name="Check OK"
+                stroke="#1a6fb5"
+                strokeWidth={2}
+                dot={false}
+              />
+              <Line
+                type="monotone"
+                dataKey="abonne"
+                name="Abonnés"
+                stroke="#34d399"
+                strokeWidth={2}
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* Par région & itinéraire */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {byRegion.length > 0 && (
+          <div className="bg-white p-5 rounded-xl shadow-sm border border-blue-100">
+            <h3 className="text-sm font-semibold text-blue-800 mb-4">
+              Cumul par région
+            </h3>
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={byRegion.slice(0, 10)} layout="vertical">
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis type="number" tick={{ fontSize: 11 }} />
+                <YAxis
+                  type="category"
+                  dataKey="region"
+                  width={90}
+                  tick={{ fontSize: 11 }}
+                />
+                <Tooltip />
+                <Bar dataKey="total" name="Total" fill="#1a6fb5" radius={[0, 4, 4, 0]} />
+                <Bar dataKey="abonne" name="Abonnés" fill="#34d399" radius={[0, 4, 4, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {byItinerary.length > 0 && (
+          <div className="bg-white p-5 rounded-xl shadow-sm border border-blue-100">
+            <h3 className="text-sm font-semibold text-blue-800 mb-4">
+              Cumul par itinéraire (top 12)
+            </h3>
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={byItinerary.slice(0, 12)}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey="itineraires" tick={{ fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="total" name="Total" fill="#1a6fb5" />
+                <Bar dataKey="abonne" name="Abonnés" fill="#34d399" />
+                <Bar dataKey="checked" name="Check OK" fill="#fbbf24" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,77 @@
+const alarmVideoService = require('../services/alarm-video.service');
+const { uploadAndConvertVideoFromStream } = require('../services/storage-upload.service');
+const { sendAlarmTemplate } = require('../services/whatsapp-send.service');
+const logger = require('../utils/logger');
+
+const alarmLabels = {
+  makeCalls: "Appel d'urgence",
+  fatigueDriving: "Conduite fatiguée",
+  speedingAlarm: "Excès de vitesse",
+  forwardCollision: "Collision frontale",
+  laneDeparture: "Franchissement de ligne",
+  pedestrianCollision: "Risque piéton",
+  emergencyAlarm: "Alerte d'urgence"
+};
+
+function getAlarmLabel(type) {
+  return alarmLabels[type] || type;
+}
+
+async function sendAlarmVideo(request, reply) {
+  try {
+    const userId = request.user?.id;
+    if (!userId) {
+      return reply.status(401).send({ success: false, message: "Utilisateur non authentifié" });
+    }
+
+    const {
+      licenseNum,
+      alarmType,
+      startTime,
+      endTime,
+      recipientPhone,
+      channelNum,
+      phoneNumber
+    } = request.body;
+
+    if (!licenseNum || !alarmType || !startTime || !endTime || !recipientPhone) {
+      return reply.status(400).send({
+        success: false,
+        message: "Paramètres manquants : licenseNum, alarmType, startTime, endTime, recipientPhone"
+      });
+    }
+
+    logger.info(`[Alarm] Recherche vidéo: ${licenseNum} / ${alarmType} de ${startTime} à ${endTime}`);
+
+    const { stream, originalName, startTime: videoTime } = await alarmVideoService.fetchFirstAlarmVideo(
+      licenseNum, alarmType, startTime, endTime, channelNum
+    );
+
+    const uploadResult = await uploadAndConvertVideoFromStream(stream, originalName, request.user.id, licenseNum);
+    if (!uploadResult.success) throw new Error(`Upload échoué: ${uploadResult.error}`);
+
+    const alarmLabel = getAlarmLabel(alarmType);
+    const dateTimeStr = videoTime ? videoTime.replace(' ', ' à ') : new Date().toLocaleString();
+    const channelNumber = phoneNumber || request.user.phoneNumber || process.env.DEFAULT_WHATSAPP_NUMBER;
+
+    const sendResult = await sendAlarmTemplate(recipientPhone, uploadResult.publicUrl, alarmLabel, licenseNum, dateTimeStr, channelNumber);
+    if (!sendResult.success) throw new Error(`WhatsApp échoué: ${sendResult.error}`);
+
+    return reply.send({
+      success: true,
+      message: "Vidéo d'alarme envoyée avec succès",
+      video: { url: uploadResult.publicUrl, size: uploadResult.size },
+      whatsapp: sendResult
+    });
+
+  } catch (error) {
+    logger.error(`[AlarmController] ${error.message}`);
+    return reply.status(500).send({
+      success: false,
+      message: "Erreur lors de l'envoi de la vidéo d'alarme",
+      error: error.message
+    });
+  }
+}
+
+module.exports = { sendAlarmVideo };

@@ -1,0 +1,132 @@
+// api/src/workers/alarm-worker.js
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const watiService = require('../services/wati.service');
+const { markVideoAsSent } = require('../services/alarm-notification.service');
+const { v4: uuidv4 } = require('uuid');
+
+async function processAlarmJob(job) {
+  const {
+    licenseNum,
+    alarmType,
+    fileId,
+    filePath,
+    startTime,
+    recipientPhone,
+    clientId,
+    alarmLabel,
+    templateName,
+    templateParams,
+    messageId,
+    channelNumber
+  } = job.data;
+
+  try {
+    // 1. Vérifier si le message a déjà été envoyé (doublon via messageId)
+    const existing = await query('SELECT id FROM messages WHERE id = $1', [messageId]);
+    if (existing.rowCount > 0) {
+      logger.info(`[AlarmWorker] Message ${messageId} déjà traité, ignoré`);
+      return { success: true, skipped: true };
+    }
+
+    // 2. Insérer le message dans la table messages
+    const clientTable = `messages_client_${clientId.replace(/-/g, '_')}`;
+    await query(
+      `INSERT INTO messages (id, client_id, recipient_phone, message_type, template_name,
+        template_language, template_params, wa_status, queued_at, channel)
+       VALUES ($1, $2, $3, 'template', $4, 'fr', $5, 'queued', NOW(), 'whatsapp')`,
+      [messageId, clientId, recipientPhone, templateName, templateParams]
+    );
+    // Table partitionnée
+    await query(
+      `INSERT INTO ${clientTable} (id, recipient_phone, message_type, template_name,
+        template_language, template_params, wa_status, queued_at)
+       VALUES ($1, $2, 'template', $3, 'fr', $4, 'queued', NOW())`,
+      [messageId, recipientPhone, templateName, templateParams]
+    ).catch(err => logger.warn(`[AlarmWorker] Erreur insertion table client: ${err.message}`));
+
+    // 3. Envoyer via WATI
+    const sendResult = await watiService.sendTemplateMessage(
+      recipientPhone,
+      templateName,
+      templateParams,
+      'fr',
+      channelNumber
+    );
+
+    if (!sendResult.success) {
+      // Mettre à jour le message en échec
+      await query(
+        `UPDATE messages SET wa_status = 'failed', wa_error_message = $1, failed_at = NOW() WHERE id = $2`,
+        [sendResult.error || 'Échec WATI', messageId]
+      );
+      throw new Error(sendResult.error || 'Échec WATI');
+    }
+
+    // 4. Mettre à jour le message avec succès
+    await query(
+      `UPDATE messages SET wa_status = 'sent', wati_local_id = $1, sent_at = NOW() WHERE id = $2`,
+      [sendResult.localMessageId, messageId]
+    );
+    // Mettre à jour la table client
+    await query(
+      `UPDATE ${clientTable} SET wa_status = 'sent', wati_local_id = $1, sent_at = NOW() WHERE id = $2`,
+      [sendResult.localMessageId, messageId]
+    ).catch(err => logger.warn(`[AlarmWorker] Erreur update table client: ${err.message}`));
+
+    // 5. Marquer comme envoyé dans alarm_notifications (avec le vrai messageId)
+    await markVideoAsSent(fileId, filePath, licenseNum, alarmType, recipientPhone, messageId);
+
+    logger.info(`[AlarmWorker] ✅ Alarme envoyée: fileId=${fileId}, recipient=${recipientPhone}, messageId=${messageId}`);
+
+    return { success: true, fileId, recipient: recipientPhone, messageId };
+
+  } catch (error) {
+    logger.error(`[AlarmWorker] ❌ Échec pour fileId ${fileId}: ${error.message}`);
+    throw error; // BullMQ retentera
+  }
+}
+
+// Configuration du worker
+const worker = new Worker(
+  'alarm-processing',
+  processAlarmJob,
+  {
+    connection: redisConnection,
+    concurrency: 5,
+    lockDuration: 60000,
+    stalledInterval: 30000,
+    maxStalledCount: 2,
+    limiter: { max: 10, duration: 1000 },
+    removeOnComplete: { age: 86400, count: 1000 },
+    removeOnFail: { age: 604800, count: 5000 }
+  }
+);
+
+worker.on('completed', (job, result) => {
+  logger.info(`✅ Job ${job.id} terminé: fileId=${result.fileId}`);
+});
+
+worker.on('failed', (job, err) => {
+  logger.error(`❌ Job ${job.id} échoué: ${err.message}`);
+});
+
+worker.on('error', (err) => {
+  logger.error(`🔥 Worker error: ${err.message}`);
+});
+
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt du worker d\'alarme');
+  await worker.close();
+  process.exit(0);
+});
+
+module.exports = { worker };

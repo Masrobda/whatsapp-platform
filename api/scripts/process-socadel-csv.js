@@ -1,0 +1,245 @@
+const path = require('path');
+// Charger les variables d'environnement depuis le fichier .env de l'API
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
+
+const fs = require('fs');
+const { parse } = require('csv-parse');
+const { query } = require('../src/config/database');
+const logger = require('../src/utils/logger');
+
+const INCOMING_DIR = '/var/socadel/incoming';
+const ARCHIVE_DIR = '/var/socadel/archive';
+const LOG_FILE = '/var/log/socadel-import.log';
+
+// Fonction de log personnalisée (console + fichier)
+function log(msg) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${msg}`;
+  console.log(line);
+  try {
+    fs.appendFileSync(LOG_FILE, line + '\n', { flag: 'a' });
+  } catch (e) {
+    // Fallback si écriture fichier impossible
+  }
+}
+
+// Convertit DD/MM/YYYY ou DD/MM/YY vers YYYY-MM-DD pour PostgreSQL
+function parseFrenchDate(dateStr) {
+  if (!dateStr) return null;
+  const cleaned = dateStr.trim();
+  const match = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (match) {
+    let [, day, month, year] = match;
+    if (year.length === 2) year = '20' + year;
+    day = day.padStart(2, '0');
+    month = month.padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+  return cleaned;
+}
+
+async function processFiles() {
+  if (!fs.existsSync(INCOMING_DIR)) {
+    log(`⚠️ Dossier ${INCOMING_DIR} inexistant`);
+    return;
+  }
+
+  // Créer le dossier d'archive s'il n'existe pas
+  if (!fs.existsSync(ARCHIVE_DIR)) {
+    fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+  }
+
+  const files = fs.readdirSync(INCOMING_DIR).filter(f => f.endsWith('.csv'));
+
+  if (files.length === 0) {
+    return;
+  }
+
+  for (const file of files) {
+    const filePath = path.join(INCOMING_DIR, file);
+    const stats = fs.statSync(filePath);
+
+    // Ignorer les fichiers vides (taille = 0)
+    if (stats.size === 0) {
+      log(`⚠️ Fichier vide ignoré : ${file}`);
+      continue;
+    }
+
+    log(`📥 Traitement de : ${file} (${(stats.size / 1024).toFixed(1)} Ko)`);
+
+    try {
+      const parser = fs.createReadStream(filePath).pipe(
+        parse({
+          columns: true,
+          delimiter: ';',
+          trim: true,
+          bom: true, // SUPPRIME AUTOMATIQUEMENT LE BOM UTF-8 (\xEF\xBB\xBF) DE EXCEL/PHP
+          skip_empty_lines: true,
+          relax_quotes: true,
+          relax_column_count: true
+        })
+      );
+
+      let insertedCount = 0;
+
+      // Déterminer le type selon le nom du fichier
+      const isFacturesJourMysql = file.startsWith('factures_jour_mysql.') || file.startsWith('factures_jour_mysql_2');
+      const isFacturesJourMysqlAll = file.startsWith('factures_jour_mysql_all');
+      const isClientsActifsOracle = file.startsWith('clients_actifs_oracle');
+      const isPaiementsOracle = file.startsWith('paiements_oracle');
+
+      if (!isFacturesJourMysql && !isFacturesJourMysqlAll && !isClientsActifsOracle && !isPaiementsOracle) {
+        log(`⚠️ Fichier non reconnu (ignoré) : ${file}`);
+        archiveFile(filePath, file);
+        continue;
+      }
+
+      // Traiter ligne par ligne
+      for await (const record of parser) {
+
+        // 1. Factures MySQL simples -> invoices_bot
+        if (isFacturesJourMysql) {
+          const numero_facture = record.numero_facture || record.num_facture || record.facture_number;
+          const numero_contrat = record.numero_contrat || record.contrat || record.SERVICE_NO;
+          const montant = record.montant;
+          const lien_pdf = record.lien_pdf;
+          const date_creation = record.date_creation || null;
+
+          if (!numero_facture || !numero_contrat || !montant || !lien_pdf) {
+            log(`⚠️ Ligne ignorée (champs manquants) : ${JSON.stringify(record)}`);
+            continue;
+          }
+
+          await query(
+            `INSERT INTO invoices_bot (numero_facture, numero_contrat, montant, lien_pdf, date_creation)
+             VALUES ($1, $2, $3, $4, COALESCE($5::TIMESTAMP, NOW()))
+             ON CONFLICT (numero_facture) DO NOTHING`,
+            [numero_facture, numero_contrat, montant, lien_pdf, date_creation]
+          );
+          insertedCount++;
+
+        // 2. Factures MySQL complètes -> mysql_invoices_all
+        } else if (isFacturesJourMysqlAll) {
+          const numero_facture = record.numero_facture;
+          const numero_contrat = record.numero_contrat;
+
+          if (!numero_facture || !numero_contrat) {
+            log(`⚠️ Ligne ignorée (facture ou contrat manquant) : ${JSON.stringify(record)}`);
+            continue;
+          }
+
+          const dueDateFormatted = parseFrenchDate(record.due_date);
+          const telephone = record.telephone || record.phone || record.contact_phone || null;
+
+          await query(
+            `INSERT INTO mysql_invoices_all (
+               region, division, mrc, agence, categorie, nom_client, contact_ws_status,
+               numero_contrat, numero_facture, montant, unpaid_bills_amount, due_date,
+               lien_pdf, date_creation, cycle, annee, telephone
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             ON CONFLICT (numero_facture) DO NOTHING`,
+            [
+              record.region || null,
+              record.division || null,
+              record.mrc || null,
+              record.agence || null,
+              record.categorie || null,
+              record.nom_client || null,
+              record.contact_ws_status || null,
+              numero_contrat,
+              numero_facture,
+              record.montant ? parseFloat(record.montant) : 0,
+              record.unpaid_bills_amount ? parseFloat(record.unpaid_bills_amount) : 0,
+              dueDateFormatted,
+              record.lien_pdf || null,
+              record.date_creation || null,
+              record.cycle ? parseInt(record.cycle, 10) : null,
+              record.annee ? parseInt(record.annee, 10) : null,
+              telephone
+            ]
+          );
+          insertedCount++;
+
+        // 3. Clients actifs Oracle -> contracts
+        } else if (isClientsActifsOracle) {
+          const contract = record.SERVICE_NO || record.contract_number || record.contrat;
+          const name = record.NAMES || record.client_name || record.nom;
+
+          if (!contract || !name) {
+            log(`⚠️ Ligne ignorée (contrat ou nom manquant) : ${JSON.stringify(record)}`);
+            continue;
+          }
+
+          await query(
+            `INSERT INTO contracts (contract_number, client_name)
+             VALUES ($1, $2)
+             ON CONFLICT (contract_number) DO NOTHING`,
+            [contract, name]
+          );
+          insertedCount++;
+
+        // 4. Paiements Oracle -> oracle_payments
+        } else if (isPaiementsOracle) {
+          const num_rec = record.NUM_REC;
+          if (!num_rec) {
+            log(`⚠️ Ligne ignorée (NUM_REC manquant) : ${JSON.stringify(record)}`);
+            continue;
+          }
+
+          await query(
+            `INSERT INTO oracle_payments (
+               num_rec, montant_facture, montant_paye, date_paiement, cycle, f_year, status
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (num_rec) DO UPDATE SET
+               montant_paye = EXCLUDED.montant_paye,
+               status = EXCLUDED.status,
+               imported_at = CURRENT_TIMESTAMP`,
+            [
+              num_rec,
+              record.MONTANT_FACTURE ? parseFloat(record.MONTANT_FACTURE) : 0,
+              record.MONTANT_PAYE ? parseFloat(record.MONTANT_PAYE) : 0,
+              record.DATE_PAIEMENT || null,
+              record.CYCLE || null,
+              record.F_YEAR || null,
+              record.STATUS || null
+            ]
+          );
+          insertedCount++;
+        }
+      }
+
+      log(`✅ ${insertedCount} lignes insérées depuis ${file}`);
+
+      // Archiver le fichier après traitement réussi
+      archiveFile(filePath, file);
+
+    } catch (err) {
+      log(`❌ Erreur sur ${file} : ${err.message}`);
+      const errorDir = path.join(INCOMING_DIR, 'error');
+      if (!fs.existsSync(errorDir)) fs.mkdirSync(errorDir, { recursive: true });
+      fs.renameSync(filePath, path.join(errorDir, file));
+      log(`📁 Fichier déplacé dans ${errorDir}`);
+    }
+  }
+}
+
+function archiveFile(filePath, fileName) {
+  const timestamp = Date.now();
+  const archivePath = path.join(ARCHIVE_DIR, `${fileName}.${timestamp}`);
+  fs.renameSync(filePath, archivePath);
+  log(`📁 Fichier archivé : ${archivePath}`);
+}
+
+// Exécution si appelé directement
+if (require.main === module) {
+  processFiles()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      log(`💥 Erreur fatale : ${err.message}`);
+      process.exit(1);
+    });
+}
+
+module.exports = { processFiles };

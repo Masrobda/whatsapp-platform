@@ -1,0 +1,123 @@
+// api/src/workers/socadel.worker.js
+'use strict';
+
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const { QUEUE_NAME } = require('../queues/socadel.queue');
+const logger = require('../utils/logger');
+
+const CACHE_STATS_KEY = 'socadel:stats';
+
+async function runBatchSync() {
+  const start = Date.now();
+
+  const result = await query(`
+    WITH matched AS (
+      SELECT
+        sc.id,
+        w.whatsapp_phone,
+        w.client_name,
+        w.activated_at,
+        CASE WHEN w.contract_number IS NOT NULL THEN 'ABONNE' ELSE 'NON ABONNE' END AS new_statut,
+        CASE WHEN w.contract_number IS NOT NULL THEN 'OK' ELSE 'NOK' END AS new_api_status
+      FROM socadel_contacts sc
+      LEFT JOIN whatsapp_valid_contacts w
+        ON w.contract_number = sc.service_no
+    ),
+    updated AS (
+      UPDATE socadel_contacts sc
+      SET
+        numero_telephone = COALESCE(sc.numero_telephone, m.whatsapp_phone),
+        noms             = COALESCE(m.client_name, sc.noms),
+        api_status       = m.new_api_status,
+        api_date         = NOW(),
+        statut           = m.new_statut,
+        activated_at     = m.activated_at,
+        responsable      = CASE
+          WHEN sc.check_status = 'OK'
+           AND m.new_statut = 'ABONNE'
+           AND m.activated_at IS NOT NULL
+           AND sc.check_date IS NOT NULL
+           AND m.activated_at >= sc.check_date
+           AND UPPER(COALESCE(sc.rapport, 'OK')) = 'MRA'
+           AND sc.numero_telephone IS NOT NULL
+           AND m.whatsapp_phone IS NOT NULL
+           AND regexp_replace(sc.numero_telephone, '[^0-9+]', '', 'g')
+             = regexp_replace(m.whatsapp_phone, '[^0-9+]', '', 'g')
+          THEN 'TERRAIN'
+          ELSE 'AUTRES'
+        END,
+        updated_at = NOW()
+      FROM matched m
+      WHERE sc.id = m.id
+      RETURNING sc.id, sc.statut
+    )
+    SELECT
+      COUNT(*)::int AS updated,
+      COUNT(*) FILTER (WHERE statut = 'ABONNE')::int AS abonne,
+      COUNT(*) FILTER (WHERE statut = 'NON ABONNE')::int AS non_abonne
+    FROM updated
+  `);
+
+  const stats = result.rows[0] || { updated: 0, abonne: 0, non_abonne: 0 };
+
+  // Invalider le cache stats
+  try {
+    const Redis = require('ioredis');
+    // réutilise la même config si exposée ; sinon del via redisConnection raw
+  } catch (_) {}
+
+  try {
+    const { redisConnection: rc } = require('../config/redis');
+    // ioredis dual: si redisConnection est un objet options, créer client court
+    const IORedis = require('ioredis');
+    const r = new IORedis(rc);
+    await r.del(CACHE_STATS_KEY);
+    await r.quit();
+  } catch (e) {
+    logger.warn('[SOCADEL-WORKER] Cache invalidate failed:', e.message);
+  }
+
+  logger.info(
+    `[SOCADEL-WORKER] Sync terminé: updated=${stats.updated} abonne=${stats.abonne} non_abonne=${stats.non_abonne} en ${Date.now() - start}ms`
+  );
+  return stats;
+}
+
+async function processJob(job) {
+  if (job.name === 'sync') {
+    return runBatchSync();
+  }
+  logger.warn(`[SOCADEL-WORKER] Job inconnu: ${job.name}`);
+  return { success: false, reason: 'unknown_job' };
+}
+
+const worker = new Worker(QUEUE_NAME, processJob, {
+  connection: redisConnection,
+  concurrency: 1, // 1 sync à la fois = pas de contention PG
+  lockDuration: 120000,
+  limiter: { max: 2, duration: 10000 }
+});
+
+worker.on('completed', (job) => {
+  logger.info(`[SOCADEL-WORKER] Job ${job.id} (${job.name}) terminé`);
+});
+worker.on('failed', (job, err) => {
+  logger.error(`[SOCADEL-WORKER] Job ${job?.id} échoué:`, err.message);
+});
+worker.on('error', (err) => {
+  logger.error('[SOCADEL-WORKER] Erreur worker:', err.message);
+});
+
+logger.info('🚀 [SOCADEL-WORKER] Worker démarré');
+
+async function shutdown(signal) {
+  logger.info(`🛑 [SOCADEL-WORKER][${signal}] Arrêt gracieux...`);
+  await worker.close();
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+module.exports = { worker, runBatchSync };

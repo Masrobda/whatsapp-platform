@@ -1,0 +1,519 @@
+// src/services/template.service.js
+const { query } = require('../config/database');
+const whatsappService = require('./whatsapp.service');
+const logger = require('../utils/logger');
+
+/**
+ * Créer un nouveau template
+ */
+async function createTemplate(userId, templateData) {
+    const client = await db.getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // Validation des données
+    if (!templateData.name || !templateData.body_content) {
+      throw { statusCode: 400, message: 'Nom et contenu du template requis' };
+    }
+
+    // Nettoyer le nom du template (pas d'espaces, caractères spéciaux)
+    const cleanName = templateData.name
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '_')
+      .replace(/_{2,}/g, '_');
+
+    // Extraire les variables du contenu
+    const variables = extractVariables(templateData.body_content);
+    if (templateData.header_type === 'text' && templateData.header_content) {
+      variables.push(...extractVariables(templateData.header_content));
+    }
+
+    const result = await client.query(
+      `INSERT INTO templates (
+        name, language, category,
+        header_type, header_content,
+        body_content, footer_content,
+        buttons, variables, created_by,
+        status, metadata
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING *`,
+      [
+        cleanName,
+        templateData.language || 'fr',
+        templateData.category || 'UTILITY',
+        templateData.header_type || 'none',
+        templateData.header_content || null,
+        templateData.body_content,
+        templateData.footer_content || null,
+        JSON.stringify(templateData.buttons || []),
+        JSON.stringify([...new Set(variables)]), // Variables uniques
+        userId,
+        templateData.status || 'draft',
+        JSON.stringify(templateData.metadata || {})
+      ]
+    );
+
+    await client.query('COMMIT');
+    logger.info(`Template créé: ${cleanName} par utilisateur ${userId}`);
+
+    return result.rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur création template:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Extraire les variables d'un texte (format {{1}}, {{2}}, etc.)
+ */
+function extractVariables(text) {
+  if (!text) return [];
+  const regex = /{{(\d+)}}/g;
+  const matches = [...text.matchAll(regex)];
+  return matches.map(m => parseInt(m[1])).filter((v, i, a) => a.indexOf(v) === i).sort();
+}
+
+/**
+ * Soumettre un template à Meta (360Dialog)
+ */
+async function submitTemplateToMeta(templateId, userId) {
+  const client = await query.pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const template = await getTemplateById(templateId);
+
+    // Vérifier si déjà soumis
+    if (template.wa_template_id) {
+      throw { statusCode: 400, message: 'Template déjà soumis à Meta' };
+    }
+
+    // Construire les composants pour 360Dialog
+    const components = [];
+
+    // Header
+    if (template.header_type && template.header_type !== 'none' && template.header_content) {
+      components.push({
+        type: 'HEADER',
+        format: template.header_type.toUpperCase(),
+        text: template.header_type === 'text' ? template.header_content : undefined,
+        example: template.header_type === 'text' ? {
+          header_text: [template.header_content]
+        } : undefined
+      });
+    }
+
+    // Body avec exemples de variables
+    const bodyComponent = {
+      type: 'BODY',
+      text: template.body_content
+    };
+
+    // Ajouter des exemples pour les variables si présentes
+    const variables = extractVariables(template.body_content);
+    if (variables.length > 0) {
+      bodyComponent.example = {
+        body_text: [
+          variables.map((_, i) => `Exemple ${i + 1}`)
+        ]
+      };
+    }
+    components.push(bodyComponent);
+
+    // Footer
+    if (template.footer_content) {
+      components.push({
+        type: 'FOOTER',
+        text: template.footer_content
+      });
+    }
+
+    // Buttons
+    if (template.buttons && template.buttons.length > 0) {
+      components.push({
+        type: 'BUTTONS',
+        buttons: template.buttons.map(btn => ({
+          type: btn.type,
+          text: btn.text,
+          url: btn.url,
+          phone_number: btn.phone_number
+        }))
+      });
+    }
+
+    const submissionData = {
+      name: template.name,
+      language: template.language,
+      category: template.category,
+      components: components,
+      allow_category_change: true
+    };
+
+    // Soumettre à Meta
+    const result = await whatsappService.submitTemplate(submissionData);
+
+    // Mettre à jour le template
+    await client.query(
+      `UPDATE templates
+       SET wa_template_id = $1,
+           status = $2,
+           submitted_at = CURRENT_TIMESTAMP,
+           submitted_by = $3,
+           metadata = metadata || $4
+       WHERE id = $5`,
+      [
+        result.wa_template_id,
+        result.status?.toLowerCase() || 'pending',
+        userId,
+        JSON.stringify({ submission_response: result }),
+        templateId
+      ]
+    );
+
+    await client.query('COMMIT');
+    logger.info(`Template ${template.name} soumis à Meta avec ID: ${result.wa_template_id}`);
+
+    return {
+      success: true,
+      wa_template_id: result.wa_template_id,
+      status: result.status?.toLowerCase() || 'pending'
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur soumission template à Meta:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+
+/**
+ * Rafraîchir le statut d'un template depuis Meta
+ */
+async function refreshTemplateStatus(templateId) {
+  try {
+    const template = await getTemplateById(templateId);
+
+    if (!template.wa_template_id) {
+      throw { statusCode: 400, message: 'Template non soumis à Meta' };
+    }
+
+    const result = await whatsappService.getTemplateStatus(template.wa_template_id);
+
+    await query(
+      `UPDATE templates
+       SET status = $1,
+           updated_at = CURRENT_TIMESTAMP,
+           metadata = metadata || $2
+       WHERE id = $3`,
+      [
+        result.status.toLowerCase(),
+        JSON.stringify({ last_status_check: new Date().toISOString() }),
+        templateId
+      ]
+    );
+
+    logger.info(`Statut template ${template.name} rafraîchi: ${result.status}`);
+
+    return {
+      success: true,
+      status: result.status.toLowerCase(),
+      previous_status: template.status
+    };
+  } catch (error) {
+    logger.error('Erreur rafraîchissement statut template:', error);
+    throw error;
+  }
+}
+
+/**
+ * Récupérer tous les templates avec filtres
+ */
+async function getTemplates(filters = {}) {
+  const {
+    page = 1,
+    limit = 10,
+    status,
+    category,
+    search,
+    language,
+    created_by
+  } = filters;
+
+  const offset = (page - 1) * limit;
+  let whereClause = 'WHERE 1=1';
+  const params = [];
+  let paramIndex = 1;
+
+  if (status) {
+    whereClause += ` AND status = $${paramIndex}`;
+    params.push(status);
+    paramIndex++;
+  }
+
+  if (category) {
+    whereClause += ` AND category = $${paramIndex}`;
+    params.push(category);
+    paramIndex++;
+  }
+
+  if (language) {
+    whereClause += ` AND language = $${paramIndex}`;
+    params.push(language);
+    paramIndex++;
+  }
+
+  if (created_by) {
+    whereClause += ` AND created_by = $${paramIndex}`;
+    params.push(created_by);
+    paramIndex++;
+  }
+
+  if (search) {
+    whereClause += ` AND (name ILIKE $${paramIndex} OR body_content ILIKE $${paramIndex})`;
+    params.push(`%${search}%`);
+    paramIndex++;
+  }
+
+  // Compter total
+  const countRes = await query(`SELECT COUNT(*) FROM templates ${whereClause}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  // Récupérer les templates
+  const queryText = `
+    SELECT t.*,
+           u.email as created_by_email,
+           COALESCE(u.full_name, u.email) as created_by_name
+    FROM templates t
+    LEFT JOIN users u ON t.created_by = u.id
+    ${whereClause}
+    ORDER BY t.created_at DESC
+    LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+  `;
+
+  const res = await query(queryText, [...params, limit, offset]);
+
+  // Enrichir les templates avec les variables extraites
+  const templates = res.rows.map(template => ({
+    ...template,
+    variables: template.variables || extractVariables(template.body_content),
+    buttons: template.buttons || []
+  }));
+
+  return {
+    templates,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    }
+  };
+}
+
+/**
+ * Récupérer un template par ID
+ */
+async function getTemplateById(templateId) {
+  const res = await query(
+    `SELECT t.*,
+            u.email as created_by_email,
+            COALESCE(u.full_name, u.email) as created_by_name
+     FROM templates t
+     LEFT JOIN users u ON t.created_by = u.id
+     WHERE t.id = $1`,
+    [templateId]
+  );
+
+  if (res.rows.length === 0) {
+    throw { statusCode: 404, message: 'Template non trouvé' };
+  }
+
+  const template = res.rows[0];
+  template.variables = template.variables || extractVariables(template.body_content);
+  template.buttons = template.buttons || [];
+
+  return template;
+}
+
+/**
+ * Mettre à jour un template
+ */
+async function updateTemplate(templateId, userId, updates) {
+  const client = await query.pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const template = await getTemplateById(templateId);
+
+    // Ne pas permettre la modification si déjà soumis à Meta
+    if (template.wa_template_id && template.status !== 'rejected') {
+      throw { statusCode: 400, message: 'Template déjà soumis à Meta, modification impossible' };
+    }
+
+    // Extraire les nouvelles variables
+    const variables = extractVariables(updates.body_content || template.body_content);
+    if (updates.header_type === 'text' && updates.header_content) {
+      variables.push(...extractVariables(updates.header_content));
+    }
+
+    const setClause = [];
+    const values = [];
+    let paramIndex = 1;
+
+    const fields = {
+      name: updates.name,
+      language: updates.language,
+      category: updates.category,
+      header_type: updates.header_type,
+      header_content: updates.header_content,
+      body_content: updates.body_content,
+      footer_content: updates.footer_content,
+      buttons: updates.buttons ? JSON.stringify(updates.buttons) : undefined,
+      variables: JSON.stringify([...new Set(variables)]),
+      status: updates.status || 'draft',
+      updated_at: 'CURRENT_TIMESTAMP'
+    };
+
+    Object.entries(fields).forEach(([key, value]) => {
+      if (value !== undefined) {
+        setClause.push(`${key} = $${paramIndex}`);
+        values.push(value);
+        paramIndex++;
+      }
+    });
+
+    values.push(templateId);
+
+    const result = await client.query(
+      `UPDATE templates
+       SET ${setClause.join(', ')}
+       WHERE id = $${paramIndex}
+       RETURNING *`,
+      values
+    );
+
+    await client.query('COMMIT');
+    logger.info(`Template ${templateId} mis à jour par utilisateur ${userId}`);
+
+    return result.rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur mise à jour template:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Supprimer un template
+ */
+async function deleteTemplate(templateId, userId) {
+  const client = await query.pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const template = await getTemplateById(templateId);
+
+    // Ne pas supprimer si approuvé
+    if (template.status === 'approved') {
+      throw { statusCode: 400, message: 'Impossible de supprimer un template approuvé' };
+    }
+
+    await client.query('DELETE FROM templates WHERE id = $1', [templateId]);
+
+    await client.query('COMMIT');
+    logger.info(`Template ${templateId} supprimé par utilisateur ${userId}`);
+
+    return { success: true };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Erreur suppression template:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Dupliquer un template
+ */
+async function duplicateTemplate(templateId, userId) {
+  const template = await getTemplateById(templateId);
+
+  const newTemplateData = {
+    name: `${template.name}_copy_${Date.now()}`,
+    language: template.language,
+    category: template.category,
+    header_type: template.header_type,
+    header_content: template.header_content,
+    body_content: template.body_content,
+    footer_content: template.footer_content,
+    buttons: template.buttons,
+    status: 'draft'
+  };
+
+  return createTemplate(userId, newTemplateData);
+}
+
+/**
+ * Tester un template avec des variables d'exemple
+ */
+function previewTemplate(template, variables = {}) {
+  let preview = {
+    header: template.header_content || '',
+    body: template.body_content || '',
+    footer: template.footer_content || '',
+    buttons: template.buttons || []
+  };
+
+  // Remplacer les variables dans le header
+  if (template.header_type === 'text' && template.header_content) {
+    preview.header = replaceVariables(template.header_content, variables);
+  }
+
+  // Remplacer les variables dans le body
+  preview.body = replaceVariables(template.body_content, variables);
+
+  // Remplacer les variables dans le footer
+  if (template.footer_content) {
+    preview.footer = replaceVariables(template.footer_content, variables);
+  }
+
+  return preview;
+}
+
+/**
+ * Remplacer les variables dans un texte
+ */
+function replaceVariables(text, variables) {
+  if (!text) return text;
+
+  return text.replace(/{{(\d+)}}/g, (match, index) => {
+    const varIndex = parseInt(index);
+    return variables[varIndex] || match;
+  });
+}
+
+module.exports = {
+  createTemplate,
+  submitTemplateToMeta,
+  getTemplates,
+  getTemplateById,
+  updateTemplate,
+  deleteTemplate,
+  duplicateTemplate,
+  refreshTemplateStatus,
+  previewTemplate,
+  extractVariables,
+  replaceVariables
+};

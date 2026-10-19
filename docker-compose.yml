@@ -1,0 +1,73 @@
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: nextltd-api
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    env_file:
+      - ./api/.env               # ← Charge toutes les variables de api/.env
+    # Tu peux aussi ajouter ou surcharger des variables ici si besoin
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - ./api:/app               # optionnel en dev, à retirer en prod
+    networks:
+      - app-network
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: nextltd-dashboard
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    env_file:
+      - ./dashboard/.env.local   # ← Charge dashboard/.env.local
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - api
+    networks:
+      - app-network
+
+  vitrine:
+    build:
+      context: ./vitrine
+      dockerfile: Dockerfile
+    container_name: nextltd-vitrine
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./vitrine/.env.local     # ← Charge vitrine/.env.local
+    environment:
+      - NODE_ENV=production
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: nextltd-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"                # décommente si tu ajoutes SSL
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs  # décommente si tu as des certificats
+    depends_on:
+      - api
+      - dashboard
+      - vitrine
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,0 +1,1694 @@
+// api/src/services/socadel-invoice-report.service.js
+// Rapport de distribution des factures Socadel par WhatsApp (émission à venir)
+'use strict';
+
+const fs = require('fs');
+const nodemailer = require('nodemailer');
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const QUERY_TIMEOUT_MS = parseInt(process.env.SOCADEL_INVOICE_QUERY_TIMEOUT_MS || '90000', 10);
+const MIN_VOLUME = parseInt(process.env.SOCADEL_INVOICE_MIN_VOLUME || '20', 10); // volume mini pour classer une agence
+const TARGET_SUCCESS = parseFloat(process.env.SOCADEL_INVOICE_TARGET_SUCCESS || '90'); // objectif taux de succès (%)
+const FOCUS_CATEGORY = (process.env.SOCADEL_INVOICE_FOCUS_CATEGORY || 'CCOM').toUpperCase(); // catégorie en focus (gros clients)
+const TARGET_RECOUV = parseFloat(process.env.SOCADEL_INVOICE_TARGET_RECOUV || '60'); // objectif recouvrement (%)
+
+/* ───────────────────────── Helpers ───────────────────────── */
+const nbsp = (s) => String(s).replace(/[\u202f\u00a0]/g, '\u00a0');
+const fmt = (n) => nbsp(Math.round(Number(n || 0)).toLocaleString('fr-FR'));
+const fmtPct = (n) => nbsp(`${Number(n || 0).toFixed(1).replace('.', ',')} %`);
+const fmtDec = (n, d = 1) => Number(n || 0).toFixed(d).replace('.', ',');
+const fmtK = (n) => {
+  const v = Number(n || 0);
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1).replace('.', ',')}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(v >= 1e4 ? 0 : 1).replace('.', ',')}k`;
+  return String(Math.round(v));
+};
+const money = (n) => {
+  const v = Number(n || 0);
+  if (v >= 1e9) return nbsp(`${(v / 1e9).toFixed(2).replace('.', ',')} Md FCFA`);
+  if (v >= 1e6) return nbsp(`${(v / 1e6).toFixed(1).replace('.', ',')} M FCFA`);
+  return nbsp(`${fmt(v)} FCFA`);
+};
+const fmtHours = (h) => {
+  if (h == null || Number.isNaN(Number(h))) return '—';
+  h = Number(h);
+  if (h < 1) return nbsp(`${Math.round(h * 60)} min`);
+  if (h < 48) return nbsp(`${fmtDec(h)} h`);
+  return nbsp(`${fmtDec(h / 24)} j`);
+};
+const fmtDays = (d) => (d == null || Number.isNaN(Number(d)) ? '—' : nbsp(`${fmtDec(d)} j`));
+const esc = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+function pct(num, den) {
+  if (!den || den <= 0) return 0;
+  return Math.round((Number(num) / Number(den)) * 1000) / 10;
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+function toDay(v) {
+  if (v instanceof Date) return v;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v));
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(v);
+}
+const ymd = (v) => {
+  const d = toDay(v);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const dm = (v) => {
+  if (!v) return '—';
+  const d = toDay(v);
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`;
+};
+const maskPhone = (t) => {
+  const s = String(t || '');
+  return s ? s.slice(0, 4) + s.slice(4).replace(/\d(?=\d{4})/g, '•') : '';
+};
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timeout ${label} ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function step(label, fn, fallback) {
+  const t0 = Date.now();
+  try {
+    const r = await withTimeout(fn(), QUERY_TIMEOUT_MS, label);
+    logger.info(`[SOCADEL-INVOICE] ${label} OK (+${Date.now() - t0}ms)`);
+    return r;
+  } catch (err) {
+    console.error(`[SOCADEL-INVOICE] ${label} ÉCHEC: ${err.message}`);
+    try {
+      logger.error(`[SOCADEL-INVOICE] ${label} ÉCHEC: ${err.message}`);
+    } catch (_) {}
+    if (fallback === undefined) throw err;
+    return fallback;
+  }
+}
+
+/* ───────────────────────── SQL ─────────────────────────
+ * Périmètre : factures du cycle/année (émission à venir) de mysql_invoices_all,
+ * rapprochées des paiements oracle_payments (num_rec = numero_facture).
+ * Paramètres : $1 = cycle, $2 = année.
+ *
+ * Définitions :
+ *  tried      = transmis avec succès à Meta (sent, delivered, read, failed)
+ *  delivered  = distribuée (delivered ou read)
+ *  paid       = paiement enregistré (montant_paye > 0)
+ *  delay_pay  = date de paiement - jour de distribution (jours)
+ *
+ * Statuts WhatsApp observés :
+ *  pending / processing → pas encore transmis à Meta
+ *  sent / queued        → accepté par Meta, accusé de livraison en attente
+ *  delivered / read     → distribué (arrivé sur le téléphone)
+ *  failed               → échec
+ *  skipped              → volontairement non envoyé (Ignoré)
+ */
+const BASE = `
+WITH t AS (SELECT (NOW() AT TIME ZONE 'Africa/Douala')::date AS today),
+r AS (
+  SELECT
+    COALESCE(NULLIF(i.region, ''),    'Non renseigné') AS region,
+    COALESCE(NULLIF(i.division, ''),  'Non renseigné') AS division,
+    COALESCE(NULLIF(i.mrc, ''),       'Non renseigné') AS mrc,
+    COALESCE(NULLIF(i.agence, ''),    'Non renseigné') AS agence,
+    COALESCE(NULLIF(i.categorie, ''), 'Non renseigné') AS categorie,
+    i.nom_client, i.numero_contrat, i.numero_facture, i.telephone,
+    COALESCE(i.montant, 0)::float8 AS montant,
+    i.due_date, i.date_creation,
+    COALESCE(i.whatsapp_status, 'pending') AS st,
+    i.whatsapp_sent_at AS sent_at,
+    COALESCE(i.whatsapp_attempts, 0) AS attempts,
+    i.whatsapp_error AS err,
+    (i.contact_ws_status = 'valid') AS is_valid,
+    (p.num_rec IS NOT NULL AND COALESCE(p.montant_paye, 0) > 0) AS paid,
+    COALESCE(p.montant_paye, 0)::float8 AS montant_paye,
+    CASE WHEN p.date_paiement ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}$'
+         THEN to_date(p.date_paiement, 'DD/MM/YY') END AS pay_date,
+    (i.whatsapp_sent_at AT TIME ZONE 'Africa/Douala')::date AS sent_day
+  FROM mysql_invoices_all i
+  LEFT JOIN oracle_payments p ON p.num_rec = i.numero_facture
+  WHERE i.cycle = $1 AND i.annee = $2
+),
+b AS (
+  SELECT r.*,
+    t.today,
+    (r.st IN ('sent', 'delivered', 'read', 'failed')) AS tried,
+    (r.st IN ('delivered', 'read')) AS delivered,
+    CASE WHEN r.paid AND r.pay_date IS NOT NULL AND r.sent_day IS NOT NULL
+         THEN r.pay_date - r.sent_day END AS delay_pay,
+    CASE WHEN r.sent_at IS NOT NULL AND r.date_creation IS NOT NULL AND r.sent_at >= r.date_creation
+         THEN EXTRACT(EPOCH FROM (r.sent_at - r.date_creation)) / 3600.0 END AS delay_dist_h
+  FROM r CROSS JOIN t
+)`;
+
+const METRICS = `
+  COUNT(*)::int AS total,
+  COALESCE(SUM(montant), 0)::float8 AS montant,
+  COUNT(*) FILTER (WHERE is_valid)::int AS valides,
+  COUNT(*) FILTER (WHERE tried)::int AS envoyees,
+  COUNT(*) FILTER (WHERE delivered)::int AS distribuees,
+  COUNT(*) FILTER (WHERE st = 'read')::int AS lues,
+  COUNT(*) FILTER (WHERE st = 'failed')::int AS echecs,
+  COALESCE(SUM(montant) FILTER (WHERE delivered), 0)::float8 AS montant_distribue,
+  COUNT(*) FILTER (WHERE delivered AND paid)::int AS payees,
+  COALESCE(SUM(montant_paye) FILTER (WHERE delivered AND paid), 0)::float8 AS montant_paye,
+  AVG(delay_pay) FILTER (WHERE delivered AND paid AND delay_pay >= 0)::float8 AS delai_paiement,
+  AVG(delay_dist_h)::float8 AS delai_dist_h`;
+
+const SUM_KEYS = [
+  'total', 'montant', 'valides', 'envoyees', 'distribuees', 'lues', 'echecs',
+  'montant_distribue', 'payees', 'montant_paye',
+];
+
+function enrich(r) {
+  const o = { ...r };
+  o.tx_valide = pct(r.valides, r.total);
+  o.tx_envoi = pct(r.envoyees, r.total);
+  // Taux de succès PRINCIPAL = distribuées / contacts valides (ce qui a réellement été transmis)
+  o.tx_succes = pct(r.distribuees, r.valides);
+  o.tx_succes_valides = o.tx_succes; // alias
+  // Taux global (tous contacts) — secondaire
+  o.tx_succes_global = pct(r.distribuees, r.total);
+  o.tx_lecture = pct(r.lues, r.distribuees);
+  o.tx_echec = pct(r.echecs, r.envoyees);
+  o.tx_recouv = Math.min(100, pct(r.montant_paye, r.montant_distribue));
+  o.tx_paiement = pct(r.payees, r.distribuees);
+  // Score composite : 40 % succès (sur valides) + 20 % lecture + 40 % recouvrement
+  o.score = Math.round((0.4 * o.tx_succes + 0.2 * o.tx_lecture + 0.4 * o.tx_recouv) * 10) / 10;
+  return o;
+}
+
+function sumRows(rows) {
+  const s = Object.fromEntries(SUM_KEYS.map((k) => [k, 0]));
+  let dp = 0;
+  for (const r of rows) {
+    for (const k of SUM_KEYS) s[k] += Number(r[k] || 0);
+    dp += Number(r.delai_paiement || 0) * Number(r.payees || 0);
+  }
+  s.delai_paiement = s.payees ? dp / s.payees : null;
+  return enrich(s);
+}
+
+async function resolveCycle(opts = {}) {
+  const y = opts.annee || process.env.SOCADEL_INVOICE_YEAR;
+  const c = opts.cycle || process.env.SOCADEL_INVOICE_CYCLE;
+  if (y && c) return { annee: +y, cycle: +c };
+  const r = await query(`
+    SELECT annee, cycle FROM mysql_invoices_all
+    WHERE annee IS NOT NULL AND cycle IS NOT NULL
+    ORDER BY annee DESC, cycle DESC LIMIT 1`);
+  if (!r.rows[0]) throw new Error('Aucune facture trouvée dans mysql_invoices_all');
+  return { annee: r.rows[0].annee, cycle: r.rows[0].cycle };
+}
+
+const run = async (sql, params) => (await query(sql, params)).rows;
+
+async function fetchGlobal(p) {
+  const rows = await run(
+    `${BASE}
+     SELECT ${METRICS},
+       (SELECT today FROM t) AS today,
+       COUNT(DISTINCT numero_contrat)::int AS contrats,
+       COUNT(*) FILTER (WHERE NOT is_valid)::int AS invalides,
+       COUNT(*) FILTER (WHERE st = 'pending')::int AS pending,
+       COUNT(*) FILTER (WHERE st = 'processing')::int AS processing,
+       COUNT(*) FILTER (WHERE st = 'queued')::int AS queued,
+       COUNT(*) FILTER (WHERE st = 'sent')::int AS sent,
+       COUNT(*) FILTER (WHERE st = 'skipped')::int AS skipped,
+       COUNT(*) FILTER (WHERE attempts > 1)::int AS retries,
+       COUNT(*) FILTER (WHERE paid)::int AS payees_total,
+       COUNT(*) FILTER (WHERE st = 'read' AND paid)::int AS payees_lues,
+       COALESCE(SUM(montant_paye) FILTER (WHERE paid), 0)::float8 AS montant_paye_total,
+       COUNT(*) FILTER (WHERE delivered AND paid AND delay_pay < 0)::int AS payees_avant_dist,
+       COUNT(*) FILTER (WHERE delivered AND paid AND pay_date <= due_date)::int AS payees_avant_echeance,
+       COUNT(*) FILTER (WHERE NOT delivered AND NOT paid)::int AS nd_np,
+       COALESCE(SUM(montant) FILTER (WHERE NOT delivered AND NOT paid), 0)::float8 AS nd_np_montant,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delay_dist_h) AS dist_med_h,
+       PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY delay_dist_h) AS dist_p90_h,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delay_pay::float8)
+         FILTER (WHERE delivered AND paid AND delay_pay >= 0) AS pay_med,
+       PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY delay_pay::float8)
+         FILTER (WHERE delivered AND paid AND delay_pay >= 0) AS pay_p90,
+       MIN(due_date) AS due_min, MAX(due_date) AS due_max,
+       MIN(sent_at) AS first_sent, MAX(sent_at) AS last_sent
+     FROM b`,
+    [p.cycle, p.annee]
+  );
+  return rows[0];
+}
+
+const fetchStatus = (p) =>
+  run(`${BASE} SELECT st, COUNT(*)::int AS nb, COALESCE(SUM(montant),0)::float8 AS montant
+       FROM b GROUP BY st ORDER BY nb DESC`, [p.cycle, p.annee]);
+
+/**
+ * Classification des causes d'échec à partir des vrais messages whatsapp_error.
+ * Ordre important : les motifs les plus spécifiques en premier.
+ */
+const fetchErrors = (p) =>
+  run(
+    `${BASE}
+     SELECT CASE
+       WHEN err IS NULL OR err = '' THEN 'Cause non renseignée'
+
+       -- Délai minimum 24 h (cooldown entre messages)
+       WHEN err ILIKE '%Délai minimum de 24 heures%'
+         OR err ILIKE '%délai minimum%'
+         OR err ILIKE '%24 heure%'
+         THEN 'Délai minimum 24 h non respecté'
+
+       -- Limite de débit / spam
+       WHEN err ILIKE '%Spam Rate limit%'
+         OR err ILIKE '%rate limit%'
+         OR err ILIKE '%rate%limit%'
+         OR err ILIKE '%130429%'
+         OR err ILIKE '%throttl%'
+         THEN 'Limite de débit / spam'
+
+       -- Destinataire a bloqué les messages marketing
+       WHEN err ILIKE '%stop receiving marketing%'
+         OR err ILIKE '%chosen to stop%'
+         OR err ILIKE '%opt-out%'
+         OR err ILIKE '%opted out%'
+         OR err ILIKE '%131050%'
+         OR err ILIKE '%block%'
+         THEN 'Bloqué / désabonné (messages marketing)'
+
+       -- Restriction qualité Meta
+       WHEN err ILIKE '%restricted it for higher quality%'
+         OR err ILIKE '%higher quality messaging%'
+         OR err ILIKE '%Message undeliverable as Meta%'
+         THEN 'Restriction qualité Meta'
+
+       -- Numéro invalide / sans WhatsApp
+       WHEN err ILIKE '%not a valid%'
+         OR err ILIKE '%invalid%'
+         OR err ILIKE '%131026%'
+         OR err ILIKE '%not registered%'
+         OR err ILIKE '%no whatsapp%'
+         OR err ILIKE '%Parameter value is not valid%'
+         OR err ILIKE '%131009%'
+         THEN 'Numéro invalide / paramètre incorrect'
+
+       -- Expérience / test Meta
+       WHEN err ILIKE '%part of an experiment%'
+         OR err ILIKE '%experiment%'
+         THEN 'Numéro en expérience Meta'
+
+       -- Erreurs techniques / réseau
+       WHEN err ILIKE '%Service temporarily unavailable%'
+         OR err ILIKE '%OAuthException%#2%'
+         OR err ILIKE '%SSL connection%'
+         OR err ILIKE '%Bad Gateway%'
+         OR err ILIKE '%502%'
+         OR err ILIKE '%404%'
+         OR err ILIKE '%Not Found%'
+         OR err ILIKE '%timeout%'
+         OR err ILIKE '%network%'
+         OR err ILIKE '%econn%'
+         OR err ILIKE '%unavailable%'
+         OR err ILIKE '%Response status code does not indicate success%'
+         THEN 'Erreur technique / réseau'
+
+       -- Media / template
+       WHEN err ILIKE '%Media upload%'
+         OR err ILIKE '%template%'
+         THEN 'Erreur média / modèle'
+
+       -- Message non délivrable générique
+       WHEN err ILIKE '%Message undeliverable%'
+         OR err ILIKE '%undeliverable%'
+         THEN 'Message non délivrable'
+
+       -- Catch-all
+       WHEN err ILIKE '%Something went wrong%'
+         THEN 'Erreur indéterminée (Something went wrong)'
+
+       ELSE 'Autre cause'
+     END AS cause,
+       COUNT(*)::int AS nb,
+       COALESCE(SUM(montant),0)::float8 AS montant
+     FROM b
+     WHERE st = 'failed'
+     GROUP BY 1
+     ORDER BY nb DESC`,
+    [p.cycle, p.annee]
+  );
+
+const fetchErrorsRaw = (p) =>
+  run(
+    `${BASE}
+     SELECT LEFT(err, 120) AS err, COUNT(*)::int AS nb
+     FROM b WHERE st = 'failed' AND err IS NOT NULL AND err <> ''
+     GROUP BY 1 ORDER BY nb DESC LIMIT 8`,
+    [p.cycle, p.annee]
+  );
+
+/** Raisons des factures ignorées (skipped) */
+const fetchSkippedReasons = (p) =>
+  run(
+    `${BASE}
+     SELECT
+       CASE
+         WHEN err IS NULL OR err = '' THEN 'Cause non renseignée'
+         ELSE LEFT(err, 90)
+       END AS raison,
+       COUNT(*)::int AS nb,
+       COALESCE(SUM(montant),0)::float8 AS montant
+     FROM b
+     WHERE st = 'skipped'
+     GROUP BY 1
+     ORDER BY nb DESC
+     LIMIT 20`,
+    [p.cycle, p.annee]
+  );
+
+const fetchAttempts = (p) =>
+  run(
+    `${BASE}
+     SELECT attempts, COUNT(*)::int AS nb,
+       COUNT(*) FILTER (WHERE delivered)::int AS distribuees,
+       COUNT(*) FILTER (WHERE st = 'failed')::int AS echecs
+     FROM b WHERE tried GROUP BY attempts ORDER BY attempts`,
+    [p.cycle, p.annee]
+  );
+
+const fetchDaily = (p) =>
+  run(
+    `${BASE},
+     d AS (
+       SELECT generate_series(
+         GREATEST(
+           (SELECT today FROM t) - 30,
+           LEAST(
+             COALESCE((SELECT MIN(sent_day) FROM b), (SELECT today FROM t)),
+             COALESCE((SELECT MIN(pay_date) FROM b), (SELECT today FROM t))
+           )
+         ),
+         (SELECT today FROM t), '1 day'::interval)::date AS jour
+     ),
+     s AS (
+       SELECT sent_day AS jour,
+         COUNT(*) FILTER (WHERE tried)::int AS envoyees,
+         COUNT(*) FILTER (WHERE delivered)::int AS distribuees,
+         COUNT(*) FILTER (WHERE st = 'failed')::int AS echecs,
+         COALESCE(SUM(montant) FILTER (WHERE delivered), 0)::float8 AS montant_distribue
+       FROM b WHERE sent_day IS NOT NULL GROUP BY 1
+     ),
+     pm AS (
+       SELECT pay_date AS jour, COUNT(*)::int AS payees,
+         COALESCE(SUM(montant_paye), 0)::float8 AS montant_paye
+       FROM b WHERE paid AND pay_date IS NOT NULL GROUP BY 1
+     )
+     SELECT d.jour,
+       COALESCE(s.envoyees, 0) AS envoyees, COALESCE(s.distribuees, 0) AS distribuees,
+       COALESCE(s.echecs, 0) AS echecs, COALESCE(s.montant_distribue, 0) AS montant_distribue,
+       COALESCE(pm.payees, 0) AS payees, COALESCE(pm.montant_paye, 0) AS montant_paye
+     FROM d LEFT JOIN s ON s.jour = d.jour LEFT JOIN pm ON pm.jour = d.jour
+     ORDER BY d.jour`,
+    [p.cycle, p.annee]
+  );
+
+const fetchDailyRegion = (p) =>
+  run(
+    `${BASE}
+     SELECT sent_day AS jour, region, COUNT(*)::int AS nb
+     FROM b WHERE delivered AND sent_day IS NOT NULL
+     GROUP BY 1, 2 ORDER BY 1, 2`,
+    [p.cycle, p.annee]
+  );
+
+const fetchPayBuckets = (p) =>
+  run(
+    `${BASE}
+     SELECT ord, COUNT(*)::int AS nb, COALESCE(SUM(montant_paye),0)::float8 AS montant FROM (
+       SELECT CASE WHEN delay_pay < 0 THEN 0 WHEN delay_pay = 0 THEN 1 WHEN delay_pay = 1 THEN 2
+                   WHEN delay_pay <= 3 THEN 3 WHEN delay_pay <= 7 THEN 4 WHEN delay_pay <= 15 THEN 5 ELSE 6 END AS ord,
+              montant_paye
+       FROM b WHERE delivered AND paid AND delay_pay IS NOT NULL
+     ) x GROUP BY ord ORDER BY ord`,
+    [p.cycle, p.annee]
+  );
+
+const fetchEcheancier = (p) =>
+  run(
+    `${BASE}
+     SELECT ord, COUNT(*)::int AS nb, COALESCE(SUM(montant),0)::float8 AS montant FROM (
+       SELECT CASE
+         WHEN due_date IS NULL THEN 10
+         WHEN due_date - today < -30 THEN 0 WHEN due_date - today < -15 THEN 1
+         WHEN due_date - today < -7 THEN 2 WHEN due_date - today < 0 THEN 3
+         WHEN due_date - today = 0 THEN 4 WHEN due_date - today = 1 THEN 5
+         WHEN due_date - today = 2 THEN 6 WHEN due_date - today = 3 THEN 7
+         WHEN due_date - today <= 7 THEN 8 ELSE 9 END AS ord,
+         montant
+       FROM b WHERE delivered AND NOT paid
+     ) x GROUP BY ord ORDER BY ord`,
+    [p.cycle, p.annee]
+  );
+
+// whereSql est une constante interne (jamais issue d'une saisie utilisateur)
+const RELANCE_SOON = 'due_date IS NOT NULL AND due_date >= today AND due_date <= today + 3';
+const RELANCE_LATE = 'due_date IS NOT NULL AND due_date < today';
+const fetchRelance = (p, whereSql, limit) =>
+  run(
+    `${BASE}
+     SELECT nom_client, numero_contrat, numero_facture, agence, mrc, division, region, categorie, telephone,
+       montant, due_date, (due_date - today)::int AS jours, st
+     FROM b WHERE delivered AND NOT paid AND ${whereSql}
+     ORDER BY montant DESC LIMIT $3`,
+    [p.cycle, p.annee, limit]
+  );
+
+const fetchPareto = (p) =>
+  run(
+    `${BASE},
+     k AS (SELECT b.*, ROW_NUMBER() OVER (ORDER BY montant DESC, numero_facture) AS rn,
+                  COUNT(*) OVER () AS n FROM b)
+     SELECT CASE WHEN rn <= CEIL(0.2 * n) THEN 'top' ELSE 'rest' END AS seg, ${METRICS}
+     FROM k GROUP BY 1`,
+    [p.cycle, p.annee]
+  );
+
+const fetchConcentration = (p) =>
+  run(
+    `${BASE},
+     k AS (SELECT montant, ROW_NUMBER() OVER (ORDER BY montant DESC) AS rn,
+                  COUNT(*) OVER () AS n,
+                  SUM(montant) OVER (ORDER BY montant DESC ROWS UNBOUNDED PRECEDING) AS cum,
+                  SUM(montant) OVER () AS tot FROM b)
+     SELECT MIN(rn)::int AS k80, MAX(n)::int AS n, MAX(tot)::float8 AS tot
+     FROM k WHERE cum >= 0.8 * tot`,
+    [p.cycle, p.annee]
+  );
+
+const fetchBigUnpaid = (p) =>
+  run(
+    `${BASE}
+     SELECT nom_client, agence, categorie, montant, due_date, st
+     FROM b WHERE NOT paid ORDER BY montant DESC LIMIT 10`,
+    [p.cycle, p.annee]
+  );
+
+const fetchChannel = (p) =>
+  run(
+    `${BASE}
+     SELECT CASE WHEN st = 'read' THEN 'lue' WHEN st = 'delivered' THEN 'delivree' ELSE 'non_distribuee' END AS seg,
+       COUNT(*)::int AS total, COALESCE(SUM(montant),0)::float8 AS montant,
+       COUNT(*) FILTER (WHERE paid)::int AS payees,
+       COALESCE(SUM(montant_paye),0)::float8 AS montant_paye
+     FROM b GROUP BY 1`,
+    [p.cycle, p.annee]
+  );
+
+/**
+ * Rapport clients / téléphones WhatsApp :
+ *
+ *  socadel_contacts  = CIBLE : tous les service_no qui doivent avoir un n° WhatsApp valide
+ *  db_client_valid   = référentiel des clients déjà validés
+ *
+ * IMPORTANT : confirmés / nouveaux / total unique se calculent sur les NUMÉROS DE TÉLÉPHONE
+ *   socadel_contacts.numero_telephone  ↔  db_client_valid.telephone
+ * (pas sur service_no / numero_contrat)
+ *
+ * Indicateurs :
+ *  cible              = COUNT(service_no) dans socadel_contacts
+ *  valides            = COUNT(numero_contrat) dans db_client_valid
+ *  confirmes          = n° téléphone présents dans les 2 tables
+ *  nouveaux           = n° téléphone dans socadel_contacts absents de db_client_valid
+ *  total_unique       = DISTINCT n° téléphone des 2 tables (union)
+ *  reste_a_collecter  = cible − total unique
+ *  abonnes            = statut = ABONNE dans socadel_contacts
+ */
+async function fetchValidClients() {
+  const rows = await run(`
+    WITH
+    -- Cible : un service_no = un client à couvrir
+    contacts AS (
+      SELECT
+        TRIM(service_no) AS service_no,
+        NULLIF(TRIM(numero_telephone), '') AS phone,
+        UPPER(TRIM(COALESCE(statut, ''))) AS statut
+      FROM socadel_contacts
+      WHERE service_no IS NOT NULL AND TRIM(service_no) <> ''
+    ),
+    -- Référentiel validé : numéros de téléphone déjà connus
+    valides_phones AS (
+      SELECT DISTINCT NULLIF(TRIM(telephone), '') AS phone
+      FROM db_client_valid
+      WHERE telephone IS NOT NULL AND TRIM(telephone) <> ''
+    ),
+    valides_contrats AS (
+      SELECT COUNT(DISTINCT TRIM(numero_contrat))::int AS nb
+      FROM db_client_valid
+      WHERE numero_contrat IS NOT NULL AND TRIM(numero_contrat) <> ''
+    ),
+    -- Téléphones distincts de la collecte
+    contacts_phones AS (
+      SELECT DISTINCT phone FROM contacts WHERE phone IS NOT NULL
+    ),
+    -- Confirmés = n° téléphone présents dans les 2 bases
+    confirmes_phones AS (
+      SELECT c.phone
+      FROM contacts_phones c
+      INNER JOIN valides_phones v ON v.phone = c.phone
+    ),
+    -- Nouveaux = n° téléphone collectés absents du référentiel
+    nouveaux_phones AS (
+      SELECT c.phone
+      FROM contacts_phones c
+      LEFT JOIN valides_phones v ON v.phone = c.phone
+      WHERE v.phone IS NULL
+    ),
+    -- Union des n° téléphone (sans doublons)
+    all_phones AS (
+      SELECT phone FROM contacts_phones
+      UNION
+      SELECT phone FROM valides_phones
+    )
+    SELECT
+      (SELECT COUNT(*)::int FROM contacts) AS cible,
+      (SELECT nb FROM valides_contrats) AS valides,
+      (SELECT COUNT(*)::int FROM contacts WHERE statut = 'ABONNE') AS abonnes,
+      (SELECT COUNT(*)::int FROM confirmes_phones) AS confirmes,
+      (SELECT COUNT(*)::int FROM nouveaux_phones) AS nouveaux,
+      (SELECT COUNT(*)::int FROM all_phones) AS total_unique
+  `);
+  const r = rows[0] || {};
+  const cible = Number(r.cible || 0);
+  const confirmes = Number(r.confirmes || 0);
+  const nouveaux = Number(r.nouveaux || 0);
+  const total_unique = Number(r.total_unique || 0);
+  return {
+    cible,
+    total: cible,
+    valides: Number(r.valides || 0),
+    abonnes: Number(r.abonnes || 0),
+    confirmes,
+    nouveaux,
+    a_confirmer: nouveaux,
+    total_unique,
+    valides_hors: 0,
+    // Reste WhatsApp à collecter = cible − total unique
+    reste_a_collecter: Math.max(0, cible - total_unique),
+  };
+}
+
+// where : condition SQL interne (constante), éventuellement avec $3 = valeur passée dans extra
+async function fetchDim(p, expr, { order = 'total DESC', parent = null, where = '', extra = [] } = {}) {
+  const rows = await run(
+    `${BASE}
+     SELECT ${expr} AS label, ${parent ? `MIN(${parent}) AS parent,` : ''} ${METRICS}
+     FROM b ${where ? `WHERE ${where}` : ''} GROUP BY 1 ORDER BY ${order}`,
+    [p.cycle, p.annee, ...extra]
+  );
+  return rows.map(enrich);
+}
+
+const TRANCHE_EXPR = `CASE
+  WHEN montant < 5000 THEN '< 5 000'
+  WHEN montant < 10000 THEN '5 000 – 10 000'
+  WHEN montant < 25000 THEN '10 000 – 25 000'
+  WHEN montant < 50000 THEN '25 000 – 50 000'
+  WHEN montant < 100000 THEN '50 000 – 100 000'
+  WHEN montant < 500000 THEN '100 000 – 500 000'
+  ELSE '≥ 500 000' END`;
+
+/* ───────────────────────── Assemblage ───────────────────────── */
+async function buildReportData(opts = {}) {
+  const t0 = Date.now();
+  const p = await resolveCycle(opts);
+  logger.info(`[SOCADEL-INVOICE] collecte données cycle ${p.cycle}/${p.annee}…`);
+
+  const [
+    globalRow, status, errors, errorsRaw, skippedReasons, attempts, daily, dailyRegion, payBuckets, echeancier,
+    relanceSoon, relanceLate, pareto, conc, bigUnpaid, channel,
+    byCategorie, byRegion, byDivision, byMrc, byAgence, byTranche, focusRegion,
+    validClients,
+  ] = await Promise.all([
+    step('global', () => fetchGlobal(p)),
+    step('statuts', () => fetchStatus(p), []),
+    step('causes échecs', () => fetchErrors(p), []),
+    step('messages d’erreur', () => fetchErrorsRaw(p), []),
+    step('raisons ignorés', () => fetchSkippedReasons(p), []),
+    step('tentatives', () => fetchAttempts(p), []),
+    step('journalier', () => fetchDaily(p), []),
+    step('journalier par région', () => fetchDailyRegion(p), []),
+    step('délais de paiement', () => fetchPayBuckets(p), []),
+    step('échéancier', () => fetchEcheancier(p), []),
+    step('relance ≤ 3 j', () => fetchRelance(p, RELANCE_SOON, 5000), []),
+    step('relance échues', () => fetchRelance(p, RELANCE_LATE, 5000), []),
+    step('pareto', () => fetchPareto(p), []),
+    step('concentration', () => fetchConcentration(p), []),
+    step('gros impayés', () => fetchBigUnpaid(p), []),
+    step('impact canal', () => fetchChannel(p), []),
+    step('catégories', () => fetchDim(p, 'categorie'), []),
+    step('régions', () => fetchDim(p, 'region'), []),
+    step('divisions', () => fetchDim(p, 'division', { parent: 'region' }), []),
+    step('mrc', () => fetchDim(p, 'mrc', { parent: 'division' }), []),
+    step('agences', () => fetchDim(p, 'agence', { parent: 'division' }), []),
+    step('tranches', () => fetchDim(p, TRANCHE_EXPR, { order: 'MIN(montant)' }), []),
+    step('focus catégorie par région', () => fetchDim(p, 'region', { where: 'UPPER(categorie) = $3', extra: [FOCUS_CATEGORY] }), []),
+    step('clients valides', () => fetchValidClients(), {
+      cible: 0, total: 0, valides: 0, abonnes: 0, confirmes: 0, nouveaux: 0, a_confirmer: 0,
+      total_unique: 0, valides_hors: 0, reste_a_collecter: 0,
+    }),
+  ]);
+
+  const global = enrich(globalRow);
+
+  const paretoRows = Object.fromEntries(pareto.map((r) => [r.seg, enrich(r)]));
+  const c80 = conc[0] || {};
+
+  const eligible = byAgence.filter((a) => a.total >= MIN_VOLUME);
+  const sorted = [...eligible].sort((a, b) => b.score - a.score || b.total - a.total);
+  const top = sorted.slice(0, 10);
+  const flop = sorted.length > 10 ? sorted.slice(-Math.min(10, sorted.length - 10)).reverse() : [];
+
+  const data = {
+    generatedAt: new Date().toISOString(),
+    cycle: p.cycle,
+    annee: p.annee,
+    today: global.today,
+    global,
+    status,
+    errors,
+    errorsRaw,
+    skippedReasons,
+    attempts,
+    daily,
+    dailyRegion,
+    payBuckets,
+    echeancier,
+    relanceSoon,
+    relanceLate,
+    pareto: { top: paretoRows.top || null, rest: paretoRows.rest || null, k80: c80.k80 || 0, n: c80.n || 0, tot: c80.tot || 0 },
+    bigUnpaid,
+    channel,
+    byCategorie, byRegion, byDivision, byMrc, byAgence, byTranche, focusRegion,
+    ranking: { top, flop },
+    validClients,
+  };
+  logger.info(`[SOCADEL-INVOICE] données prêtes en ${Date.now() - t0}ms`);
+  return data;
+}
+
+/* ───────────────────────── Analyse automatique ───────────────────────── */
+const ech = (data, ords) => {
+  const rows = (data.echeancier || []).filter((r) => ords.includes(r.ord));
+  return { nb: rows.reduce((a, r) => a + r.nb, 0), montant: rows.reduce((a, r) => a + r.montant, 0) };
+};
+
+function buildInsights(data) {
+  const g = data.global;
+  const facts = [];
+  const alerts = [];
+  const recos = [];
+
+  facts.push(
+    `<b>${fmt(g.distribuees)}</b> factures distribuées sur <b>${fmt(g.valides)}</b> contacts valides, soit un taux de succès de <b>${fmtPct(g.tx_succes)}</b> (global ${fmtPct(g.tx_succes_global)} sur ${fmt(g.total)} · ${money(g.montant_distribue)}).`
+  );
+  facts.push(`<b>${fmtPct(g.tx_lecture)}</b> des factures délivrées ont été lues (${fmt(g.lues)} lectures).`);
+  const ch = Object.fromEntries((data.channel || []).map((r) => [r.seg, r]));
+  if (ch.lue && ch.non_distribuee && ch.lue.total && ch.non_distribuee.total) {
+    facts.push(
+      `Taux de paiement : <b>${fmtPct(pct(ch.lue.payees, ch.lue.total))}</b> pour les factures lues, contre ${fmtPct(pct(ch.non_distribuee.payees, ch.non_distribuee.total))} pour les non distribuées.`
+    );
+  } else {
+    facts.push(`<b>${money(g.montant_paye)}</b> encaissés sur les factures distribuées (recouvrement ${fmtPct(g.tx_recouv)}).`);
+  }
+
+  const vc = data.validClients || {};
+  if ((vc.cible || vc.total) > 0) {
+    const cible = vc.cible || vc.total;
+    facts.push(
+      `Cible WhatsApp : <b>${fmt(cible)}</b> · confirmés <b>${fmt(vc.confirmes)}</b> · nouveaux n° <b>${fmt(vc.nouveaux)}</b> · total contact valide ws <b>${fmt(vc.total_unique)}</b> .  reste à collecter <b>${fmt(vc.reste_a_collecter)}</b>.`
+    );
+  }
+
+  const soon = ech(data, [4, 5, 6, 7]);
+  const late = ech(data, [0, 1, 2, 3]);
+  if (soon.nb > 0)
+    alerts.push(`<b>${fmt(soon.nb)}</b> factures distribuées (${money(soon.montant)}) arrivent à échéance sous 3 jours sans paiement.`);
+  if (late.nb > 0)
+    alerts.push(`<b>${fmt(late.nb)}</b> factures distribuées sont échues et impayées (${money(late.montant)}).`);
+  if (g.tx_echec > 5 && data.errors?.[0])
+    alerts.push(`Taux d'échec de <b>${fmtPct(g.tx_echec)}</b>, principale cause : ${esc(data.errors[0].cause.toLowerCase())}.`);
+  const queue = (g.pending || 0) + (g.processing || 0);
+  if (queue > 0) alerts.push(`<b>${fmt(queue)}</b> factures sont encore en attente d'envoi.`);
+  const under = (data.byAgence || []).filter((a) => a.total >= MIN_VOLUME && a.tx_succes < TARGET_SUCCESS).length;
+  if (under > 0) alerts.push(`<b>${fmt(under)}</b> agences sont sous l'objectif de succès de ${fmt(TARGET_SUCCESS)} %.`);
+  if (vc.a_confirmer > 0)
+    alerts.push(`<b>${fmt(vc.reste_a_collecter)}</b> clients non whatsapp à collecter.`);
+  if (!alerts.length) alerts.push('Aucune alerte majeure sur la période.');
+
+  if (soon.nb > 0) recos.push('Relancer en priorité les factures à échéance sous 3 jours (liste détaillée plus bas et en pièce jointe).');
+  if (g.invalides > 0 || g.echecs > 0)
+    recos.push(`Corriger les numéros en erreur en collectant les numeros ws (${fmt(Math.max(g.invalides, g.echecs))}) en agences ou basculer vers SMS ou Email en cas d'échec persistant.`);
+  if (data.pareto?.top && data.pareto.top.payees < data.pareto.top.distribuees)
+    recos.push('Cibler les gros montants non payés (focus 20/80) par une relance personnalisée.');
+  if (under > 0) recos.push('Accompagner les agences les moins performantes (classement en fin de rapport).');
+  if (late.nb > 0) recos.push('Lancer un plan de recouvrement sur les factures échues, en commençant par les plus anciennes.');
+  if (vc.a_confirmer > 0)
+    recos.push(`Poursuivre la validation des ${fmt(vc.reste_a_collecter)} contacts non encore whatsapp.`);
+  if (!recos.length) recos.push('Maintenir le rythme actuel de distribution et de relance.');
+
+  return { facts, alerts: alerts.slice(0, 5), recos: recos.slice(0, 5) };
+}
+
+/* ───────────────────────── Rendu HTML ───────────────────────── */
+const FONT = "'Segoe UI',Helvetica,Arial,sans-serif";
+const C = {
+  page: '#f1f6f3',
+  dark: '#075e54',
+  mid: '#128c7e',
+  green: '#25d366',
+  light: '#a8e6c3',
+  soft: '#e7f7ee',
+  softer: '#f6fbf8',
+  border: '#d8e8de',
+  text: '#1f2d27',
+  muted: '#66786f',
+  track: '#e3ece7',
+  amber: '#d97706',
+  amberSoft: '#fff6e5',
+  red: '#c0392b',
+  redSoft: '#fdecea',
+  grey: '#9aa8a2',
+};
+
+const TICK_GREY = '#8a9a92';
+const TICK_BLUE = '#34b7f1';
+const STATUS = {
+  pending: { l: "En attente d'envoi", c: '#e9efec' },
+  processing: { l: 'En traitement', c: '#d3ebdc' },
+  queued: { l: "En file d'attente", c: '#d3ebdc' },
+  sent: { l: 'Envoyé · accusé en attente', c: C.light, tick: '✓', tc: TICK_GREY },
+  delivered: { l: 'Délivré (non lu)', c: C.green, tick: '✓✓', tc: TICK_GREY },
+  read: { l: 'Lu', c: C.dark, tick: '✓✓', tc: TICK_BLUE },
+  failed: { l: 'Échec', c: C.red },
+  skipped: { l: 'Ignoré', c: C.grey },
+};
+// Ordre d'apparition dans le cycle de vie d'un message
+const STATUS_ORDER = ['pending', 'processing', 'queued', 'sent', 'delivered', 'read', 'failed', 'skipped'];
+// Coches façon WhatsApp : 1 grise (envoyé), 2 grises (délivré), 2 bleues (lu)
+const tickHtml = (st) =>
+  STATUS[st] && STATUS[st].tick
+    ? `<span style="color:${STATUS[st].tc};font-weight:700;letter-spacing:-2px;">${STATUS[st].tick}</span>`
+    : '';
+
+const PAY_LABELS = ['Avant la distribution', 'Jour J', 'J+1', 'J+2 à J+3', 'J+4 à J+7', 'J+8 à J+15', 'Au-delà de J+15'];
+const ECH_LABELS = [
+  'Échues depuis plus de 30 j', 'Échues depuis 16 à 30 j', 'Échues depuis 8 à 15 j', 'Échues depuis 1 à 7 j',
+  "Échéance aujourd'hui", 'Échéance demain (J+1)', 'Échéance à J+2', 'Échéance à J+3',
+  'Échéance J+4 à J+7', 'Échéance au-delà de J+7', 'Sans date d’échéance',
+];
+const SEG_LABELS = { lue: 'Factures lues', delivree: 'Délivrées, non lues', non_distribuee: 'Non distribuées' };
+
+/**
+ * Réduit le poids du HTML (Gmail tronque au-delà de ~102 Ko) : les styles inline répétés
+ * sont remplacés par des classes définies dans <style>. Les attributs bgcolor/width conservent
+ * les barres de progression même si un client ignore la balise <style>.
+ */
+function compactStyles(html) {
+  const counts = new Map();
+  html.replace(/ style="([^"]+)"/g, (m, st) => counts.set(st, (counts.get(st) || 0) + 1) && m);
+  const map = new Map();
+  let css = '';
+  let i = 0;
+  for (const [st, c] of counts) {
+    if (c >= 3 && st.length > 22) {
+      const cl = `s${(i++).toString(36)}`;
+      map.set(st, cl);
+      css += `.${cl}{${st}}`;
+    }
+  }
+  const out = html.replace(/ style="([^"]+)"/g, (m, st) => (map.has(st) ? ` class="${map.get(st)}"` : m));
+  return out.replace('</title>', `</title><style>${css}</style>`);
+}
+
+function buildReportHtml(data, opts = {}) {
+  const full = !!opts.full;
+  const g = data.global;
+  const ins = buildInsights(data);
+  const vc = data.validClients || {
+    cible: 0, total: 0, valides: 0, abonnes: 0, confirmes: 0, nouveaux: 0, a_confirmer: 0,
+    total_unique: 0, valides_hors: 0, reste_a_collecter: 0,
+  };
+
+  const dateLabelRaw = toDay(data.today).toLocaleDateString('fr-FR', {
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+  });
+  const dateLabel = dateLabelRaw.charAt(0).toUpperCase() + dateLabelRaw.slice(1);
+  const generatedLabel = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Douala' });
+
+  const cell = (o = {}) =>
+    `padding:6px;font-size:${o.size || 11}px;text-align:${o.align || 'left'};` +
+    `${o.bold ? 'font-weight:700;' : ''}${o.color ? `color:${o.color};` : ''}${o.bg ? `background:${o.bg};` : ''}`;
+  const td = (v, o = {}) => `<td style="${cell(o)}">${v}</td>`;
+  const headCell = (align) =>
+    `padding:8px 6px;background:${C.dark};color:#ffffff;font-size:10px;font-weight:600;text-align:${align};`;
+  const tblStyle = `border-collapse:collapse;border:1px solid ${C.border};font-family:${FONT};color:${C.text};`;
+  const zebra = (i) => (i % 2 ? C.softer : '#ffffff');
+  const rateColor = (rate, target) => (rate >= target ? C.green : rate >= target - 15 ? C.amber : C.red);
+
+  const tbl = (heads, body, foot = '') =>
+    `<tr><td style="padding:0 28px;"><table width="100%" cellpadding="0" cellspacing="0" border="0" style="${tblStyle}">
+      <thead><tr>${heads.map(([h, a]) => `<th style="${headCell(a)}">${h}</th>`).join('')}</tr></thead>
+      <tbody>${body}${foot}</tbody></table></td></tr>`;
+
+  function progressBar(rate, color, h = 6) {
+    const w = Math.round(Math.min(100, Math.max(0, Number(rate) || 0)));
+    const left = w > 0 ? `<td width="${w}%" bgcolor="${color}" height="${h}" style="font-size:0;line-height:0;">&nbsp;</td>` : '';
+    const right = w < 100 ? `<td width="${100 - w}%" bgcolor="${C.track}" height="${h}" style="font-size:0;line-height:0;">&nbsp;</td>` : '';
+    return `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:4px;"><tr>${left}${right}</tr></table>`;
+  }
+
+  function sectionTitle(title, subtitle) {
+    return `<tr><td style="padding:28px 28px 10px 28px;">
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"><tr>
+        <td width="4" bgcolor="${C.green}" style="background:${C.green};">&nbsp;</td>
+        <td style="padding-left:12px;font-family:${FONT};">
+          <div style="font-size:15px;font-weight:700;color:${C.dark};">${esc(title)}</div>
+          ${subtitle ? `<div style="font-size:11px;color:${C.muted};margin-top:2px;">${esc(subtitle)}</div>` : ''}
+        </td></tr></table></td></tr>`;
+  }
+
+  function kpiCard(c) {
+    return `<td width="25%" valign="top" style="padding:6px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border:1px solid ${C.border};border-top:3px solid ${c.color || C.dark};">
+        <tr><td style="padding:12px 14px;font-family:${FONT};">
+          <div style="font-size:11px;color:${C.muted};">${esc(c.label)}</div>
+          <div style="font-size:22px;font-weight:700;color:${C.dark};margin-top:4px;">${c.value}</div>
+          <div style="font-size:10.5px;color:${C.muted};margin-top:2px;min-height:13px;">${c.sub || '&nbsp;'}</div>
+          ${c.rate != null ? progressBar(c.rate, c.color || C.green, 6) : ''}
+        </td></tr></table></td>`;
+  }
+  function kpiRows(cards) {
+    let html = '';
+    for (let i = 0; i < cards.length; i += 4) {
+      const slice = cards.slice(i, i + 4);
+      html += `<tr><td style="padding:0 22px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        ${slice.map(kpiCard).join('')}</tr></table></td></tr>`;
+    }
+    return html;
+  }
+
+  const rateCell = (rate, target, bg) =>
+    `<td style="${cell({ align: 'right', bg })}"><span style="font-weight:700;color:${C.dark};">${fmtPct(rate)}</span>${progressBar(rate, rateColor(rate, target), 4)}</td>`;
+
+  /* ── 0. Hero + synthèse ── */
+  const hero = (label, rate, sub, color) => `<td width="50%" valign="top" style="padding:0 6px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${C.soft};border:1px solid ${C.border};"><tr><td style="padding:16px 18px;font-family:${FONT};">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td valign="bottom"><div style="font-size:12px;color:${C.muted};">${label}</div>
+          <div style="font-size:11.5px;color:${C.text};margin-top:4px;">${sub}</div></td>
+        <td valign="bottom" align="right" style="font-size:30px;font-weight:700;color:${C.dark};">${fmtPct(rate)}</td>
+      </tr></table>${progressBar(rate, color, 10)}
+    </td></tr></table></td>`;
+
+  const insightBox = (title, items, color) => `<td width="33%" valign="top" style="padding:0 6px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${C.border};border-top:3px solid ${color};background:#ffffff;"><tr><td style="padding:12px 14px;font-family:${FONT};font-size:11.5px;line-height:1.5;color:${C.text};">
+      <div style="font-size:12.5px;font-weight:700;color:${C.dark};margin-bottom:8px;">${title}</div>
+      ${items.map((t) => `<div style="margin-bottom:7px;">• ${t}</div>`).join('')}
+    </td></tr></table></td>`;
+
+  /* ── 1. KPI ── */
+  const soon = ech(data, [4, 5, 6, 7]);
+  const late = ech(data, [0, 1, 2, 3]);
+  const cards = [
+    { label: 'Factures à distribuer', value: fmt(g.total), sub: `${fmt(g.contrats)} contrats`, color: C.dark },
+    { label: 'Montant à distribuer', value: money(g.montant), sub: `Cycle ${g.cycle || data.cycle}/${data.annee}`, color: C.dark },
+    { label: 'Contacts WhatsApp valides', value: fmt(g.valides), sub: `Couverture ${fmtPct(g.tx_valide)}`, rate: g.tx_valide, color: C.mid },
+    { label: 'Transmis avec succès à Meta', value: fmt(g.envoyees), sub: `${fmtPct(g.tx_envoi)} des factures`, rate: g.tx_envoi, color: C.mid },
+    { label: 'Factures distribuées', value: fmt(g.distribuees), sub: 'Délivrées + lues', rate: g.tx_succes, color: C.green },
+    { label: 'Taux de succès', value: fmtPct(g.tx_succes), sub: `Contacts valides · global : ${fmtPct(g.tx_succes_global)}`, rate: g.tx_succes, color: rateColor(g.tx_succes, TARGET_SUCCESS) },
+    { label: 'Taux de lecture', value: fmtPct(g.tx_lecture), sub: `${fmt(g.lues)} factures lues`, rate: g.tx_lecture, color: C.green },
+    { label: "Taux d'échec", value: fmtPct(g.tx_echec), sub: `${fmt(g.echecs)} échecs`, rate: g.tx_echec, color: g.tx_echec > 5 ? C.red : C.grey },
+    { label: 'Délai moyen de distribution', value: fmtHours(g.delai_dist_h), sub: `Médiane ${fmtHours(g.dist_med_h)} · P90 ${fmtHours(g.dist_p90_h)}`, color: C.mid },
+    { label: 'Montant distribué', value: money(g.montant_distribue), sub: `${fmtPct(pct(g.montant_distribue, g.montant))} du montant`, rate: pct(g.montant_distribue, g.montant), color: C.green },
+    { label: 'Montant payé', value: money(g.montant_paye), sub: `${fmt(g.payees)} factures payées`, color: C.dark },
+    { label: 'Taux de recouvrement', value: fmtPct(g.tx_recouv), sub: 'Payé / distribué', rate: g.tx_recouv, color: rateColor(g.tx_recouv, TARGET_RECOUV) },
+    { label: 'Taux de paiement', value: fmtPct(g.tx_paiement), sub: 'Payées / distribuées', rate: g.tx_paiement, color: C.green },
+    { label: 'Délai moyen de paiement', value: fmtDays(g.delai_paiement), sub: `Médiane ${fmtDays(g.pay_med)} · P90 ${fmtDays(g.pay_p90)}`, color: C.mid },
+    { label: 'Échéance sous 3 j · impayées', value: fmt(soon.nb), sub: money(soon.montant), color: C.amber },
+    { label: 'Échues · impayées', value: fmt(late.nb), sub: money(late.montant), color: C.red },
+  ];
+
+  /* ── Clients valides ── */
+  function validClientsBlock() {
+    const den = vc.cible || vc.total || 1;
+    const rows = [
+      ['Cible — clients à couvrir (socadel_contacts)', vc.cible || vc.total, 100, C.dark],
+      ['Ancien référentiel des contact valide ', vc.valides, pct(vc.valides, den), C.mid],
+      ['Confirmés — déjà dans référentiel (nouveaux)', vc.confirmes, pct(vc.confirmes, den), C.green],
+      ['Nouveaux n° whatsapp collectés', vc.nouveaux, pct(vc.nouveaux, den), C.amber],
+      ['Total contacts whatsapp valides uniques', vc.total_unique, pct(vc.total_unique, den), C.dark],
+      ['Clients abonnés (lors de la collecte)', vc.abonnes, pct(vc.abonnes, den), C.mid],
+      ['Reste WhatsApp à collecter (cible − total unique)', vc.reste_a_collecter, pct(vc.reste_a_collecter, den), C.red],
+    ];
+    const body = rows
+      .map(([l, v, rate, col], i) => {
+        const bg = zebra(i);
+        return `<tr>${td(esc(l), { bg, bold: true })}
+          <td style="${cell({ bg })}" width="30%">${rate != null ? progressBar(rate, col, 8) : ''}</td>
+          ${td(fmt(v), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(rate != null ? fmtPct(rate) : '—', { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    return tbl(
+      [['Indicateur', 'left'], ['', 'left'], ['Volume', 'right'], ['% de la cible', 'right']],
+      body
+    );
+  }
+
+  /* ── 2. Entonnoir ── */
+  function funnel() {
+    // prev = index de l'étape de référence pour le % d'étape précédente et l'écart
+    const steps = [
+      { label: 'Factures à distribuer', v: g.total, prev: null, color: C.mid },
+      { label: 'Transmis avec succès à Meta', v: g.envoyees, prev: 0, color: C.mid },
+      { label: 'dont Envoyé · accusé en attente (sent)', tick: tickHtml('sent'), v: g.sent, prev: 1, color: C.light, sub: true },
+      { label: 'Distribuées (délivrées + lues)', v: g.distribuees, prev: 1, color: C.green },
+      { label: 'Lues', tick: tickHtml('read'), v: g.lues, prev: 3, color: C.green },
+      { label: 'Payées parmi les lues', v: g.payees_lues, prev: 4, color: C.dark },
+      { label: 'Payées (parmi les distribuées)', v: g.payees, prev: 3, color: C.dark },
+    ];
+    const body = steps
+      .map((st, i) => {
+        const bg = zebra(i);
+        const pt = pct(st.v, g.total);
+        const pp = st.prev == null ? 100 : pct(st.v, steps[st.prev].v);
+        const loss = st.prev == null || st.sub ? '—' : fmt(Math.max(0, steps[st.prev].v - st.v));
+        const labelHtml = `${st.sub ? '&nbsp;&nbsp;&nbsp;↳&nbsp;' : ''}${esc(st.label)}${st.tick ? `&nbsp;&nbsp;${st.tick}` : ''}`;
+        return `<tr>${td(labelHtml, { bg, bold: !st.sub })}
+          <td style="${cell({ bg })}" width="34%">${progressBar(pt, st.color, st.sub ? 8 : 14)}</td>
+          ${td(fmt(st.v), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(fmtPct(pt), { align: 'right', bg })}
+          ${td(st.prev == null ? '—' : fmtPct(pp), { align: 'right', bg })}
+          ${td(loss, { align: 'right', bg, color: C.muted })}</tr>`;
+      })
+      .join('');
+    return tbl(
+      [['Étape', 'left'], ['Part du total', 'left'], ['Volume', 'right'], ['% du total', 'right'], ['% étape précédente', 'right'], ['Écart / reste', 'right']],
+      body
+    );
+  }
+
+  function contactsBlock() {
+    const rows = [
+      ['Contacts valides', g.valides, C.green],
+      ['Contacts non valides', g.invalides, C.red],
+      ['Factures ignorées (non envoyées)', g.skipped, C.grey],
+      ["En attente d'envoi ou en traitement", (g.pending || 0) + (g.processing || 0), C.light],
+      ['Renvois (plus d’une tentative)', g.retries, C.mid],
+    ];
+    const body = rows
+      .map(([l, v, col], i) => `<tr>${td(esc(l), { bg: zebra(i) })}
+        <td style="${cell({ bg: zebra(i) })}" width="34%">${progressBar(pct(v, g.total), col, 8)}</td>
+        ${td(fmt(v), { align: 'right', bg: zebra(i), bold: true, color: C.dark })}
+        ${td(fmtPct(pct(v, g.total)), { align: 'right', bg: zebra(i) })}</tr>`)
+      .join('');
+    return tbl([['Qualité des contacts', 'left'], ['', 'left'], ['Factures', 'right'], ['% du total', 'right']], body);
+  }
+
+  /* ── 3. Statuts ── */
+  function statusBlock() {
+    const map = Object.fromEntries((data.status || []).map((s) => [s.st, s]));
+    const keys = [...STATUS_ORDER.filter((k) => map[k]), ...Object.keys(map).filter((k) => !STATUS[k])];
+    if (!keys.length) return '';
+    const total = keys.reduce((a, k) => a + map[k].nb, 0) || 1;
+    const stack = keys
+      .map((k) => {
+        const w = Math.max(0.5, (map[k].nb / total) * 100);
+        const col = (STATUS[k] || { c: C.grey }).c;
+        return `<td width="${w.toFixed(1)}%" bgcolor="${col}" style="background:${col};height:16px;font-size:0;line-height:0;">&nbsp;</td>`;
+      })
+      .join('');
+    const body = keys
+      .map((k, i) => {
+        const s = STATUS[k] || { l: k, c: C.grey };
+        const bg = zebra(i);
+        return `<tr><td style="${cell({ bg })}"><span style="display:inline-block;width:10px;height:10px;background:${s.c};vertical-align:middle;"></span>&nbsp;${esc(s.l)}${STATUS[k] && STATUS[k].tick ? `&nbsp;&nbsp;${tickHtml(k)}` : ''}</td>
+          ${td(fmt(map[k].nb), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(fmtPct(pct(map[k].nb, total)), { align: 'right', bg })}
+          ${td(money(map[k].montant), { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    return `<tr><td style="padding:0 28px 10px 28px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>${stack}</tr></table></td></tr>` +
+      tbl([['Statut', 'left'], ['Factures', 'right'], ['% du total', 'right'], ['Montant', 'right']], body);
+  }
+
+  /* ── 4. Échecs ── */
+  function errorsBlock() {
+    if (!data.errors?.length) {
+      return `<tr><td style="padding:0 28px;font-family:${FONT};font-size:12px;color:${C.muted};">Aucun échec d'envoi enregistré sur la période.</td></tr>`;
+    }
+    const tot = data.errors.reduce((a, e) => a + e.nb, 0) || 1;
+    const body = data.errors
+      .map((e, i) => {
+        const bg = zebra(i);
+        return `<tr>${td(esc(e.cause), { bg, bold: true })}
+          <td style="${cell({ bg })}" width="30%">${progressBar(pct(e.nb, tot), C.red, 8)}</td>
+          ${td(fmt(e.nb), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(fmtPct(pct(e.nb, tot)), { align: 'right', bg })}
+          ${td(money(e.montant), { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    let html = tbl([['Cause', 'left'], ['', 'left'], ['Échecs', 'right'], ['% des échecs', 'right'], ['Montant concerné', 'right']], body);
+    if (data.errorsRaw?.length) {
+      const raw = data.errorsRaw
+        .map((e, i) => `<tr>${td(esc(e.err), { bg: zebra(i), size: 10 })}${td(fmt(e.nb), { align: 'right', bg: zebra(i), bold: true, color: C.dark })}</tr>`)
+        .join('');
+      html += `<tr><td style="padding:12px 28px 0 28px;"></td></tr>` + tbl([['Messages d’erreur les plus fréquents', 'left'], ['Occurrences', 'right']], raw);
+    }
+    if (data.attempts?.length > 1) {
+      const att = data.attempts
+        .map((a, i) => `<tr>${td(`${a.attempts} tentative(s)`, { bg: zebra(i) })}${td(fmt(a.nb), { align: 'right', bg: zebra(i) })}${td(fmt(a.distribuees), { align: 'right', bg: zebra(i) })}${td(fmtPct(pct(a.distribuees, a.nb)), { align: 'right', bg: zebra(i), bold: true, color: C.dark })}${td(fmt(a.echecs), { align: 'right', bg: zebra(i) })}</tr>`)
+        .join('');
+      html += `<tr><td style="padding:12px 28px 0 28px;"></td></tr>` +
+        tbl([['Récupération par nombre de tentatives', 'left'], ['Envois', 'right'], ['Distribuées', 'right'], ['Taux de succès', 'right'], ['Échecs', 'right']], att);
+    }
+    return html;
+  }
+
+  /* ── 4 bis. Raisons des factures ignorées (skipped) ── */
+  function skippedBlock() {
+    if (!data.skippedReasons?.length) {
+      return `<tr><td style="padding:0 28px;font-family:${FONT};font-size:12px;color:${C.muted};">Aucune facture ignorée sur la période.</td></tr>`;
+    }
+    const tot = data.skippedReasons.reduce((a, e) => a + e.nb, 0) || 1;
+    const body = data.skippedReasons
+      .map((e, i) => {
+        const bg = zebra(i);
+        return `<tr>${td(esc(e.raison), { bg, bold: true, size: 10 })}
+          <td style="${cell({ bg })}" width="28%">${progressBar(pct(e.nb, tot), C.grey, 8)}</td>
+          ${td(fmt(e.nb), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(fmtPct(pct(e.nb, tot)), { align: 'right', bg })}
+          ${td(money(e.montant), { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    return tbl([['Raison ', 'left'], ['', 'left'], ['Factures', 'right'], ['% des ignorés', 'right'], ['Montant concerné', 'right']], body);
+  }
+
+  /* ── 5. Évolution journalière ── */
+  function barChart(days, key, color, title) {
+    const H = 80;
+    const vals = days.map((d) => Number(d[key] || 0));
+    const max = Math.max(1, ...vals);
+    const cols = days
+      .map((d, i) => {
+        const v = vals[i];
+        const h = v > 0 ? Math.max(2, Math.round((v / max) * H)) : 1;
+        const col = v > 0 ? color : C.track;
+        return `<td valign="bottom" align="center" style="padding:0 1px;font-family:${FONT};">
+          <div style="font-size:8px;color:${C.muted};height:11px;">${v > 0 ? fmtK(v) : ''}</div>
+          <table cellpadding="0" cellspacing="0" align="center"><tr><td width="14" height="${h}" bgcolor="${col}" style="font-size:0;line-height:0;">&nbsp;</td></tr></table></td>`;
+      })
+      .join('');
+    const labels = days
+      .map((d) => `<td align="center" style="padding-top:4px;font-family:${FONT};font-size:8px;color:${C.muted};">${pad(toDay(d.jour).getDate())}</td>`)
+      .join('');
+    return `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${C.softer};border:1px solid ${C.border};margin-bottom:10px;">
+      <tr><td style="padding:10px 14px 0 14px;font-family:${FONT};font-size:11.5px;font-weight:700;color:${C.dark};">${esc(title)}</td></tr>
+      <tr><td style="padding:6px 14px 10px 14px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>${cols}</tr><tr>${labels}</tr></table></td></tr></table>`;
+  }
+
+  function dailyBlock() {
+    const days = data.daily || [];
+    if (!days.length) return '';
+    const peakD = days.reduce((b, d) => (d.distribuees > (b.distribuees || 0) ? d : b), {});
+    const peakP = days.reduce((b, d) => (d.payees > (b.payees || 0) ? d : b), {});
+    const stat = (l, v, s) => `<td width="25%" style="padding:0 6px 0 0;"><table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${C.border};"><tr><td style="padding:8px 10px;font-family:${FONT};">
+      <div style="font-size:10.5px;color:${C.muted};">${l}</div>
+      <div style="font-size:15px;font-weight:700;color:${C.dark};margin-top:2px;">${v}</div>
+      <div style="font-size:10px;color:${C.muted};">${s || '&nbsp;'}</div></td></tr></table></td>`;
+    const chart = `<tr><td style="padding:0 28px;">
+      ${barChart(days, 'distribuees', C.green, 'Factures distribuées par jour')}
+      ${barChart(days, 'payees', C.dark, 'Paiements par jour (nombre de factures)')}
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+        ${stat('Pic de distribution', peakD.jour ? fmt(peakD.distribuees) : '—', peakD.jour ? `le ${dm(peakD.jour)}` : '')}
+        ${stat('Pic de paiement', peakP.jour ? fmt(peakP.payees) : '—', peakP.jour ? `le ${dm(peakP.jour)} · ${money(peakP.montant_paye)}` : '')}
+        ${stat('Total distribué (période)', fmt(days.reduce((a, d) => a + d.distribuees, 0)), `${fmt(days.filter((d) => d.distribuees > 0).length)} jour(s) d'envoi`)}
+        ${stat('Total payé (période)', fmt(days.reduce((a, d) => a + d.payees, 0)), money(days.reduce((a, d) => a + d.montant_paye, 0)))}
+      </tr></table></td></tr>`;
+    if (!full) return chart;
+    const body = days
+      .map((d, i) => `<tr>${td(dm(d.jour), { bg: zebra(i), bold: true })}${td(fmt(d.envoyees), { align: 'right', bg: zebra(i) })}${td(fmt(d.distribuees), { align: 'right', bg: zebra(i) })}${td(fmt(d.echecs), { align: 'right', bg: zebra(i) })}${td(money(d.montant_distribue), { align: 'right', bg: zebra(i) })}${td(fmt(d.payees), { align: 'right', bg: zebra(i) })}${td(money(d.montant_paye), { align: 'right', bg: zebra(i), bold: true, color: C.dark })}</tr>`)
+      .join('');
+    return chart + `<tr><td style="padding:10px 28px 0 28px;"></td></tr>` +
+      tbl([['Jour', 'left'], ['Transmis Meta', 'right'], ['Distribuées', 'right'], ['Échecs', 'right'], ['Montant distribué', 'right'], ['Payées', 'right'], ['Montant payé', 'right']], body);
+  }
+
+  /* ── 5 bis. Distributions réussies par jour et par région ── */
+  function dailyRegionBlock() {
+    const rows = data.dailyRegion || [];
+    if (!rows.length) return '';
+    const MOIS = ['janv', 'févr', 'mars', 'avr', 'mai', 'juin', 'juil', 'août', 'sept', 'oct', 'nov', 'déc'];
+    const regions = [...new Set(rows.map((r) => r.region))].sort((a, b) => a.localeCompare(b, 'fr'));
+    const dayMap = new Map();
+    for (const r of rows) {
+      const k = ymd(r.jour);
+      if (!dayMap.has(k)) dayMap.set(k, { jour: r.jour, v: {} });
+      dayMap.get(k).v[r.region] = r.nb;
+    }
+    const days = [...dayMap.values()].sort((a, b) => ymd(a.jour).localeCompare(ymd(b.jour)));
+    const colTot = Object.fromEntries(regions.map((rg) => [rg, 0]));
+    let max = 1;
+    for (const d of days) {
+      d.total = 0;
+      for (const rg of regions) {
+        const v = d.v[rg] || 0;
+        d.total += v;
+        colTot[rg] += v;
+        if (v > max) max = v;
+      }
+    }
+    const grand = days.reduce((a, d) => a + d.total, 0);
+    const heat = (v) => {
+      if (!v) return '#ffffff';
+      const t = Math.ceil(Math.min(1, v / max) * 8) / 8;
+      const mix = (a, b) => Math.round(a + (b - a) * (0.12 + 0.6 * t));
+      const h = (x) => x.toString(16).padStart(2, '0');
+      return `#${h(mix(255, 37))}${h(mix(255, 211))}${h(mix(255, 102))}`;
+    };
+    const body = days
+      .map((d) => {
+        const dd = toDay(d.jour);
+        const lab = `${pad(dd.getDate())}-${MOIS[dd.getMonth()]}`;
+        return `<tr><td bgcolor="${C.softer}"><b>${lab}</b></td>${regions
+          .map((rg) => `<td align="right" bgcolor="${heat(d.v[rg] || 0)}">${d.v[rg] ? fmt(d.v[rg]) : '–'}</td>`)
+          .join('')}<td align="right" bgcolor="${C.soft}"><b>${fmt(d.total)}</b></td></tr>`;
+      })
+      .join('');
+    const foot = `<tr style="font-weight:700;color:${C.dark};"><td bgcolor="${C.soft}">TOTAL</td>${regions
+      .map((rg) => `<td align="right" bgcolor="${C.soft}">${fmt(colTot[rg])}</td>`)
+      .join('')}<td align="right" bgcolor="${C.soft}">${fmt(grand)}</td></tr>`;
+    const head = `<tr style="background:${C.dark};color:#ffffff;font-weight:600;font-size:10px;"><td bgcolor="${C.dark}"><font color="#ffffff">Date</font></td>${regions
+      .map((rg) => `<td align="right" bgcolor="${C.dark}"><font color="#ffffff">${esc(rg)}</font></td>`)
+      .join('')}<td align="right" bgcolor="${C.dark}"><font color="#ffffff">TOTAL</font></td></tr>`;
+    return `<tr><td style="padding:0 28px;"><table width="100%" cellpadding="6" cellspacing="0" border="0" style="${tblStyle}font-size:11px;">${head}${body}${foot}</table></td></tr>`;
+  }
+
+  /* ── 6. Paiement ── */
+  function paymentBlock() {
+    const bk = Object.fromEntries((data.payBuckets || []).map((r) => [r.ord, r]));
+    const tot = (data.payBuckets || []).reduce((a, r) => a + r.nb, 0) || 1;
+    const body = PAY_LABELS.map((l, i) => {
+      const r = bk[i] || { nb: 0, montant: 0 };
+      const bg = zebra(i);
+      return `<tr>${td(l, { bg, bold: true })}<td style="${cell({ bg })}" width="34%">${progressBar(pct(r.nb, tot), i === 0 ? C.grey : C.green, 8)}</td>
+        ${td(fmt(r.nb), { align: 'right', bg, bold: true, color: C.dark })}${td(fmtPct(pct(r.nb, tot)), { align: 'right', bg })}${td(money(r.montant), { align: 'right', bg })}</tr>`;
+    }).join('');
+    const kp = (l, v) => `<td width="25%" style="padding:0 6px 10px 0;"><table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${C.border};"><tr><td style="padding:8px 10px;font-family:${FONT};">
+      <div style="font-size:10.5px;color:${C.muted};">${l}</div><div style="font-size:15px;font-weight:700;color:${C.dark};margin-top:2px;">${v}</div></td></tr></table></td>`;
+    const strip = `<tr><td style="padding:0 28px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+      ${kp('Délai moyen de paiement', fmtDays(g.delai_paiement))}
+      ${kp('Délai médian · P90', `${fmtDays(g.pay_med)} · ${fmtDays(g.pay_p90)}`)}
+      ${kp('Payées avant échéance', fmtPct(pct(g.payees_avant_echeance, g.payees)))}
+      ${kp('Payées avant la distribution', fmt(g.payees_avant_dist))}
+    </tr></table></td></tr>`;
+
+    const ch = Object.fromEntries((data.channel || []).map((r) => [r.seg, r]));
+    const chBody = ['lue', 'delivree', 'non_distribuee']
+      .filter((k) => ch[k])
+      .map((k, i) => {
+        const r = ch[k];
+        const bg = zebra(i);
+        return `<tr>${td(SEG_LABELS[k], { bg, bold: true })}${td(fmt(r.total), { align: 'right', bg })}${td(fmt(r.payees), { align: 'right', bg })}
+          ${rateCell(pct(r.payees, r.total), TARGET_RECOUV, bg)}
+          ${td(money(r.montant), { align: 'right', bg })}${td(money(r.montant_paye), { align: 'right', bg, bold: true, color: C.dark })}
+          ${td(fmtPct(Math.min(100, pct(r.montant_paye, r.montant))), { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    const impact = chBody
+      ? `<tr><td style="padding:14px 28px 0 28px;"></td></tr>` +
+        tbl([['Comparaison selon la situation de la facture', 'left'], ['Factures', 'right'], ['Payées', 'right'], ['Taux de paiement', 'right'], ['Montant', 'right'], ['Montant payé', 'right'], ['Recouvrement', 'right']], chBody)
+      : '';
+    return strip + tbl([['Délai de paiement après distribution', 'left'], ['', 'left'], ['Factures', 'right'], ['% des payées', 'right'], ['Montant payé', 'right']], body) + impact;
+  }
+
+  /* ── 7. Échéancier & relance ── */
+  function echeanceBlock() {
+    const rows = Object.fromEntries((data.echeancier || []).map((r) => [r.ord, r]));
+    const totM = (data.echeancier || []).reduce((a, r) => a + r.montant, 0) || 1;
+    const totN = (data.echeancier || []).reduce((a, r) => a + r.nb, 0);
+    const body = ECH_LABELS.map((l, i) => {
+      const r = rows[i];
+      if (!r) return '';
+      const bg = i <= 3 ? C.redSoft : i <= 7 ? C.amberSoft : zebra(i);
+      return `<tr>${td(l, { bg, bold: i <= 7 })}${td(fmt(r.nb), { align: 'right', bg, bold: true, color: C.dark })}${td(money(r.montant), { align: 'right', bg })}${td(fmtPct(pct(r.montant, totM)), { align: 'right', bg })}</tr>`;
+    }).join('');
+    const foot = `<tr>${td('TOTAL distribuées non payées', { bold: true, bg: C.soft, color: C.dark })}${td(fmt(totN), { align: 'right', bold: true, bg: C.soft, color: C.dark })}${td(money(totN ? totM : 0), { align: 'right', bold: true, bg: C.soft, color: C.dark })}${td('', { bg: C.soft })}</tr>`;
+    let html = tbl([['Échéance des factures distribuées et non payées', 'left'], ['Factures', 'right'], ['Montant à risque', 'right'], ['% du montant', 'right']], body, foot);
+    html += `<tr><td style="padding:8px 28px 0 28px;font-family:${FONT};font-size:11px;color:${C.muted};">
+      Distribuées non payées : <b>${fmt(totN)}</b> · Non distribuées et non payées : <b>${fmt(g.nd_np)}</b> (${money(g.nd_np_montant)}) — à traiter par un autre canal.</td></tr>`;
+    const list = (title, rows2, limit) => {
+      const shown = (rows2 || []).slice(0, limit);
+      if (!shown.length) return '';
+      const b = shown
+        .map((r, i) => {
+          const bg = zebra(i);
+          const j = r.jours;
+          const txt = j == null ? '—' : j < 0 ? `échue il y a ${-j} j` : j === 0 ? "aujourd'hui" : `dans ${j} j`;
+          return `<tr>${td(esc(r.nom_client || '—'), { bg, bold: true })}${td(esc(r.numero_contrat), { bg })}${td(esc(r.agence), { bg })}${td(esc(r.categorie), { bg })}${td(money(r.montant), { align: 'right', bg, bold: true, color: C.dark })}${td(`${dm(r.due_date)} · ${txt}`, { bg })}${td(esc((STATUS[r.st] || { l: r.st }).l), { bg })}</tr>`;
+        })
+        .join('');
+      return `<tr><td style="padding:14px 28px 0 28px;"></td></tr>` +
+        tbl([[title, 'left'], ['Contrat', 'left'], ['Agence', 'left'], ['Catégorie', 'left'], ['Montant', 'right'], ['Échéance', 'left'], ['Statut WhatsApp', 'left']], b);
+    };
+    html += list('Relance prioritaire : échéance sous 3 jours (top 15)', data.relanceSoon, 15);
+    html += list('Plus gros montants échus non payés (top 10)', data.relanceLate, 10);
+    return html;
+  }
+
+  /* ── 8. Pareto ── */
+  function paretoBlock() {
+    const P = data.pareto;
+    if (!P || !P.top) return '';
+    const shareTop = pct(P.top.montant, g.montant);
+    const k80pct = P.n ? pct(P.k80, P.n) : 0;
+    const row = (label, r, bg) => `<tr>${td(label, { bg, bold: true })}${td(fmt(r.total), { align: 'right', bg })}${td(money(r.montant), { align: 'right', bg })}${td(fmtPct(pct(r.montant, g.montant)), { align: 'right', bg })}
+      ${rateCell(r.tx_succes, TARGET_SUCCESS, bg)}${rateCell(r.tx_lecture, 70, bg)}${rateCell(r.tx_recouv, TARGET_RECOUV, bg)}</tr>`;
+    const body = row('Top 20 % des factures (gros montants)', P.top, '#ffffff') + (P.rest ? row('80 % restants', P.rest, C.softer) : '');
+    const note = `<tr><td style="padding:0 28px 10px 28px;font-family:${FONT};font-size:12px;color:${C.text};">
+      Les <b>20 % de factures les plus élevées</b> représentent <b>${fmtPct(shareTop)}</b> du montant à distribuer.
+      ${P.n ? `À l'inverse, <b>${fmtPct(k80pct)}</b> des factures suffisent à atteindre 80 % du montant.` : ''}</td></tr>`;
+    let html = note + tbl([['Segment', 'left'], ['Factures', 'right'], ['Montant', 'right'], ['% du montant', 'right'], ['Taux de succès', 'right'], ['Taux de lecture', 'right'], ['Recouvrement', 'right']], body);
+    if (data.bigUnpaid?.length) {
+      const b = data.bigUnpaid
+        .map((r, i) => `<tr>${td(esc(r.nom_client || '—'), { bg: zebra(i), bold: true })}${td(esc(r.agence), { bg: zebra(i) })}${td(esc(r.categorie), { bg: zebra(i) })}${td(money(r.montant), { align: 'right', bg: zebra(i), bold: true, color: C.dark })}${td(dm(r.due_date), { bg: zebra(i) })}${td(esc((STATUS[r.st] || { l: r.st }).l), { bg: zebra(i) })}</tr>`)
+        .join('');
+      html += `<tr><td style="padding:14px 28px 0 28px;"></td></tr>` +
+        tbl([['Top 10 gros montants non payés', 'left'], ['Agence', 'left'], ['Catégorie', 'left'], ['Montant', 'right'], ['Échéance', 'left'], ['Statut WhatsApp', 'left']], b);
+    }
+    return html;
+  }
+
+  /* ── 9. Tableaux par dimension ── */
+  function dimTable(title, rows, { limit = null, showParent = false, labelHead = 'Libellé' } = {}) {
+    if (!rows?.length) return '';
+    const shown = limit ? rows.slice(0, limit) : rows;
+    const s = sumRows(rows);
+    const body = shown
+      .map((r, i) => {
+        const bg = zebra(i);
+        return `<tr><td style="${cell({ bg, bold: true })}">${esc(r.label)}${showParent && r.parent ? `<div style="font-size:9.5px;font-weight:400;color:${C.muted};">${esc(r.parent)}</div>` : ''}</td>
+          ${td(fmt(r.total), { align: 'right', bg })}${td(money(r.montant), { align: 'right', bg })}${td(fmtPct(r.tx_valide), { align: 'right', bg })}${td(fmt(r.distribuees), { align: 'right', bg })}
+          ${rateCell(r.tx_succes, TARGET_SUCCESS, bg)}${td(fmtPct(r.tx_lecture), { align: 'right', bg })}${td(fmtPct(r.tx_echec), { align: 'right', bg, color: r.tx_echec > 5 ? C.red : C.text })}
+          ${td(money(r.montant_paye), { align: 'right', bg })}${rateCell(r.tx_recouv, TARGET_RECOUV, bg)}${td(fmtDays(r.delai_paiement), { align: 'right', bg })}</tr>`;
+      })
+      .join('');
+    const f = (v, a = 'right') => td(v, { align: a, bold: true, bg: C.soft, color: C.dark });
+    const foot = `<tr>${f('TOTAL', 'left')}${f(fmt(s.total))}${f(money(s.montant))}${f(fmtPct(s.tx_valide))}${f(fmt(s.distribuees))}${f(fmtPct(s.tx_succes))}${f(fmtPct(s.tx_lecture))}${f(fmtPct(s.tx_echec))}${f(money(s.montant_paye))}${f(fmtPct(s.tx_recouv))}${f(fmtDays(s.delai_paiement))}</tr>`;
+    const heads = [[labelHead, 'left'], ['Factures', 'right'], ['Montant', 'right'], ['Contacts valides', 'right'], ['Distribuées', 'right'], ['Taux de succès', 'right'], ['Lecture', 'right'], ['Échec', 'right'], ['Montant payé', 'right'], ['Recouvrement', 'right'], ['Délai pay.', 'right']];
+    const sub = `${rows.length} élément(s)${limit && rows.length > limit ? ` · ${limit} plus gros affichés, détail complet en pièce jointe` : ''}`;
+    return sectionTitle(title, sub) + tbl(heads, body, foot);
+  }
+
+  /* ── 10. Classement ── */
+  function rankingBlock() {
+    const lim = full ? 10 : 5;
+    const top = (data.ranking?.top || []).slice(0, lim);
+    const flop = (data.ranking?.flop || []).slice(0, lim);
+    if (!top.length) return '';
+    const make = (title, rows, startGood) => {
+      const body = rows
+        .map((r, i) => {
+          const bg = zebra(i);
+          return `<tr>${td(String(i + 1), { align: 'center', bg, bold: true, color: startGood ? C.green : C.red })}
+            <td style="${cell({ bg, bold: true })}">${esc(r.label)}<div style="font-size:9.5px;font-weight:400;color:${C.muted};">${esc(r.parent || '')}</div></td>
+            ${td(fmt(r.total), { align: 'right', bg })}${rateCell(r.tx_succes, TARGET_SUCCESS, bg)}${td(fmtPct(r.tx_lecture), { align: 'right', bg })}${td(fmtPct(r.tx_recouv), { align: 'right', bg })}
+            ${td(fmtDec(r.score), { align: 'right', bg, bold: true, color: C.dark })}</tr>`;
+        })
+        .join('');
+      return tbl([['#', 'center'], [title, 'left'], ['Factures', 'right'], ['Taux de succès', 'right'], ['Lecture', 'right'], ['Recouvrement', 'right'], ['Score', 'right']], body);
+    };
+    return sectionTitle('Classement des agences', `Score = 40 % succès + 20 % lecture + 40 % recouvrement · agences d'au moins ${MIN_VOLUME} factures`) +
+      make(`Top ${top.length} agences`, top, true) +
+      (flop?.length ? `<tr><td style="padding:14px 28px 0 28px;"></td></tr>` + make(`${flop.length} agences à accompagner`, flop, false) : '');
+  }
+
+  /* ── 11. Glossaire des indicateurs ── */
+  function glossaryBlock() {
+    const groups = [
+      {
+        title: 'A. Volumes et couverture',
+        items: [
+          ['Factures à distribuer', 'Nombre de factures de l’émission à venir pour le cycle analysé.', 'COUNT(*) sur mysql_invoices_all (cycle, année)'],
+          ['Contrats', 'Nombre de contrats distincts concernés par la distribution.', 'COUNT(DISTINCT numero_contrat)'],
+          ['Montant à distribuer', 'Valeur totale des factures du cycle.', 'Σ montant'],
+          ['Contacts WhatsApp valides', 'Factures dont le numéro WhatsApp est validé.', 'contact_ws_status = « valid »'],
+          ['Couverture', 'Part des factures disposant d’un contact valide.', 'Contacts valides ÷ Factures à distribuer'],
+          ['Contacts non valides', 'Factures sans contact WhatsApp exploitable : à collecter ou à corriger en agence.', 'contact_ws_status ≠ « valid »'],
+        ],
+      },
+      {
+        title: 'B. Statuts des messages WhatsApp',
+        items: [
+          ['En attente d’envoi (pending)', 'Facture dans la file, pas encore transmise à Meta.', 'whatsapp_status = pending'],
+          ['En traitement (processing)', 'Envoi en cours d’exécution.', 'whatsapp_status = processing'],
+          ['En file d’attente (queued)', 'Message en file d’attente côté plateforme d’envoi.', 'whatsapp_status = queued'],
+          ['Envoyé · accusé en attente (sent) ✓', 'Message accepté par Meta, confirmation de livraison attendue. Une coche grise.', 'whatsapp_status = sent'],
+          ['Délivré (delivered) ✓✓', 'Message arrivé sur le téléphone du client, non encore lu. Deux coches grises.', 'whatsapp_status = delivered'],
+          ['Lu (read) ✓✓', 'Message ouvert par le client. Deux coches bleues.', 'whatsapp_status = read'],
+          ['Échec (failed)', 'Envoi ou livraison refusé (voir causes d’échec).', 'whatsapp_status = failed'],
+          ['Ignoré (skipped)', 'Facture volontairement non envoyée (règle métier, numéro inexploitable, etc.). Ce n’est pas un échec technique.', 'whatsapp_status = skipped'],
+          ['Transmis avec succès à Meta', 'Factures dont l’envoi a été accepté par Meta puis suivi d’un accusé ou d’un échec.', 'sent + delivered + read + failed'],
+        ],
+      },
+      {
+        title: 'C. Performance de distribution',
+        items: [
+          ['Facture distribuée', 'Message arrivé sur le téléphone du client : preuve de réception.', 'delivered + read'],
+          ['Montant distribué', 'Valeur des factures distribuées.', 'Σ montant des factures distribuées'],
+          ['Taux de succès', `Indicateur principal de distribution, mesuré sur les contacts valides. Objectif de référence : ${TARGET_SUCCESS} %.`, 'Distribuées ÷ Contacts valides'],
+          ['Taux de succès global', 'Même mesure rapportée à toutes les factures, y compris celles sans contact valide.', 'Distribuées ÷ Factures à distribuer'],
+          ['Taux d’envoi', 'Part des factures effectivement transmises à Meta.', 'Transmis à Meta ÷ Factures à distribuer'],
+          ['Taux de lecture', 'Part des factures distribuées qui ont été ouvertes.', 'Lues ÷ Distribuées'],
+          ['Taux d’échec', 'Part des envois transmis qui ont échoué.', 'Échecs ÷ Transmis à Meta'],
+          ['Renvois', 'Factures ayant fait l’objet de plus d’une tentative d’envoi.', 'whatsapp_attempts > 1'],
+          ['Récupération par tentatives', 'Taux de succès selon le nombre de tentatives : mesure l’efficacité des renvois.', 'Distribuées ÷ Envois, par nombre de tentatives'],
+        ],
+      },
+      {
+        title: 'D. Délais de distribution',
+        items: [
+          ['Délai de distribution (moyen)', 'Temps écoulé entre la création de la facture et son envoi WhatsApp.', 'whatsapp_sent_at − date_creation'],
+          ['Médiane (P50)', 'Délai sous lequel se situent 50 % des factures : valeur typique, peu sensible aux extrêmes.', 'Percentile 50 du délai'],
+          ['P90', 'Délai sous lequel se situent 90 % des factures : performance pour la grande majorité.', 'Percentile 90 du délai'],
+        ],
+      },
+      {
+        title: 'E. Échecs et factures ignorées',
+        items: [
+          ['Causes d’échec', 'Regroupement des messages d’erreur WhatsApp en catégories : délai minimum 24 h, limite de débit, blocage marketing, restriction qualité Meta, numéro invalide, erreur technique, etc.', 'Classification de whatsapp_error'],
+          ['Messages d’erreur fréquents', 'Libellés d’erreur bruts les plus répétés, pour identifier les causes à traiter en priorité.', 'Top 8 de whatsapp_error'],
+          ['Raisons des factures ignorées', 'Motifs pour lesquels des factures n’ont pas été envoyées.', 'whatsapp_error des factures skipped'],
+        ],
+      },
+      {
+        title: 'F. Paiement et recouvrement',
+        items: [
+          ['Facture payée', 'Facture ayant un paiement enregistré dans oracle_payments.', 'montant_paye > 0 (num_rec = numero_facture)'],
+          ['Montant payé', 'Somme encaissée sur les factures distribuées.', 'Σ montant_paye des distribuées payées'],
+          ['Taux de paiement', 'Part des factures distribuées qui ont été payées.', 'Payées ÷ Distribuées'],
+          ['Payées parmi les lues', 'Factures lues puis réglées : mesure la conversion entre la lecture et le paiement.', 'Lues ∩ payées ÷ Lues'],
+          ['Recouvrement', `Part de la valeur distribuée effectivement encaissée. Objectif de référence : ${TARGET_RECOUV} %.`, 'Montant payé ÷ Montant distribué'],
+          ['Délai de paiement (moyen, médian, P90)', 'Temps écoulé entre le jour de distribution et la date de paiement.', 'date_paiement − jour d’envoi'],
+          ['Fréquence de paiement', 'Répartition des paiements par délai après distribution : jour J, J+1, J+2 à J+3, J+4 à J+7, J+8 à J+15, au-delà.', 'Tranches de délai de paiement'],
+          ['Payées avant échéance', 'Part des factures distribuées payées à la date d’échéance ou avant.', 'date_paiement ≤ due_date'],
+          ['Payées avant la distribution', 'Factures réglées avant l’envoi du message (paiement spontané).', 'date_paiement < jour d’envoi'],
+          ['Comparaison lues / délivrées / non distribuées', 'Taux de paiement selon la situation de la facture : met en évidence l’écart observé entre factures lues et non distribuées.', 'Payées ÷ Factures, par segment'],
+        ],
+      },
+      {
+        title: 'G. Échéances et risque',
+        items: [
+          ['Échéance sous 3 jours', 'Factures distribuées, non payées, dont l’échéance tombe entre aujourd’hui et J+3 : cible de la relance prioritaire.', 'due_date entre aujourd’hui et J+3'],
+          ['Factures échues', 'Factures distribuées, non payées, dont l’échéance est dépassée, classées par ancienneté (1-7 j, 8-15 j, 16-30 j, plus de 30 j).', 'due_date < aujourd’hui'],
+          ['Montant à risque', 'Valeur des factures distribuées non payées, répartie par échéance.', 'Σ montant des distribuées non payées'],
+          ['Non distribuées et non payées', 'Factures non atteintes par WhatsApp et non réglées : à traiter par un autre canal (SMS, e-mail, agent).', 'Non distribuées ∩ non payées'],
+          ['Liste de relance', 'Factures à relancer, triées par montant décroissant (détail en pièce jointe CSV).', 'Échéance sous 3 jours + échues'],
+        ],
+      },
+      {
+        title: 'H. Analyses comparatives et pilotage',
+        items: [
+          ['Focus 20 / 80', 'Comparaison des 20 % de factures les plus élevées avec les 80 % restantes sur le succès, la lecture et le recouvrement.', 'Classement par montant décroissant'],
+          ['Concentration 80 %', 'Part des factures qui suffit pour atteindre 80 % du montant total.', 'Cumul du montant jusqu’à 80 %'],
+          [`Focus catégorie ${FOCUS_CATEGORY}`, `Mêmes indicateurs restreints à la catégorie ${FOCUS_CATEGORY} (gros clients), déclinés par région.`, `categorie = ${FOCUS_CATEGORY}`],
+          ['Tranche de montant', 'Segmentation des factures par valeur : moins de 5 000, jusqu’à 500 000 FCFA et plus.', 'Tranches de montant de facture'],
+          ['Distributions réussies par région', 'Nombre de factures délivrées ou lues, par jour d’envoi et par région. L’intensité de la couleur reflète le volume.', 'delivered + read, par sent_day et région'],
+          ['Pic de distribution / de paiement', 'Jour où le plus grand nombre de factures ont été distribuées, respectivement payées.', 'Maximum journalier'],
+          ['Score agence', 'Note composite servant au classement des agences.', '40 % succès + 20 % lecture + 40 % recouvrement'],
+          ['Classement des agences', `Top et agences à accompagner, limités aux agences d’au moins ${MIN_VOLUME} factures.`, 'Tri par score'],
+        ],
+      },
+      {
+        title: 'I. Base clients et téléphones WhatsApp',
+        items: [
+          ['Cible', 'Nombre de clients à couvrir en numéro WhatsApp valide.', 'COUNT(service_no) dans socadel_contacts'],
+          ['Ancien référentiel validé', 'Contrats dont le téléphone est déjà validé.', 'COUNT(numero_contrat) dans db_client_valid'],
+          ['Confirmés', 'Numéros de téléphone présents à la fois dans la collecte et dans le référentiel validé.', 'socadel_contacts ∩ db_client_valid (téléphone)'],
+          ['Nouveaux numéros', 'Numéros collectés absents du référentiel validé, à confirmer.', 'socadel_contacts − db_client_valid (téléphone)'],
+          ['Total contacts uniques', 'Numéros de téléphone distincts des deux bases, sans doublon.', 'socadel_contacts ∪ db_client_valid (téléphone)'],
+          ['Clients abonnés', 'Clients ayant le statut ABONNE lors de la collecte.', 'statut = ABONNE'],
+          ['Reste à collecter', 'Clients de la cible pour lesquels aucun numéro valide n’est encore disponible.', 'Cible − Total contacts uniques'],
+        ],
+      },
+    ];
+
+    let body = '';
+    for (const grp of groups) {
+      body += `<tr><td colspan="3" style="${cell({ bg: C.soft, bold: true, color: C.dark, size: 11 })}">${esc(grp.title)}</td></tr>`;
+      grp.items.forEach(([term, def, calc], i) => {
+        const bg = zebra(i);
+        body += `<tr>
+          <td width="24%" valign="top" style="${cell({ bg, bold: true, color: C.dark })}">${esc(term)}</td>
+          <td valign="top" style="${cell({ bg })}">${esc(def)}</td>
+          <td width="27%" valign="top" style="${cell({ bg, color: C.muted, size: 10 })}">${esc(calc)}</td>
+        </tr>`;
+      });
+    }
+
+    return sectionTitle('Glossaire des indicateurs', 'Définition, mode de calcul et source de chaque indicateur du rapport') +
+      tbl([['Indicateur', 'left'], ['Définition', 'left'], ['Calcul / source', 'left']], body);
+  }
+
+  /* ── 12. Signature ── */
+  function signatureBlock() {
+    return `<tr><td style="padding:26px 28px 0 28px;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${C.border};background:${C.softer};"><tr>
+        <td width="5" bgcolor="${C.green}" style="background:${C.green};">&nbsp;</td>
+        <td style="padding:16px 20px;font-family:${FONT};">
+          <div style="font-size:10.5px;color:${C.muted};margin-bottom:6px;">Rapport préparé par</div>
+          <div style="font-size:15px;font-weight:700;color:${C.dark};">Patrick Tondjou Dontegho</div>
+          <div style="font-size:12px;color:${C.text};margin-top:2px;">Assistant Analyse des données</div>
+          <div style="font-size:12px;color:${C.mid};font-weight:600;margin-top:2px;">SDFACT · Reporting et qualité de la facturation</div>
+          <div style="font-size:11.5px;color:${C.text};margin-top:10px;line-height:1.7;">
+            ✉ <a href="mailto:patrick.tondjou@camlight.cm" style="color:${C.dark};text-decoration:none;">patrick.tondjou@camlight.cm</a><br/>
+            ☎ <a href="tel:+237690062737" style="color:${C.dark};text-decoration:none;">+237 690 06 27 37</a>
+          </div>
+        </td></tr></table>
+    </td></tr>`;
+  }
+
+  let n = 0;
+  const S = (t, s) => sectionTitle(`${++n}. ${t}`, s);
+
+  const html = `<!DOCTYPE html>
+<html lang="fr"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Distribution des factures WhatsApp — Cycle ${data.cycle}/${data.annee}</title>
+<!--[if mso]><style>table{border-collapse:collapse;}td,th{font-family:Arial,sans-serif;}</style><![endif]-->
+</head>
+<body style="margin:0;padding:0;background:${C.page};">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:${C.page};font-size:1px;">${esc(`${fmt(g.distribuees)} distribuées sur ${fmt(g.valides)} valides (${fmtPct(g.tx_succes)}) · global ${fmtPct(g.tx_succes_global)} · recouvrement ${fmtPct(g.tx_recouv)}`)}</div>
+<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${C.page}" style="background:${C.page};">
+<tr><td align="center" style="padding:20px 8px;">
+<table width="900" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:900px;max-width:900px;background:#ffffff;border:1px solid ${C.border};">
+  <tr><td bgcolor="${C.dark}" style="background:${C.dark};padding:26px 28px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+      <td valign="middle" style="font-family:${FONT};">
+        <div style="font-size:12px;color:#b9e8cf;">SOCADEL · Distribution WhatsApp</div>
+        <div style="font-size:24px;font-weight:700;color:#ffffff;margin-top:6px;">Rapport de distribution des factures par WhatsApp</div>
+        <div style="font-size:12px;color:#d6f3e3;margin-top:4px;">Émission à venir · Cycle ${data.cycle}/${data.annee}</div>
+      </td>
+      <td valign="middle" align="right" style="font-family:${FONT};">
+        <div style="font-size:11px;color:#b9e8cf;">Situation au</div>
+        <div style="font-size:15px;font-weight:600;color:#ffffff;margin-top:4px;">${esc(dateLabel)}</div>
+      </td></tr></table>
+  </td></tr>
+  <tr><td bgcolor="${C.green}" style="background:${C.green};height:4px;font-size:0;line-height:0;">&nbsp;</td></tr>
+
+  <tr><td style="padding:22px 22px 6px 22px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+    ${hero('Taux de succès de la distribution', g.tx_succes, `<b>${fmt(g.distribuees)}</b> factures distribuées sur <b>${fmt(g.total)}</b>`, C.green)}
+    ${hero('Taux de recouvrement', g.tx_recouv, `<b>${money(g.montant_paye)}</b> encaissés sur <b>${money(g.montant_distribue)}</b> distribués`, C.dark)}
+  </tr></table></td></tr>
+
+  ${S('Synthèse exécutive', 'Faits marquants, points d’attention et actions recommandées')}
+  <tr><td style="padding:0 22px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+    ${insightBox('Faits marquants', ins.facts, C.green)}
+    ${insightBox('Points d’attention', ins.alerts, C.amber)}
+    ${insightBox('Actions recommandées', ins.recos, C.dark)}
+  </tr></table></td></tr>
+
+  ${S('Indicateurs clés', 'Volumes, distribution, encaissement et échéances')}
+  ${kpiRows(cards)}
+
+  ${S('Base clients / téléphones WhatsApp')}
+  ${validClientsBlock()}
+
+  ${S('Entonnoir de distribution', 'De la facture émise à la facture payée')}
+  ${funnel()}
+  <tr><td style="padding:12px 28px 0 28px;"></td></tr>
+  ${contactsBlock()}
+
+  ${S('Statuts des messages', 'Répartition des factures par statut WhatsApp')}
+  ${statusBlock()}
+
+  ${S('Analyse des échecs', 'Causes, montants concernés et efficacité des nouvelles tentatives')}
+  ${errorsBlock()}
+
+  ${S('Raisons des factures ignorées', 'Pourquoi certaines factures n’ont pas été envoyées (statut skipped)')}
+  ${skippedBlock()}
+
+  ${S('Évolution journalière', 'Distribution et paiements, jour par jour')}
+  ${dailyBlock()}
+
+  ${S('Distributions réussies par région', 'Factures délivrées ou lues, par jour d’envoi et par région (intensité = volume)')}
+  ${dailyRegionBlock()}
+
+  ${S('Paiement après distribution', 'Délais, fréquence de paiement et comparaison lues / non distribuées')}
+  ${paymentBlock()}
+
+  ${S('Échéances et relances', 'Factures distribuées non payées, classées par échéance')}
+  ${echeanceBlock()}
+
+  ${S('Focus 20 / 80', 'Concentration des montants et performance sur les gros montants')}
+  ${paretoBlock()}
+
+  ${dimTable(`${++n}. Par catégorie de client`, data.byCategorie, { labelHead: 'Catégorie' })}
+  ${dimTable(`${++n}. Par tranche de montant`, data.byTranche, { labelHead: 'Tranche (FCFA)' })}
+  ${dimTable(`${++n}. Par région`, data.byRegion, { labelHead: 'Région' })}
+  ${dimTable(`${++n}. Focus catégorie ${FOCUS_CATEGORY} par région`, data.focusRegion, { labelHead: 'Région' })}
+  ${dimTable(`${++n}. Par division`, data.byDivision, { showParent: true, labelHead: 'Division' })}
+  ${full ? dimTable(`${++n}. Par MRC`, data.byMrc, { showParent: true, labelHead: 'MRC' }) : ''}
+  ${full ? dimTable(`${++n}. Par agence`, data.byAgence, { showParent: true, labelHead: 'Agence' }) : ''}
+  ${rankingBlock()}
+
+  ${glossaryBlock()}
+  ${signatureBlock()}
+
+  <tr><td style="padding:30px 28px 24px 28px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid ${C.border};"><tr><td style="padding-top:12px;font-family:${FONT};font-size:10px;line-height:1.6;color:#8a9a92;">
+      Rapport automatique généré le ${esc(generatedLabel)} (heure de Douala) · périmètre : factures du cycle ${data.cycle}/${data.annee} (émission à venir).<br/>
+      Détail complet par agence et listes de relance : pièces jointes.
+    </td></tr></table>
+  </td></tr>
+</table></td></tr></table>
+</body></html>`;
+
+  return compactStyles(html.replace(/>\s+</g, '><').replace(/\n\s*/g, ''));
+}
+
+/* ───────────────────────── CSV ───────────────────────── */
+function toCsv(headers, rows) {
+  const e = (v) => {
+    const s = v == null ? '' : v instanceof Date ? ymd(v) : String(v);
+    return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return '\uFEFF' + [headers.map(e).join(';'), ...rows.map((r) => r.map(e).join(';'))].join('\n');
+}
+
+function buildAgencesCsv(data) {
+  const h = ['Agence', 'Division', 'Factures', 'Montant', 'Contacts valides', 'Taux contacts valides (%)', 'Transmis Meta', 'Distribuées', 'Taux de succès sur valides (%)', 'Lues', 'Taux de lecture (%)', 'Échecs', "Taux d'échec (%)", 'Montant distribué', 'Factures payées', 'Montant payé', 'Recouvrement (%)', 'Délai paiement (j)', 'Délai distribution (h)', 'Score'];
+  return toCsv(h, (data.byAgence || []).map((r) => [r.label, r.parent, r.total, r.montant, r.valides, r.tx_valide, r.envoyees, r.distribuees, r.tx_succes, r.lues, r.tx_lecture, r.echecs, r.tx_echec, r.montant_distribue, r.payees, r.montant_paye, r.tx_recouv, r.delai_paiement == null ? '' : Number(r.delai_paiement).toFixed(1), r.delai_dist_h == null ? '' : Number(r.delai_dist_h).toFixed(1), r.score]));
+}
+
+function buildRelanceCsv(data) {
+  const h = ['Priorité', 'Région', 'Division', 'MRC', 'Agence', 'Catégorie', 'Client', 'Contrat', 'Facture', 'Téléphone', 'Montant', 'Échéance', 'Jours avant échéance', 'Statut WhatsApp'];
+  const map = (label) => (r) => [label, r.region, r.division, r.mrc, r.agence, r.categorie, r.nom_client, r.numero_contrat, r.numero_facture, r.telephone, r.montant, r.due_date, r.jours, r.st];
+  return toCsv(h, [...(data.relanceSoon || []).map(map('Échéance ≤ 3 j')), ...(data.relanceLate || []).map(map('Échue'))]);
+}
+
+/* ───────────────────────── Envoi email ───────────────────────── */
+function buildReportTransporter() {
+  const host = process.env.REPORT_SMTP_HOST;
+  const user = process.env.REPORT_SMTP_USER;
+  const pass = process.env.REPORT_SMTP_PASSWORD;
+  if (!host || !user) {
+    const emailService = require('./email.service');
+    return emailService.transporter || (typeof emailService.getTransporter === 'function' ? emailService.getTransporter() : null);
+  }
+  return nodemailer.createTransport({
+    host,
+    port: parseInt(process.env.REPORT_SMTP_PORT || '587', 10),
+    secure: String(process.env.REPORT_SMTP_SECURE || 'false').toLowerCase() === 'true',
+    auth: { user, pass },
+  });
+}
+
+async function sendInvoiceReportEmail({ to, cc } = {}) {
+  const recipients =
+    to ||
+    process.env.SOCADEL_INVOICE_REPORT_EMAIL_TO ||
+    process.env.SOCADEL_REPORT_EMAIL_TO ||
+    process.env.REPORT_EMAIL_TO ||
+    'patrick.tondjou@camlight.cm';
+
+  const data = await buildReportData();
+  // Version complète directement dans le corps du mail (pas de HTML en pièce jointe)
+  const html = buildReportHtml(data, { full: true });
+  const csvAgences = buildAgencesCsv(data);
+  const csvRelance = buildRelanceCsv(data);
+  const day = ymd(data.today);
+  logger.info(`[SOCADEL-INVOICE] HTML=${html.length} o (version complète dans le corps)`);
+
+  try {
+    fs.writeFileSync('/tmp/socadel-invoice-report-full.html', html, 'utf8');
+  } catch (err) {
+    logger.warn(`[SOCADEL-INVOICE] écriture /tmp: ${err.message}`);
+  }
+
+  const g = data.global;
+  const subject = `Socadel — Distribution des factures WhatsApp — Cycle ${data.cycle}/${data.annee} — ${day}`;
+  const text =
+    `Distribution des factures WhatsApp — cycle ${data.cycle}/${data.annee} — ${day}\n` +
+    `Factures à distribuer : ${g.total}\nContacts valides : ${g.valides}\nDistribuées : ${g.distribuees} (succès ${g.tx_succes} % sur valides · global ${g.tx_succes_global} %)\n` +
+    `Taux de lecture : ${g.tx_lecture} %\nÉchecs : ${g.echecs} (${g.tx_echec} %)\n` +
+    `Montant distribué : ${g.montant_distribue}\nMontant payé : ${g.montant_paye} (${g.tx_recouv} %)\n` +
+    `\n--\nPatrick Tondjou Dontegho\nAssistant Analyse des données\nSDFACT - Reporting et qualité de la facturation\npatrick.tondjou@camlight.cm | +237 690 06 27 37\n`;
+
+  const transporter = buildReportTransporter();
+  if (!transporter) throw new Error('Aucun transporter SMTP disponible pour le rapport');
+  const from = process.env.REPORT_EMAIL_FROM || process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER;
+
+  if (typeof transporter.verify === 'function') {
+    try {
+      await withTimeout(transporter.verify(), 15000, 'smtp.verify');
+    } catch (err) {
+      logger.warn(`[SOCADEL-INVOICE] SMTP verify: ${err.message}`);
+    }
+  }
+
+  const info = await withTimeout(
+    transporter.sendMail({
+      from,
+      to: recipients,
+      cc: cc || process.env.SOCADEL_INVOICE_REPORT_EMAIL_CC || process.env.SOCADEL_REPORT_EMAIL_CC || undefined,
+      subject,
+      html,
+      text,
+      attachments: [
+        // Uniquement les CSV (plus de HTML joint)
+        { filename: `socadel-agences-${day}.csv`, content: Buffer.from(csvAgences, 'utf8'), contentType: 'text/csv; charset=utf-8' },
+        { filename: `socadel-relance-${day}.csv`, content: Buffer.from(csvRelance, 'utf8'), contentType: 'text/csv; charset=utf-8' },
+      ],
+    }),
+    120000,
+    'sendMail'
+  );
+  logger.info(`[SOCADEL-INVOICE] Email OK id=${info.messageId}`);
+  return { success: true, to: recipients, date: day, messageId: info.messageId };
+}
+
+module.exports = {
+  buildReportData,
+  buildReportHtml,
+  buildAgencesCsv,
+  buildRelanceCsv,
+  sendInvoiceReportEmail,
+  enrich,
+};

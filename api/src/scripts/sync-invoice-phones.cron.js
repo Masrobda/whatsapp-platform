@@ -1,0 +1,70 @@
+// /var/www/numericexport/api/src/scripts/sync-invoice-phones.cron.js
+require('dotenv').config();
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+const WINDOW_DAYS = parseInt(process.env.PHONE_SYNC_WINDOW_DAYS || '60', 10);
+
+async function syncInvoicePhones() {
+  const t0 = Date.now();
+
+  const resSync = await query(
+    `UPDATE mysql_invoices_all AS inv
+        SET telephone = wvc.whatsapp_phone,
+            contact_ws_status = 'valid',
+            whatsapp_status = CASE
+              WHEN inv.whatsapp_status = 'skipped' THEN 'pending'
+              ELSE inv.whatsapp_status
+            END,
+            whatsapp_error = CASE
+              WHEN inv.whatsapp_status = 'skipped' THEN NULL
+              ELSE inv.whatsapp_error
+            END,
+            whatsapp_attempts = CASE
+              WHEN inv.whatsapp_status = 'skipped' THEN 0
+              ELSE inv.whatsapp_attempts
+            END
+       FROM whatsapp_valid_contacts AS wvc
+      WHERE inv.numero_contrat::text = wvc.contract_number::text
+        AND inv.imported_at > NOW() - ($1 || ' days')::interval
+        AND (
+          inv.whatsapp_status = 'skipped'
+          OR inv.telephone IS NULL
+          OR regexp_replace(inv.telephone, '[^0-9]', '', 'g') <> regexp_replace(wvc.whatsapp_phone, '[^0-9]', '', 'g')
+          OR inv.contact_ws_status IS NULL
+          OR inv.contact_ws_status <> 'valid'
+        )`,
+    [String(WINDOW_DAYS)]
+  );
+
+  const resFlagValid = await query(
+    `UPDATE mysql_invoices_all
+        SET contact_ws_status = 'valid'
+      WHERE whatsapp_status IN ('sent', 'delivered', 'read', 'failed')
+        AND (contact_ws_status IS NULL OR contact_ws_status IN ('invalid', 'not_checked'))`
+  );
+
+  const ms = Date.now() - t0;
+  logger.info(
+    `[PHONE-SYNC] ✅ Synchronisation terminée en ${ms}ms : ` +
+    `${resSync.rowCount} factures resynchronisées, ` +
+    `${resFlagValid.rowCount} factures traitées flaggées 'valid'.`
+  );
+
+  return { rowCount: resSync.rowCount, flagged: resFlagValid.rowCount, ms };
+}
+
+module.exports = { syncInvoicePhones };
+
+// Exécution directe en CLI (cron) uniquement
+if (require.main === module) {
+  (async () => {
+    try {
+      await syncInvoicePhones();
+      process.exit(0);
+    } catch (err) {
+      logger.error('[PHONE-SYNC] Erreur:', err.message);
+      process.exit(1);
+    }
+  })();
+}

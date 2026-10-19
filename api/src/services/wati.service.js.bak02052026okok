@@ -1,0 +1,311 @@
+// src/services/wati.service.js
+const axios = require('axios');
+
+class WatiService {
+  constructor() {
+    this.baseURL = 'https://live-mt-server.wati.io/10144460';
+    this.apiKey = process.env.WATI_API_KEY;
+if (!this.apiKey) {
+  throw new Error('WATI_API_KEY manquant dans les variables d\'environnement');
+}
+  }
+
+  /**
+   * Convertit un objet de paramètres en tableau format WATI
+   * @param {Object} params - Paramètres sous forme d'objet {key: value}
+   * @returns {Array} Tableau formaté pour WATI [{name: key, value: value}]
+   */
+  formatTemplateParameters(params) {
+    if (!params) return [];
+
+    let parameters = [];
+
+    if (typeof params === 'string') {
+      try {
+        params = JSON.parse(params);
+      } catch (e) {
+        return [];
+      }
+    }
+
+    if (params && typeof params === 'object') {
+      for (const [key, value] of Object.entries(params)) {
+        parameters.push({
+          name: key,
+          value: String(value)
+        });
+      }
+    }
+
+    return parameters;
+  }
+
+  /**
+   * Envoie un message template standard (SANS PDF)
+   * Format exact selon support WATI (channel_number SANS +)
+   * @param {string} recipientPhone - Numéro du destinataire (non utilisé pour l'API mais conservé pour logs)
+   * @param {string} templateName - Nom du template WhatsApp
+   * @param {Object} templateParams - Paramètres du template {name: value}
+   * @param {string} language - Langue du template (ignoré, format support WATI)
+   * @param {string} senderPhone - Numéro de l'émetteur (channel_number) SANS le +
+   * @returns {Promise<Object>} Résultat de l'envoi
+   */
+  async sendTemplateMessage(recipientPhone, templateName, templateParams = {}, language = 'fr', senderPhone = null) {
+    try {
+      // Nettoyage du numéro de l'émetteur (channel_number) - Suppression du + et des espaces
+      let cleanSender = senderPhone ? senderPhone.replace(/\s/g, '').replace(/^\+/, '') : '';
+      
+      if (!cleanSender) {
+        throw new Error("Sender phone number is required. Please provide senderPhone parameter.");
+      }
+
+      // Formatage des paramètres au format tableau WATI
+      const parameters = this.formatTemplateParameters(templateParams);
+
+      // Construction du payload selon le format WATI du support
+      const payload = {
+        template_name: templateName,
+        broadcast_name: `msg_${Date.now()}`,
+        parameters: parameters,
+        channel_number: cleanSender  // ← SANS le signe +, exactement comme le support
+      };
+
+      console.log("📤 Envoi template message:", {
+        template_name: templateName,
+        channel_number: cleanSender,
+        params_count: parameters.length
+      });
+      console.log("📤 Payload:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("✅ Réponse WATI:", JSON.stringify(response.data, null, 2));
+
+      return {
+        success: true,
+        localMessageId: response.data.local_message_id,
+        watiMessageId: response.data.message_id || response.data.id,
+        status: response.data.status || 'sent'
+      };
+
+    } catch (error) {
+      const errorDetail = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+      console.error('❌ Erreur sendTemplateMessage:', errorDetail);
+      return { success: false, error: errorDetail };
+    }
+  }
+
+  /**
+   * Envoie une facture avec PDF via template WhatsApp
+   * Format exact selon support WATI (channel_number SANS +)
+   * @param {string} recipientPhone - Numéro du destinataire (non utilisé pour l'API mais conservé pour logs)
+   * @param {string} templateName - Nom du template WhatsApp
+   * @param {Object} templateParams - Paramètres texte du template
+   * @param {Object} invoiceData - Données de la facture {pdfUrl, number}
+   * @param {string} senderPhone - Numéro de l'émetteur (channel_number) SANS le +
+   * @returns {Promise<Object>} Résultat de l'envoi
+   */
+  async sendInvoiceWithPDF(recipientPhone, templateName, templateParams, invoiceData, senderPhone = null) {
+    console.log("--- DÉBUT ENVOI TEMPLATE AVEC PDF ---");
+
+    try {
+      // 1. Nettoyage du template name
+      let tName = typeof templateName === 'object' ? (templateName.template_name || templateName.name) : templateName;
+      tName = String(tName || "").trim();
+
+      // 2. Nettoyage du numéro de l'émetteur (channel_number) - Suppression du + et des espaces
+      let cleanSender = senderPhone ? senderPhone.replace(/\s/g, '').replace(/^\+/, '') : '';
+      
+      if (!cleanSender) {
+        throw new Error("Sender phone number is required. Please provide senderPhone parameter.");
+      }
+
+      console.log(`📤 Envoi depuis channel_number: ${cleanSender}`);
+
+      // 3. Construction des paramètres au format tableau WATI
+      let parameters = [];
+
+      // Gestion des paramètres templateParams
+      let safeParams = {};
+      if (typeof templateParams === 'string') {
+        try {
+          safeParams = JSON.parse(templateParams);
+        } catch (e) {
+          safeParams = {};
+        }
+      } else if (templateParams && typeof templateParams === 'object') {
+        safeParams = templateParams;
+      }
+
+      // Ajout des paramètres texte (sans le champ 'file')
+      for (const [key, value] of Object.entries(safeParams)) {
+        if (key !== 'file') {
+          parameters.push({
+            name: key,
+            value: String(value)
+          });
+        }
+      }
+
+      // 4. Ajout du fichier PDF si présent
+      const pdfUrl = (invoiceData?.pdfUrl || invoiceData?.url || "").trim();
+      if (pdfUrl && pdfUrl.startsWith('http')) {
+        parameters.push({
+          name: "file",
+          value: pdfUrl
+        });
+        console.log("📎 PDF ajouté:", pdfUrl);
+      } else {
+        console.warn("⚠️ Aucun PDF valide trouvé");
+      }
+
+      // 5. Construction du payload - Format EXACT du support WATI
+      const payload = {
+        template_name: tName,
+        broadcast_name: `inv_${invoiceData?.number || Date.now()}`,
+        parameters: parameters,
+        channel_number: cleanSender  // ← SANS le signe +, exactement comme le support
+      };
+
+      console.log("📤 Payload final envoyé à WATI:", JSON.stringify(payload, null, 2));
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTemplateMessage`,
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("✅ Réponse WATI:", JSON.stringify(response.data, null, 2));
+
+      return {
+        success: true,
+        localMessageId: response.data.local_message_id,
+        watiMessageId: response.data.message_id || response.data.id,
+        status: response.data.status || 'sent'
+      };
+
+    } catch (error) {
+      const errorDetail = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+      console.error("❌ ERREUR sendInvoiceWithPDF:", errorDetail);
+      return { success: false, error: errorDetail };
+    }
+  }
+
+  /**
+   * Envoie un message texte simple
+   * @param {string} recipientPhone - Numéro du destinataire
+   * @param {string} text - Contenu du message
+   * @param {string} senderPhone - Numéro de l'émetteur (channel_number) SANS le +
+   * @returns {Promise<Object>} Résultat de l'envoi
+   */
+  async sendTextMessage(recipientPhone, text, senderPhone = null) {
+    try {
+      // Nettoyage du numéro de l'émetteur - Suppression du + et des espaces
+      let cleanSender = senderPhone ? senderPhone.replace(/\s/g, '').replace(/^\+/, '') : '';
+
+      if (!cleanSender) {
+        throw new Error("Sender phone number is required");
+      }
+
+      const payload = {
+        text: text,
+        channel_number: cleanSender
+      };
+
+      console.log("📤 Send text message:", { channel_number: cleanSender, text_length: text?.length });
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendTextMessage`,
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("✅ Réponse WATI Text:", JSON.stringify(response.data, null, 2));
+
+      return {
+        success: true,
+        localMessageId: response.data.local_message_id,
+        watiMessageId: response.data.message_id || response.data.id,
+        status: response.data.status || 'sent'
+      };
+
+    } catch (error) {
+      console.error('Erreur sendTextMessage:', error.response?.data || error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Envoie un message média (image, vidéo, document)
+   * @param {string} recipientPhone - Numéro du destinataire
+   * @param {string} mediaUrl - URL du média
+   * @param {string} mediaType - Type de média (image, video, document)
+   * @param {string} caption - Légende du média
+   * @param {string} senderPhone - Numéro de l'émetteur (channel_number) SANS le +
+   * @returns {Promise<Object>} Résultat de l'envoi
+   */
+  async sendMediaMessage(recipientPhone, mediaUrl, mediaType = 'image', caption = '', senderPhone = null) {
+    try {
+      // Nettoyage du numéro de l'émetteur - Suppression du + et des espaces
+      let cleanSender = senderPhone ? senderPhone.replace(/\s/g, '').replace(/^\+/, '') : '';
+
+      if (!cleanSender) {
+        throw new Error("Sender phone number is required");
+      }
+
+      const payload = {
+        url: mediaUrl,
+        type: mediaType,
+        caption: caption,
+        channel_number: cleanSender
+      };
+
+      console.log("📤 Send media message:", { channel_number: cleanSender, media_type: mediaType, url: mediaUrl });
+
+      const response = await axios({
+        method: 'post',
+        url: `${this.baseURL}/api/v1/sendMediaMessage`,
+        data: payload,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey.trim()}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      console.log("✅ Réponse WATI Media:", JSON.stringify(response.data, null, 2));
+
+      return {
+        success: true,
+        localMessageId: response.data.local_message_id,
+        watiMessageId: response.data.message_id || response.data.id,
+        status: response.data.status || 'sent'
+      };
+
+    } catch (error) {
+      console.error('Erreur sendMediaMessage:', error.response?.data || error.message);
+      return { success: false, error: error.message };
+    }
+  }
+}
+
+module.exports = new WatiService();

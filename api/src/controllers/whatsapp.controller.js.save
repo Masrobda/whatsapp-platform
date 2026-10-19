@@ -1,0 +1,950 @@
+// src/controllers/whatsapp.controller.js
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+const { redisConnection } = require('../config/redis');
+
+/**
+ * Liste tous les numéros avec les détails du client associé
+ */
+   /**
+ * Récupère tous les numéros avec leurs assignations
+ * (Remplace getAllNumbers)
+ */
+async function getAllNumbersWithAssignments(req, rep) {
+    try {
+        // Utilisez la version AVEC STATS
+        const sql = `
+            SELECT
+                wn.*,
+                (
+                    SELECT json_agg(json_build_object(
+                        'client_id', wa.client_id,
+                        'client_name', c.company_name,
+                        'client_email', c.email,
+                        'is_primary', wa.is_primary,
+                        'assigned_at', wa.assigned_at,
+                        'daily_limit', wa.daily_limit,
+                        'notes', wa.notes,
+                        'stats', (
+                            SELECT json_build_object(
+                                'messages_sent_24h', wns.messages_sent_24h,
+                                'messages_sent_total', wns.messages_sent_total,
+                                'conversations_active', wns.conversations_active,
+                                'conversations_total', wns.conversations_total,
+                                'last_message_at', wns.last_message_at,
+                                'last_activity', wns.last_activity,
+                                'quality_rating', wns.quality_rating,
+                                'tier_current', wns.tier_current
+                            )
+                            FROM whatsapp_number_client_stats wns
+                            WHERE wns.assignment_id = wa.id
+                        )
+                    ) ORDER BY wa.is_primary DESC, wa.assigned_at DESC)
+                    FROM whatsapp_number_assignments wa
+                    JOIN clients c ON wa.client_id = c.id
+                    WHERE wa.number_id = wn.id
+                ) as assignments,
+                (
+                    SELECT json_build_object(
+                        'client_id', wa.client_id,
+                        'client_name', c.company_name,
+                        'client_email', c.email
+                    )
+                    FROM whatsapp_number_assignments wa
+                    JOIN clients c ON wa.client_id = c.id
+                    WHERE wa.number_id = wn.id AND wa.is_primary = true
+                    LIMIT 1
+                ) as primary_client
+            FROM whatsapp_numbers wn
+            ORDER BY wn.created_at DESC;
+        `;
+
+        const res = await query(sql);
+        return rep.send({ success: true, data: res.rows });
+    } catch (err) {
+        logger.error('Erreur lecture numéros:', err);
+        return rep.status(500).send({ success: false, message: "Erreur serveur" });
+    }
+}
+
+
+/**
+ * Récupère les statistiques d'un client pour un numéro
+ */
+async function getClientNumberStats(req, rep) {
+    try {
+        const { numberId, clientId } = req.params;
+
+        const result = await query(`
+            SELECT 
+                wa.*,
+                wns.*,
+                c.company_name,
+                c.email
+            FROM whatsapp_number_assignments wa
+            LEFT JOIN whatsapp_number_client_stats wns ON wa.id = wns.assignment_id
+            JOIN clients c ON wa.client_id = c.id
+            WHERE wa.number_id = $1 AND wa.client_id = $2
+        `, [numberId, clientId]);
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Assignation non trouvée" });
+        }
+
+        return rep.send({ success: true, data: result.rows[0] });
+    } catch (err) {
+        logger.error('Erreur récupération stats client:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Met à jour les statistiques d'un client pour un numéro
+ */
+async function updateClientNumberStats(req, rep) {
+    try {
+        const { numberId, clientId } = req.params;
+        const stats = req.body;
+
+        // Récupérer l'ID de l'assignation
+        const assignment = await query(
+            'SELECT id FROM whatsapp_number_assignments WHERE number_id = $1 AND client_id = $2',
+            [numberId, clientId]
+        );
+
+        if (assignment.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Assignation non trouvée" });
+        }
+
+        const assignmentId = assignment.rows[0].id;
+
+        // Mettre à jour ou insérer les stats
+        const result = await query(`
+            INSERT INTO whatsapp_number_client_stats 
+            (assignment_id, messages_sent_24h, messages_sent_total, conversations_active, 
+             conversations_total, last_message_at, quality_rating, tier_current, daily_limit)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (assignment_id) DO UPDATE SET
+                messages_sent_24h = EXCLUDED.messages_sent_24h,
+                messages_sent_total = whatsapp_number_client_stats.messages_sent_total + EXCLUDED.messages_sent_24h,
+                conversations_active = EXCLUDED.conversations_active,
+                conversations_total = whatsapp_number_client_stats.conversations_total + 1,
+                last_message_at = EXCLUDED.last_message_at,
+                quality_rating = EXCLUDED.quality_rating,
+                tier_current = EXCLUDED.tier_current,
+                daily_limit = EXCLUDED.daily_limit,
+                last_activity = NOW()
+            RETURNING *
+        `, [
+            assignmentId,
+            stats.messages_sent_24h || 0,
+            stats.messages_sent_24h || 0,
+            stats.conversations_active || 0,
+            stats.conversations_total || 0,
+            stats.last_message_at || null,
+            stats.quality_rating || null,
+            stats.tier_current || null,
+            stats.daily_limit || 1000
+        ]);
+
+        logger.info(`Stats mises à jour pour client ${clientId} sur numéro ${numberId}`);
+        return rep.send({ success: true, data: result.rows[0] });
+    } catch (err) {
+        logger.error('Erreur mise à jour stats client:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Récupère tous les numéros avec leurs assignations et stats
+ */
+async function getAllNumbersWithAssignmentsAndStats(req, rep) {
+    try {
+        const sql = `
+            SELECT 
+                wn.*,
+                (
+                    SELECT json_agg(json_build_object(
+                        'client_id', wa.client_id,
+                        'client_name', c.company_name,
+                        'client_email', c.email,
+                        'is_primary', wa.is_primary,
+                        'assigned_at', wa.assigned_at,
+                        'daily_limit', wa.daily_limit,
+                        'notes', wa.notes,
+                        'stats', (
+                            SELECT json_build_object(
+                                'messages_sent_24h', wns.messages_sent_24h,
+                                'messages_sent_total', wns.messages_sent_total,
+                                'conversations_active', wns.conversations_active,
+                                'conversations_total', wns.conversations_total,
+                                'last_message_at', wns.last_message_at,
+                                'last_activity', wns.last_activity,
+                                'quality_rating', wns.quality_rating,
+                                'tier_current', wns.tier_current
+                            )
+                            FROM whatsapp_number_client_stats wns
+                            WHERE wns.assignment_id = wa.id
+                        )
+                    ) ORDER BY wa.is_primary DESC, wa.assigned_at DESC)
+                    FROM whatsapp_number_assignments wa
+                    JOIN clients c ON wa.client_id = c.id
+                    WHERE wa.number_id = wn.id
+                ) as assignments,
+                (
+                    SELECT json_build_object(
+                        'client_id', wa.client_id,
+                        'client_name', c.company_name,
+                        'client_email', c.email
+                    )
+                    FROM whatsapp_number_assignments wa
+                    JOIN clients c ON wa.client_id = c.id
+                    WHERE wa.number_id = wn.id AND wa.is_primary = true
+                    LIMIT 1
+                ) as primary_client
+            FROM whatsapp_numbers wn
+            ORDER BY wn.created_at DESC;
+        `;
+
+        const res = await query(sql);
+        return rep.send({ success: true, data: res.rows });
+    } catch (err) {
+        logger.error('Erreur lecture numéros:', err);
+        return rep.status(500).send({ success: false, message: "Erreur serveur" });
+    }
+}
+
+
+/**
+ * Ajouter un nouveau numéro
+ */
+async function addNumber(req, rep) {
+    try {
+        const { phone_number, display_name, client_id, notes, daily_conversation_limit } = req.body;
+
+        if (!phone_number) {
+            return rep.status(400).send({ success: false, message: "Numéro requis" });
+        }
+
+        // IMPORTANT: Ne nettoyer QUE les espaces, garder le +
+        const cleanPhone = phone_number.trim().replace(/\s+/g, '');
+        
+        // Vérifier que le numéro commence bien par +
+        if (!cleanPhone.startsWith('+')) {
+            return rep.status(400).send({ 
+                success: false, 
+                message: "Le numéro doit être au format international avec + (ex: +237689000000)" 
+            });
+        }
+
+        // Vérifier le format (chiffres seulement après le +)
+        if (!/^\+\d{8,15}$/.test(cleanPhone)) {
+            return rep.status(400).send({ 
+                success: false, 
+                message: "Format invalide. Utilisez + suivi de 8 à 15 chiffres" 
+            });
+        }
+
+        const result = await query(
+            `INSERT INTO whatsapp_numbers
+             (phone_number, display_name, client_id, notes, daily_conversation_limit, is_active, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
+             RETURNING *`,
+            [cleanPhone, display_name || null, client_id || null, notes || null, daily_conversation_limit || 1000]
+        );
+
+        logger.info(`Nouveau numéro ajouté: ${cleanPhone}`);
+        return rep.send({ success: true, data: result.rows[0] });
+    } catch (err) {
+        logger.error('Erreur ajout numéro:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+
+/**
+ * Modifier un numéro
+ */
+async function updateNumber(req, rep) {
+    try {
+        const { id } = req.params;
+        const { display_name, notes, daily_conversation_limit, is_active } = req.body;
+
+        const updates = [];
+        const values = [];
+        let paramIndex = 1;
+
+        if (display_name !== undefined) {
+            updates.push(`display_name = $${paramIndex++}`);
+            values.push(display_name);
+        }
+        if (notes !== undefined) {
+            updates.push(`notes = $${paramIndex++}`);
+            values.push(notes);
+        }
+        if (daily_conversation_limit !== undefined) {
+            updates.push(`daily_conversation_limit = $${paramIndex++}`);
+            values.push(daily_conversation_limit);
+        }
+        if (is_active !== undefined) {
+            updates.push(`is_active = $${paramIndex++}`);
+            values.push(is_active);
+        }
+
+        updates.push(`updated_at = NOW()`);
+
+        if (updates.length === 0) {
+            return rep.status(400).send({ success: false, message: "Aucune donnée à mettre à jour" });
+        }
+
+        values.push(id);
+        const sql = `UPDATE whatsapp_numbers SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+
+        const result = await query(sql, values);
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro non trouvé" });
+        }
+
+        logger.info(`Numéro ${id} mis à jour`);
+        return rep.send({ success: true, data: result.rows[0] });
+    } catch (err) {
+        logger.error('Erreur mise à jour numéro:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Activation/Désactivation d'un numéro
+ */
+async function toggleNumberStatus(req, rep) {
+    try {
+        const { id } = req.params;
+        const { is_active } = req.body;
+
+        const result = await query(
+            `UPDATE whatsapp_numbers 
+             SET is_active = $1, updated_at = NOW() 
+             WHERE id = $2 
+             RETURNING *`,
+            [is_active, id]
+        );
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro non trouvé" });
+        }
+
+        logger.info(`Numéro ${id} ${is_active ? 'activé' : 'désactivé'}`);
+        return rep.send({ 
+            success: true, 
+            message: `Numéro ${is_active ? 'activé' : 'désactivé'} avec succès`,
+            data: result.rows[0]
+        });
+    } catch (err) {
+        logger.error('Erreur changement statut:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Récupérer les détails d'un numéro
+ */
+async function getNumberDetails(req, rep) {
+    try {
+        const { id } = req.params;
+
+        const result = await query(
+            `SELECT wn.*, c.company_name, c.email, c.phone as client_phone
+             FROM whatsapp_numbers wn
+             LEFT JOIN clients c ON wn.client_id = c.id
+             WHERE wn.id = $1`,
+            [id]
+        );
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro non trouvé" });
+        }
+
+        return rep.send({ success: true, data: result.rows[0] });
+    } catch (err) {
+        logger.error('Erreur récupération détails:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Liste des clients pour le dropdown
+ */
+async function getClientsList(req, rep) {
+    try {
+        const result = await query(
+            `SELECT id, company_name, email, phone 
+             FROM clients 
+             ORDER BY company_name ASC`
+        );
+        return rep.send({ success: true, data: result.rows });
+    } catch (err) {
+        logger.error('Erreur récupération clients:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Statistiques globales des numéros
+ */
+async function getNumbersStats(req, rep) {
+    try {
+        const stats = await query(`
+            SELECT
+                COUNT(*) as total_numbers,
+                COUNT(*) FILTER (WHERE is_active = true) as active_numbers,
+                COUNT(*) FILTER (WHERE is_active = false) as inactive_numbers,
+                COUNT(*) FILTER (WHERE client_id IS NULL) as unassigned_numbers,
+                COUNT(*) FILTER (WHERE quality_rating = 'GREEN') as green_quality,
+                COUNT(*) FILTER (WHERE quality_rating = 'YELLOW') as yellow_quality,
+                COUNT(*) FILTER (WHERE quality_rating = 'RED') as red_quality,
+                SUM(messages_sent_24h) as total_messages_24h,
+                SUM(daily_conversation_limit) as total_daily_limit,
+                AVG(messages_sent_24h::float / NULLIF(daily_conversation_limit, 0)) * 100 as avg_usage_percentage
+            FROM whatsapp_numbers
+        `);
+
+        return rep.send({ success: true, data: stats.rows[0] });
+    } catch (err) {
+        logger.error('Erreur récupération stats:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Import massif amélioré
+ */
+async function syncNumbersBulk(req, rep) {
+    const { numbers, client_id, default_limit = 1000 } = req.body;
+
+    if (!Array.isArray(numbers) || numbers.length === 0) {
+        return rep.status(400).send({ success: false, message: "Liste vide" });
+    }
+
+    try {
+        const results = {
+            inserted: 0,
+            updated: 0,
+            errors: []
+        };
+
+        for (const num of numbers) {
+            try {
+                // Garder le +, enlever seulement les espaces
+                const cleanPhone = num.trim().replace(/\s+/g, '');
+                
+                if (!cleanPhone.startsWith('+')) {
+                    results.errors.push({ number: num, error: "Doit commencer par +" });
+                    continue;
+                }
+                
+                if (!/^\+\d{8,15}$/.test(cleanPhone)) {
+                    results.errors.push({ number: num, error: "Format invalide" });
+                    continue;
+                }
+
+                const existing = await query(
+                    'SELECT id FROM whatsapp_numbers WHERE phone_number = $1',
+                    [cleanPhone]
+                );
+
+                if (existing.rowCount > 0) {
+                    // Mise à jour
+                    await query(
+                        `UPDATE whatsapp_numbers
+                         SET client_id = COALESCE($1, client_id),
+                             daily_conversation_limit = $2,
+                             updated_at = NOW()
+                         WHERE phone_number = $3`,
+                        [client_id || null, default_limit, cleanPhone]
+                    );
+                    results.updated++;
+                } else {
+                    // Insertion
+                    await query(
+                        `INSERT INTO whatsapp_numbers
+                         (phone_number, client_id, daily_conversation_limit, is_active, created_at, updated_at)
+                         VALUES ($1, $2, $3, true, NOW(), NOW())`,
+                        [cleanPhone, client_id || null, default_limit]
+                    );
+                    results.inserted++;
+                }
+            } catch (err) {
+                results.errors.push({ number: num, error: err.message });
+            }
+        }
+
+        logger.info(`Import massif: ${results.inserted} insérés, ${results.updated} mis à jour`);
+        return rep.send({
+            success: true,
+            message: `${results.inserted} numéro(s) ajouté(s), ${results.updated} mis à jour`,
+            details: results
+        });
+    } catch (err) {
+        logger.error('Erreur import massif:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+
+/**
+ * Suppression d'un numéro
+ */
+async function deleteNumber(req, rep) {
+    try {
+        const { id } = req.params;
+        const result = await query('DELETE FROM whatsapp_numbers WHERE id = $1 RETURNING id', [id]);
+        
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro non trouvé" });
+        }
+        
+        logger.info(`Numéro ${id} supprimé`);
+        return rep.send({ success: true, message: "Numéro supprimé avec succès" });
+    } catch (err) {
+        logger.error('Erreur suppression numéro:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Réassigner un numéro à un autre client ou le remettre en "disponible" (null)
+ */
+async function reassignNumber(req, rep) {
+    try {
+        const { id } = req.params;
+        const { client_id } = req.body;
+
+        const result = await query(
+            'UPDATE whatsapp_numbers SET client_id = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+            [client_id || null, id]
+        );
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro introuvable" });
+        }
+
+        logger.info(`Numéro ${id} réassigné au client ${client_id || 'aucun'}`);
+        return rep.send({
+            success: true,
+            message: "Réassignation réussie",
+            data: result.rows[0]
+        });
+    } catch (err) {
+        logger.error('Erreur réassignation numéro:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Liste uniquement les numéros appartenant au client connecté
+ */
+async function getMyNumbers(req, rep) {
+    try {
+        const clientId = req.user.id;
+
+        const sql = `
+            SELECT DISTINCT
+                wn.id,
+                wn.phone_number,
+                wn.display_name,
+                wn.quality_rating,
+                wn.tier_current,
+                wn.messages_sent_24h,
+                wn.daily_conversation_limit as daily_conversation_limit,
+                wn.is_active,
+                wa.notes as assignment_notes,
+                wn.notes,
+                wn.updated_at,
+                wa.is_primary
+            FROM whatsapp_numbers wn
+            JOIN whatsapp_number_assignments wa ON wn.id = wa.number_id
+            WHERE wa.client_id = $1 AND wn.is_active = true
+            ORDER BY wa.is_primary DESC, wn.phone_number ASC;
+        `;
+
+        const res = await query(sql, [clientId]);
+
+        return rep.send({
+            success: true,
+            count: res.rowCount,
+            data: res.rows
+        });
+    } catch (err) {
+        logger.error('Erreur lecture numéros client:', err);
+        return rep.status(500).send({ success: false, message: "Erreur serveur" });
+    }
+}
+
+
+/**
+ * Récupère tous les clients assignés à un numéro
+ */
+async function getNumberAssignments(req, rep) {
+    try {
+        const { numberId } = req.params;
+        
+        const result = await query(`
+            SELECT 
+                wa.*,
+                c.company_name,
+                c.email,
+                c.phone as client_phone,
+                u.email as assigned_by_email
+            FROM whatsapp_number_assignments wa
+            JOIN clients c ON wa.client_id = c.id
+            LEFT JOIN users u ON wa.assigned_by = u.id
+            WHERE wa.number_id = $1
+            ORDER BY wa.is_primary DESC, wa.assigned_at DESC
+        `, [numberId]);
+        
+        return rep.send({ success: true, data: result.rows });
+    } catch (err) {
+        logger.error('Erreur récupération assignations:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Assigne un numéro à un client
+ */
+
+async function assignNumberToClient(req, rep) {
+    try {
+        const { numberId } = req.params;
+        const { client_id, is_primary, notes } = req.body;
+        const userId = req.user.id;
+
+        if (!client_id) {
+            return rep.status(400).send({ success: false, message: "Client requis" });
+        }
+
+        // Vérifier si le numéro existe
+        const numberCheck = await query(
+            'SELECT id, phone_number FROM whatsapp_numbers WHERE id = $1',
+            [numberId]
+        );
+
+        if (numberCheck.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Numéro non trouvé" });
+        }
+
+        // Si c'est un assignation primaire, retirer le primaire des autres
+        if (is_primary) {
+            await query(
+                'UPDATE whatsapp_number_assignments SET is_primary = false WHERE number_id = $1',
+                [numberId]
+            );
+        }
+
+        // Vérifier si l'assignation existe déjà
+        const existing = await query(
+            'SELECT id FROM whatsapp_number_assignments WHERE number_id = $1 AND client_id = $2',
+            [numberId, client_id]
+        );
+
+        let result;
+        if (existing.rowCount > 0) {
+            // Mise à jour
+            result = await query(`
+                UPDATE whatsapp_number_assignments
+                SET is_primary = $1, notes = $2, assigned_by = $3, assigned_at = NOW()
+                WHERE number_id = $4 AND client_id = $5
+                RETURNING *
+            `, [is_primary || false, notes || null, userId, numberId, client_id]);
+        } else {
+            // Nouvelle assignation
+            result = await query(`
+                INSERT INTO whatsapp_number_assignments
+                (number_id, client_id, assigned_by, is_primary, notes)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+            `, [numberId, client_id, userId, is_primary || false, notes || null]);
+        }
+
+        // 🔥 Invalider le cache Redis pour ce client
+        try {
+            await redisConnection.del(`whatsapp_number:client:${client_id}`);
+            logger.info(`Cache invalidé pour le client ${client_id} après assignation`);
+        } catch (cacheErr) {
+            logger.warn('Erreur invalidation cache Redis:', cacheErr.message);
+        }
+
+        logger.info(`Numéro ${numberId} assigné au client ${client_id}`);
+        return rep.send({
+            success: true,
+            message: "Assignation réussie",
+            data: result.rows[0]
+        });
+    } catch (err) {
+        logger.error('Erreur assignation:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+/**
+ * Retire l'assignation d'un numéro à un client
+ */
+async function removeNumberAssignment(req, rep) {
+    try {
+        const { numberId, clientId } = req.params;
+
+        const result = await query(
+            'DELETE FROM whatsapp_number_assignments WHERE number_id = $1 AND client_id = $2 RETURNING id',
+            [numberId, clientId]
+        );
+
+        if (result.rowCount === 0) {
+            return rep.status(404).send({ success: false, message: "Assignation non trouvée" });
+        }
+
+        logger.info(`Assignation retirée: numéro ${numberId} du client ${clientId}`);
+        return rep.send({ success: true, message: "Assignation retirée avec succès" });
+    } catch (err) {
+        logger.error('Erreur retrait assignation:', err);
+        return rep.status(500).send({ success: false, message: err.message });
+    }
+}
+
+// Ajoutez cette fonction dans whatsapp.controller.js
+async function validateClientNumberAdvanced(req, rep) {
+    try {
+        const { phone_number, client_id } = req.body;
+        const authClientId = req.user.id; // Du JWT
+
+        if (!phone_number) {
+            return rep.status(400).send({
+                success: false,
+                message: "Numéro de téléphone requis"
+            });
+        }
+
+        // Nettoyer le numéro
+        const cleanPhone = phone_number.replace(/[^\d+]/g, '');
+
+        // Vérifier dans les assignations
+        const result = await query(`
+            SELECT 
+                wn.id,
+                wn.phone_number,
+                wn.is_active,
+                wa.client_id,
+                c.company_name,
+                wa.is_primary,
+                CASE 
+                    WHEN wa.client_id = $1 OR wa.client_id = $2 THEN true 
+                    ELSE false 
+                END as is_authorized
+            FROM whatsapp_numbers wn
+            LEFT JOIN whatsapp_number_assignments wa ON wn.id = wa.number_id
+            LEFT JOIN clients c ON wa.client_id = c.id
+            WHERE wn.phone_number = $3
+        `, [authClientId, client_id, cleanPhone]);
+
+        if (result.rows.length === 0) {
+            return rep.status(404).send({
+                success: false,
+                code: 'NUMBER_NOT_FOUND',
+                message: "Ce numéro WhatsApp n'existe pas dans notre système"
+            });
+        }
+
+        // Vérifier si une des assignations correspond au client
+        const authorized = result.rows.some(row => row.is_authorized);
+
+        if (!authorized) {
+            return rep.status(403).send({
+                success: false,
+                code: 'NUMBER_NOT_OWNED',
+                message: "Ce numéro ne vous est pas assigné",
+                is_authorized: false
+            });
+        }
+
+        // Prendre la première assignation pour les infos
+        const number = result.rows[0];
+
+        if (!number.is_active) {
+            return rep.status(403).send({
+                success: false,
+                code: 'NUMBER_INACTIVE',
+                message: "Ce numéro WhatsApp n'est pas actif"
+            });
+        }
+
+        return rep.send({
+            success: true,
+            message: "Numéro valide et autorisé",
+            phone_number: number.phone_number,
+            is_authorized: true,
+            is_active: number.is_active
+        });
+
+    } catch (err) {
+        logger.error('Erreur validation numéro:', err);
+        return rep.status(500).send({
+            success: false,
+            message: "Erreur lors de la validation du numéro"
+        });
+    }
+}
+
+/**
+ * Met à jour la limite quotidienne d'un client pour un numéro spécifique
+ */
+async function updateAssignmentLimit(req, rep) {
+    try {
+        const { numberId, clientId } = req.params;
+        const { daily_limit } = req.body;
+
+        if (!daily_limit || daily_limit < 1) {
+            return rep.status(400).send({ 
+                success: false, 
+                message: "Limite quotidienne invalide (doit être ≥ 1)" 
+            });
+        }
+
+        // Vérifier que l'assignation existe
+        const checkAssignment = await query(
+            'SELECT id FROM whatsapp_number_assignments WHERE number_id = $1 AND client_id = $2',
+            [numberId, clientId]
+        );
+
+        if (checkAssignment.rowCount === 0) {
+            return rep.status(404).send({ 
+                success: false, 
+                message: "Assignation non trouvée" 
+            });
+        }
+
+        // Mettre à jour la limite
+        const result = await query(
+            `UPDATE whatsapp_number_assignments 
+             SET daily_limit = $1, 
+                 assigned_at = NOW() 
+             WHERE number_id = $2 AND client_id = $3 
+             RETURNING *`,
+            [daily_limit, numberId, clientId]
+        );
+
+        logger.info(`Limite mise à jour pour client ${clientId} sur numéro ${numberId}: ${daily_limit}`);
+        
+        return rep.send({ 
+            success: true, 
+            message: "Limite quotidienne mise à jour avec succès",
+            data: result.rows[0]
+        });
+    } catch (err) {
+        logger.error('Erreur mise à jour limite assignation:', err);
+        return rep.status(500).send({ 
+            success: false, 
+            message: err.message 
+        });
+    }
+}
+
+/**
+ * Valider si un numéro appartient bien au client connecté
+ */
+async function validateClientNumber(req, rep) {
+    try {
+        const clientId = req.user.id;
+        const { phone_number } = req.body;
+
+        if (!phone_number) {
+            return rep.status(400).send({
+                success: false,
+                message: "Numéro de téléphone requis"
+            });
+        }
+
+        // Nettoyer le numéro pour la comparaison
+        const cleanPhone = phone_number.replace(/[^\d+]/g, '');
+
+        const result = await query(`
+            SELECT
+                id,
+                phone_number,
+                client_id,
+                is_active,
+                CASE
+                    WHEN client_id = $1 THEN true
+                    ELSE false
+                END as is_owner
+            FROM whatsapp_numbers
+            WHERE phone_number = $2
+        `, [clientId, cleanPhone]);
+
+        if (result.rows.length === 0) {
+            return rep.status(404).send({
+                success: false,
+                code: 'NUMBER_NOT_FOUND',
+                message: "Ce numéro WhatsApp n'existe pas dans notre système"
+            });
+        }
+
+        const number = result.rows[0];
+
+        if (!number.is_active) {
+            return rep.status(403).send({
+                success: false,
+                code: 'NUMBER_INACTIVE',
+                message: "Ce numéro WhatsApp n'est pas actif",
+                is_active: false
+            });
+        }
+
+        if (number.client_id !== clientId) {
+            return rep.status(403).send({
+                success: false,
+                code: 'NUMBER_NOT_OWNED',
+                message: "Ce numéro ne vous appartient pas",
+                owner_client_id: number.client_id,
+                is_owner: false
+            });
+        }
+
+        return rep.send({
+            success: true,
+            message: "Numéro valide et autorisé",
+            phone_number: number.phone_number,
+            owner_client_id: number.client_id,
+            is_owner: true,
+            is_active: number.is_active
+        });
+
+    } catch (err) {
+        logger.error('Erreur validation numéro:', err);
+        return rep.status(500).send({
+            success: false,
+            message: "Erreur lors de la validation du numéro"
+        });
+    }
+}
+
+module.exports = { 
+    getAllNumbersWithAssignments,
+    addNumber,
+    updateNumber,
+    toggleNumberStatus,
+    getNumberDetails,
+    getClientsList,
+    getNumbersStats,
+    syncNumbersBulk, 
+    deleteNumber, 
+    reassignNumber, 
+    getMyNumbers, 
+    validateClientNumber,
+    getNumberAssignments,
+    assignNumberToClient,
+    removeNumberAssignment,
+    getClientNumberStats,
+    updateClientNumberStats,
+    getAllNumbersWithAssignmentsAndStats,
+    updateAssignmentLimit
+};

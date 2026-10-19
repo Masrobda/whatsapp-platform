@@ -1,0 +1,623 @@
+// src/services/inbox.service.js
+// Inbox centralisée des conversations WhatsApp
+const { query, getClient } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const logger = require('../utils/logger');
+const { emitToClient } = require('../socket'); // ← AJOUTER CET IMPORT
+
+// ============================================================
+// CONVERSATIONS
+// ============================================================
+
+/**
+ * Récupérer ou créer une conversation
+ */
+async function getOrCreateConversation(clientId, phoneNumber, channelPhone, senderName = null) {
+  // Chercher une conversation existante
+  const existing = await query(
+    `SELECT * FROM inbox_conversations
+     WHERE client_id = $1 AND phone_number = $2 AND channel_phone = $3`,
+    [clientId, phoneNumber, channelPhone]
+  );
+
+  if (existing.rows[0]) return existing.rows[0];
+
+  // Créer une nouvelle conversation
+  const convId = uuidv4();
+  const res = await query(
+    `INSERT INTO inbox_conversations
+       (id, client_id, phone_number, contact_name, channel_phone, status, unread_count)
+     VALUES ($1,$2,$3,$4,$5,'open',1) RETURNING *`,
+    [convId, clientId, phoneNumber, senderName || null, channelPhone]
+  );
+
+  return res.rows[0];
+}
+
+async function getConversations(clientId, filters = {}) {
+  const { page = 1, limit = 30, status, assigned_to, search, tag } = filters;
+  const offset = (page - 1) * limit;
+
+  let where = 'WHERE c.client_id = $1';
+  const params = [clientId];
+  let idx = 2;
+
+  if (status) { where += ` AND c.status = $${idx++}`; params.push(status); }
+  if (assigned_to === 'me' || assigned_to) {
+    where += ` AND c.assigned_to = $${idx++}`;
+    params.push(assigned_to === 'me' ? assigned_to : assigned_to);
+  }
+  if (search) {
+    where += ` AND (c.phone_number ILIKE $${idx} OR c.contact_name ILIKE $${idx})`;
+    params.push(`%${search}%`); idx++;
+  }
+
+  const countRes = await query(`SELECT COUNT(*) FROM inbox_conversations c ${where}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  const res = await query(
+    `SELECT c.*,
+       u.email as assigned_to_email,
+       COALESCE(u.full_name, u.email) as assigned_to_name
+     FROM inbox_conversations c
+     LEFT JOIN users u ON c.assigned_to = u.id
+     ${where}
+     ORDER BY c.last_message_at DESC
+     LIMIT $${idx} OFFSET $${idx+1}`,
+    [...params, limit, offset]
+  );
+
+  return {
+    success: true,
+    conversations: res.rows,
+    pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / limit) },
+    unread_total: res.rows.reduce((acc, c) => acc + (c.unread_count || 0), 0)
+  };
+}
+
+async function getConversationById(convId, clientId) {
+  const res = await query(
+    `SELECT c.*,
+       u.email as assigned_to_email,
+       COALESCE(u.full_name, u.email) as assigned_to_name
+     FROM inbox_conversations c
+     LEFT JOIN users u ON c.assigned_to = u.id
+     WHERE c.id = $1 AND c.client_id = $2`,
+    [convId, clientId]
+  );
+  if (!res.rows[0]) throw { statusCode: 404, code: 'NOT_FOUND', message: 'Conversation non trouvée' };
+  return res.rows[0];
+}
+
+async function updateConversation(convId, clientId, updates) {
+  const allowed = ['status', 'assigned_to', 'priority', 'contact_name', 'tags', 'is_bot'];
+  const sets = [];
+  const vals = [convId, clientId];
+  let idx = 3;
+
+  for (const key of allowed) {
+    if (updates[key] !== undefined) {
+      sets.push(`${key} = $${idx++}`);
+      vals.push(typeof updates[key] === 'object' && key !== 'tags' ? JSON.stringify(updates[key]) : updates[key]);
+    }
+  }
+  if (!sets.length) throw { statusCode: 400, message: 'Rien à mettre à jour' };
+  sets.push('updated_at = NOW()');
+
+  await query(
+    `UPDATE inbox_conversations SET ${sets.join(', ')} WHERE id = $1 AND client_id = $2`,
+    vals
+  );
+
+  return { success: true, conversation: await getConversationById(convId, clientId) };
+}
+
+async function markConversationRead(convId, clientId) {
+  console.log(`🔍 [markConversationRead] Début - conv=${convId}, client=${clientId}`);
+
+  try {
+    // Vérification simple
+    const check = await query(
+      `SELECT id FROM inbox_conversations 
+       WHERE id = $1 AND client_id = $2`,
+      [convId, clientId]
+    );
+
+    if (check.rows.length === 0) {
+      console.log(`❌ Conversation non trouvée ou accès refusé`);
+      throw { statusCode: 404, message: 'Conversation non trouvée ou accès refusé' };
+    }
+
+    // Mise à jour messages
+    await query(
+      `UPDATE inbox_messages 
+       SET status = 'read', read_at = NOW() 
+       WHERE conversation_id = $1 AND direction = 'inbound'`,
+      [convId]
+    );
+
+    // Mise à jour conversation
+    await query(
+      `UPDATE inbox_conversations 
+       SET unread_count = 0, updated_at = NOW() 
+       WHERE id = $1`,
+      [convId]
+    );
+
+    console.log(`✅ [markConversationRead] Conversation ${convId} marquée comme lue`);
+    return { success: true };
+
+  } catch (error) {
+    console.error(`❌ [markConversationRead] Erreur:`, error.message);
+    throw error;
+  }
+}
+
+// ============================================================
+// MESSAGES
+// ============================================================
+
+async function getMessages(convId, clientId, filters = {}) {
+  await getConversationById(convId, clientId); // vérif accès
+
+  const { limit = 50, before } = filters;
+  let where = 'WHERE conversation_id = $1';
+  const params = [convId];
+  let idx = 2;
+
+  if (before) {
+    where += ` AND created_at < $${idx++}`;
+    params.push(before);
+  }
+
+  const res = await query(
+    `SELECT m.*,
+       u.email as note_author_email,
+       COALESCE(u.full_name, u.email) as note_author_name
+     FROM inbox_messages m
+     LEFT JOIN users u ON m.note_author = u.id
+     ${where}
+     ORDER BY m.created_at DESC
+     LIMIT $${idx}`,
+    [...params, limit]
+  );
+
+  return { success: true, messages: res.rows.reverse() };
+}
+
+/**
+ * Envoyer un message depuis l'inbox (réponse agent)
+ */
+async function sendReply(convId, clientId, userId, data) {
+  const conv = await getConversationById(convId, clientId);
+  const { content, message_type = 'text', template_name, template_params = {}, media_url, phone_number } = data;
+
+  if (!content && !template_name) {
+    throw { statusCode: 400, code: 'CONTENT_REQUIRED', message: 'Contenu ou template requis' };
+  }
+
+  const emitter = phone_number || conv.channel_phone || '+237689588347';
+  const messageId = uuidv4();
+
+  // 1. Insérer d'abord le message en base avec statut 'pending'
+  let insertedMsg = null;
+  if (message_type === 'text' && content) {
+    const msgRes = await query(
+      `INSERT INTO inbox_messages
+         (id, conversation_id, direction, message_type, content, status, sender_name, wa_status)
+       VALUES ($1,$2,'outbound','text',$3,'pending','Agent','queued')
+       RETURNING *`,
+      [messageId, convId, content]
+    );
+    insertedMsg = msgRes.rows[0];
+  } else if (message_type === 'template' && template_name) {
+    const msgRes = await query(
+      `INSERT INTO inbox_messages
+         (id, conversation_id, direction, message_type, content, status, sender_name, metadata, wa_status)
+       VALUES ($1,$2,'outbound','template',$3,'pending','Agent',$4,'queued')
+       RETURNING *`,
+      [messageId, convId, `[Template: ${template_name}]`, JSON.stringify({ template_name, template_params })]
+    );
+    insertedMsg = msgRes.rows[0];
+  }
+
+  if (!insertedMsg) {
+    throw { statusCode: 400, message: 'Impossible de créer le message' };
+  }
+
+  // 2. Mettre à jour la conversation (preview)
+  const preview = message_type === 'text' ? content.substring(0, 100) : `[Template: ${template_name}]`;
+  await query(
+    `UPDATE inbox_conversations SET last_message_at = NOW(), last_message_preview = $1, updated_at = NOW()
+     WHERE id = $2`,
+    [preview, convId]
+  );
+
+  // 3. Tentative d'envoi WATI
+  let watiResult = { success: false };
+  try {
+    const watiService = require('./wati.service');
+    if (message_type === 'text' && content) {
+      watiResult = await watiService.sendTextMessage(conv.phone_number, content, emitter);
+    } else if (message_type === 'template' && template_name) {
+      watiResult = await watiService.sendTemplateMessage(conv.phone_number, template_name, template_params, 'fr', emitter);
+    }
+
+    if (watiResult.success) {
+      // Mise à jour du message avec succès
+      await query(
+        `UPDATE inbox_messages SET status = 'sent', wa_message_id = $1, wa_status = 'sent', sent_at = NOW()
+         WHERE id = $2`,
+        [watiResult.localMessageId || watiResult.watiMessageId, insertedMsg.id]
+      );
+      insertedMsg.status = 'sent';
+      insertedMsg.wa_message_id = watiResult.localMessageId || watiResult.watiMessageId;
+    } else {
+      // Échec : marquer le message comme failed
+      await query(
+        `UPDATE inbox_messages SET status = 'failed', error_message = $1, wa_status = 'failed'
+         WHERE id = $2`,
+        [watiResult.error || 'Unknown error', insertedMsg.id]
+      );
+      insertedMsg.status = 'failed';
+      // Ne pas lever d'exception, on veut que le message reste visible
+    }
+  } catch (err) {
+    console.error('Erreur lors de l’envoi WATI:', err);
+    await query(
+      `UPDATE inbox_messages SET status = 'failed', error_message = $1, wa_status = 'failed'
+       WHERE id = $2`,
+      [err.message, insertedMsg.id]
+    );
+    insertedMsg.status = 'failed';
+  }
+
+  // 4. Émettre l'événement WebSocket (même en cas d'échec, le message existe)
+  const { emitToClient } = require('../socket');
+  emitToClient(clientId, 'reply-sent', {
+    conversationId: convId,
+    message: insertedMsg
+  });
+
+  return { success: true, message: insertedMsg };
+}
+
+/**
+ * Ajouter une note interne à une conversation
+ */
+async function addNote(convId, clientId, userId, noteContent) {
+  await getConversationById(convId, clientId);
+
+  const res = await query(
+    `INSERT INTO inbox_messages
+       (id, conversation_id, direction, message_type, content, is_note, note_author, status)
+     VALUES ($1,$2,'outbound','text',$3,true,$4,'sent') RETURNING *`,
+    [uuidv4(), convId, noteContent, userId]
+  );
+
+  return { success: true, note: res.rows[0] };
+}
+
+/**
+ * Enregistrer un message entrant dans l'inbox
+ * Appelé depuis wati.webhook.controller.js
+ */
+async function processIncomingMessage(payload, clientId) {
+  try {
+    const {
+      fromNumber, messageText, messageType = 'text',
+      senderName, channelPhone, waMessageId, receivedAt
+    } = payload;
+
+    if (!fromNumber || !clientId) return;
+
+    const conv = await getOrCreateConversation(clientId, fromNumber, channelPhone || '', senderName);
+
+    // Insérer le message
+    const msgRes = await query(  // ← STOCKER LE RÉSULTAT
+      `INSERT INTO inbox_messages
+         (id, conversation_id, direction, message_type, content, wa_message_id, status, sender_name)
+       VALUES ($1,$2,'inbound',$3,$4,$5,'received',$6)
+       ON CONFLICT DO NOTHING RETURNING *`,  // ← AJOUTER RETURNING *
+      [uuidv4(), conv.id, messageType, messageText || '', waMessageId || null, senderName || fromNumber]
+    );
+
+    // Mettre à jour la conversation
+    const updatedConvRes = await query(  // ← STOCKER LE RÉSULTAT
+      `UPDATE inbox_conversations SET
+         last_message_at = $1, last_message_preview = $2,
+         unread_count = unread_count + 1, contact_name = COALESCE(contact_name, $3),
+         updated_at = NOW()
+       WHERE id = $4
+       RETURNING *`,  // ← AJOUTER RETURNING *
+      [receivedAt || new Date(), (messageText || '').substring(0, 100), senderName, conv.id]
+    );
+
+    logger.info(`[INBOX] Message entrant de ${fromNumber} → conv ${conv.id}`);
+
+    // ✅ EMIT AFTER INSERTION (corrigé)
+    if (msgRes.rows[0]) {
+      emitToClient(clientId, 'new-inbox-message', {
+        conversationId: conv.id,
+        message: msgRes.rows[0],
+        conversation: updatedConvRes.rows[0]
+      });
+    }
+
+    return conv;
+  } catch (err) {
+    logger.error('[INBOX] processIncomingMessage:', err);
+  }
+}
+
+// ============================================================
+// RÉPONSES RAPIDES (CANNED RESPONSES)
+// ============================================================
+
+async function getCannedResponses(clientId, search = '') {
+  let where = 'WHERE client_id = $1';
+  const params = [clientId];
+  if (search) { where += ' AND (title ILIKE $2 OR shortcut ILIKE $2 OR content ILIKE $2)'; params.push(`%${search}%`); }
+
+  const res = await query(
+    `SELECT * FROM inbox_canned_responses ${where} ORDER BY usage_count DESC, title ASC`,
+    params
+  );
+  return { success: true, responses: res.rows };
+}
+
+async function createCannedResponse(clientId, userId, data) {
+  const { title, shortcut, content, category } = data;
+  if (!title || !content) throw { statusCode: 400, message: 'Titre et contenu requis' };
+
+  const res = await query(
+    `INSERT INTO inbox_canned_responses (id, client_id, title, shortcut, content, category, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [uuidv4(), clientId, title, shortcut || null, content, category || null, userId]
+  );
+  return { success: true, response: res.rows[0] };
+}
+
+async function useCannedResponse(responseId, clientId) {
+  await query(
+    `UPDATE inbox_canned_responses SET usage_count = usage_count + 1 WHERE id = $1 AND client_id = $2`,
+    [responseId, clientId]
+  );
+  const res = await query(`SELECT * FROM inbox_canned_responses WHERE id = $1`, [responseId]);
+  return { success: true, response: res.rows[0] };
+}
+
+// ============================================================
+// STATS INBOX
+// ============================================================
+
+async function getInboxStats(clientId) {
+  const res = await query(
+    `SELECT
+       COUNT(*) as total,
+       COUNT(CASE WHEN status = 'open' THEN 1 END) as open,
+       COUNT(CASE WHEN status = 'assigned' THEN 1 END) as assigned,
+       COUNT(CASE WHEN status = 'resolved' THEN 1 END) as resolved,
+       COUNT(CASE WHEN status = 'waiting' THEN 1 END) as waiting,
+       COALESCE(SUM(unread_count), 0) as total_unread,
+       COUNT(CASE WHEN priority = 'urgent' AND status != 'resolved' THEN 1 END) as urgent
+     FROM inbox_conversations WHERE client_id = $1`,
+    [clientId]
+  );
+
+  // Par agent
+  const byAgent = await query(
+    `SELECT
+       u.email, COALESCE(u.full_name, u.email) as name,
+       COUNT(*) as assigned_count,
+       COUNT(CASE WHEN c.status = 'resolved' THEN 1 END) as resolved_count
+     FROM inbox_conversations c
+     JOIN users u ON u.id = c.assigned_to
+     WHERE c.client_id = $1 AND c.assigned_to IS NOT NULL
+     GROUP BY u.id, u.email, u.full_name`,
+    [clientId]
+  );
+
+  return {
+    success: true,
+    stats: res.rows[0],
+    by_agent: byAgent.rows
+  };
+
+  /**
+ * Récupérer les conversations des dernières 24h uniquement
+ */
+async function getRecentConversations(clientId, filters = {}) {
+  const { page = 1, limit = 30, status, assigned_to, search, tag } = filters;
+  const offset = (page - 1) * limit;
+  
+  // Calculer la date d'il y a 24h
+  const twentyFourHoursAgo = new Date();
+  twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+
+  let where = 'WHERE c.client_id = $1 AND c.last_message_at >= $2';
+  const params = [clientId, twentyFourHoursAgo];
+  let idx = 3;
+
+  if (status) { where += ` AND c.status = $${idx++}`; params.push(status); }
+  if (assigned_to === 'me' || assigned_to) {
+    where += ` AND c.assigned_to = $${idx++}`;
+    params.push(assigned_to === 'me' ? assigned_to : assigned_to);
+  }
+  if (search) {
+    where += ` AND (c.phone_number ILIKE $${idx} OR c.contact_name ILIKE $${idx})`;
+    params.push(`%${search}%`); idx++;
+  }
+
+  const countRes = await query(`SELECT COUNT(*) FROM inbox_conversations c ${where}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  const res = await query(
+    `SELECT c.*,
+       u.email as assigned_to_email,
+       COALESCE(u.full_name, u.email) as assigned_to_name
+     FROM inbox_conversations c
+     LEFT JOIN users u ON c.assigned_to = u.id
+     ${where}
+     ORDER BY c.last_message_at DESC
+     LIMIT $${idx} OFFSET $${idx+1}`,
+    [...params, limit, offset]
+  );
+
+  return {
+    success: true,
+    conversations: res.rows,
+    pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / limit) },
+    unread_total: res.rows.reduce((acc, c) => acc + (c.unread_count || 0), 0)
+  };
+}
+
+/**
+ * Récupérer les conversations des dernières X jours
+ */
+async function getConversationsByDays(clientId, days = 1, filters = {}) {
+  const { page = 1, limit = 30, status, assigned_to, search, tag } = filters;
+  const offset = (page - 1) * limit;
+  
+  // Calculer la date limite
+  const dateLimit = new Date();
+  dateLimit.setDate(dateLimit.getDate() - days);
+
+  let where = 'WHERE c.client_id = $1 AND c.last_message_at >= $2';
+  const params = [clientId, dateLimit];
+  let idx = 3;
+
+  if (status) { where += ` AND c.status = $${idx++}`; params.push(status); }
+  if (assigned_to === 'me' || assigned_to) {
+    where += ` AND c.assigned_to = $${idx++}`;
+    params.push(assigned_to === 'me' ? assigned_to : assigned_to);
+  }
+  if (search) {
+    where += ` AND (c.phone_number ILIKE $${idx} OR c.contact_name ILIKE $${idx})`;
+    params.push(`%${search}%`); idx++;
+  }
+
+  const countRes = await query(`SELECT COUNT(*) FROM inbox_conversations c ${where}`, params);
+  const total = parseInt(countRes.rows[0].count);
+
+  const res = await query(
+    `SELECT c.*,
+       u.email as assigned_to_email,
+       COALESCE(u.full_name, u.email) as assigned_to_name
+     FROM inbox_conversations c
+     LEFT JOIN users u ON c.assigned_to = u.id
+     ${where}
+     ORDER BY c.last_message_at DESC
+     LIMIT $${idx} OFFSET $${idx+1}`,
+    [...params, limit, offset]
+  );
+
+  return {
+    success: true,
+    conversations: res.rows,
+    pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / limit) },
+    unread_total: res.rows.reduce((acc, c) => acc + (c.unread_count || 0), 0)
+  };
+}
+
+/**
+ * Exporter une conversation complète au format CSV
+ */
+async function exportConversationToCSV(convId, clientId) {
+  try {
+    const conv = await getConversationById(convId, clientId);
+    
+    const messagesRes = await query(
+      `SELECT 
+         m.created_at,
+         m.direction,
+         m.message_type,
+         m.content,
+         m.status,
+         m.wa_status,
+         m.sent_at,
+         m.delivered_at,
+         m.read_at,
+         m.sender_name,
+         COALESCE(u.full_name, u.email) as note_author
+       FROM inbox_messages m
+       LEFT JOIN users u ON m.note_author = u.id
+       WHERE m.conversation_id = $1
+       ORDER BY m.created_at ASC`,
+      [convId]
+    );
+
+    const formatDateForCSV = (dateString) => {
+      if (!dateString) return '';
+      const date = new Date(dateString);
+      if (isNaN(date.getTime())) return '';
+      
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const year = date.getFullYear();
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      const seconds = String(date.getSeconds()).padStart(2, '0');
+      
+      return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
+    };
+
+    const headers = [
+      'Date',
+      'Direction',
+      'Type',
+      'Contenu',
+      'Statut',
+      'Statut WhatsApp',
+      'Date envoi',
+      'Date livraison',
+      'Date lecture',
+      'Expéditeur'
+    ];
+
+    const rows = messagesRes.rows.map(msg => [
+      formatDateForCSV(msg.created_at),
+      msg.direction === 'inbound' ? '📥 Reçu' : (msg.is_note ? '📝 Note interne' : '📤 Envoyé'),
+      msg.message_type,
+      msg.content || '',
+      msg.status,
+      msg.wa_status || '',
+      formatDateForCSV(msg.sent_at),
+      formatDateForCSV(msg.delivered_at),
+      formatDateForCSV(msg.read_at),
+      msg.sender_name || (msg.direction === 'outbound' ? 'Agent' : msg.note_author || 'Client')
+    ]);
+
+    const csv = [
+      `# Conversation avec ${conv.contact_name || conv.phone_number}`,
+      `# Téléphone: ${conv.phone_number}`,
+      `# Canal: ${conv.channel_phone}`,
+      `# Statut: ${conv.status}`,
+      `# Exporté le: ${new Date().toLocaleString('fr-FR')}`,
+      '',
+      headers.join(','),
+      ...rows.map(row => row.map(cell => `"${String(cell || '').replace(/"/g, '""')}"`).join(','))
+    ].join('\n');
+
+    return {
+      success: true,
+      csv,
+      conversation: conv,
+      messageCount: messagesRes.rows.length
+    };
+  } catch (error) {
+    logger.error('Erreur export conversation CSV:', error);
+    throw error;
+  }
+}
+
+}
+
+module.exports = {
+  getOrCreateConversation, getConversations, getConversationById,
+  updateConversation, markConversationRead,
+  getMessages, sendReply, addNote,
+  processIncomingMessage,
+  getCannedResponses, createCannedResponse, useCannedResponse,
+  getInboxStats
+};

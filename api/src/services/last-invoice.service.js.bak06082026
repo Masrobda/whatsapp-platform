@@ -1,0 +1,47 @@
+// api/src/services/last-invoice.service.js
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+const REMOTE_TRIGGER_URL = process.env.REMOTE_INVOICE_TRIGGER_URL || 'https://factures.camlight.cm/api/trigger_invoice.php';
+
+/**
+ * Déclenche l'envoi de la dernière facture pour un contrat donné
+ * @param {string} contractNumber - Numéro de contrat (9 chiffres)
+ * @param {string} recipientPhone - Numéro de téléphone du client (format E.164)
+ * @returns {Promise<{ success: boolean, alreadySent: boolean, message: string }>}
+ */
+async function requestLastInvoice(contractNumber, recipientPhone) {
+  try {
+    const response = await axios.get(REMOTE_TRIGGER_URL, {
+      params: {
+        contrat: contractNumber,
+        phone: recipientPhone,
+      },
+      timeout: 10000,
+    });
+
+    const data = response.data;
+
+    // Détection du cas "déjà envoyée"
+    const alreadySent = data.status === 'info' && (
+      data.message?.includes('déjà envoyée') ||
+      data.message?.includes('already sent')
+    );
+
+    if (data.status === 'success') {
+      logger.info(`[LAST-INVOICE] Succès pour contrat ${contractNumber}`);
+      return { success: true, alreadySent: false, message: 'Facture en cours de traitement' };
+    } else if (alreadySent) {
+      logger.info(`[LAST-INVOICE] Facture déjà envoyée pour contrat ${contractNumber}`);
+      return { success: true, alreadySent: true, message: data.message || 'Facture déjà envoyée' };
+    } else {
+      logger.warn(`[LAST-INVOICE] Réponse inattendue pour ${contractNumber}:`, data);
+      return { success: false, alreadySent: false, message: data.message || 'Erreur serveur distant' };
+    }
+  } catch (error) {
+    logger.error(`[LAST-INVOICE] Erreur pour contrat ${contractNumber}:`, error.message);
+    return { success: false, alreadySent: false, message: 'Erreur de communication avec le serveur de facturation' };
+  }
+}
+
+module.exports = { requestLastInvoice };

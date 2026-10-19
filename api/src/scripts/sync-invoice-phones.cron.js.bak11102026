@@ -1,0 +1,80 @@
+// /var/www/numericexport/api/src/scripts/sync-invoice-phones.cron.js
+require('dotenv').config();
+const { query } = require('../config/database');
+const logger = require('../utils/logger');
+
+// Fenêtre : on ne touche qu'aux factures importées récemment.
+// 60 jours couvre largement le cycle courant + les rattrapages.
+const WINDOW_DAYS = parseInt(process.env.PHONE_SYNC_WINDOW_DAYS || '60', 10);
+
+// Statuts qu'on accepte de réécrire : pending / skipped.
+// On ne touche JAMAIS à queued / sent / delivered / read / failed (déjà engagés).
+const REWRITABLE_STATUSES = ['pending', 'skipped'];
+
+(async () => {
+  try {
+    const t0 = Date.now();
+
+    // ── 1. Combien de lignes seraient touchées (dry-run)
+    const preview = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM mysql_invoices_all AS inv
+         JOIN whatsapp_valid_contacts AS wvc
+           ON inv.numero_contrat = wvc.contract_number
+        WHERE inv.whatsapp_status = ANY($1)
+          AND inv.imported_at > NOW() - ($2 || ' days')::interval
+          AND (
+            inv.telephone IS NULL
+            OR regexp_replace(inv.telephone, '[^0-9]', '', 'g')
+               <> regexp_replace(wvc.whatsapp_phone, '[^0-9]', '', 'g')
+          )`,
+      [REWRITABLE_STATUSES, String(WINDOW_DAYS)]
+    );
+    logger.info(`[PHONE-SYNC] ${preview.rows[0].n} lignes à mettre à jour (fenêtre ${WINDOW_DAYS}j)`);
+
+    if (preview.rows[0].n === 0) {
+      logger.info('[PHONE-SYNC] rien à faire');
+      process.exit(0);
+    }
+
+    // ── 2. UPDATE en une seule requête
+    const res = await query(
+      `UPDATE mysql_invoices_all AS inv
+          SET telephone = wvc.whatsapp_phone,
+              whatsapp_error = CASE
+                WHEN inv.whatsapp_status = 'skipped'
+                 AND inv.whatsapp_error ILIKE '%Aucun numéro%'
+                THEN NULL  -- ce skip n'est plus valide
+                ELSE inv.whatsapp_error
+              END,
+              whatsapp_status = CASE
+                WHEN inv.whatsapp_status = 'skipped'
+                 AND inv.whatsapp_error ILIKE '%Aucun numéro%'
+                THEN 'pending'  -- retry avec le nouveau numéro
+                ELSE inv.whatsapp_status
+              END,
+              whatsapp_attempts = CASE
+                WHEN inv.whatsapp_status = 'skipped'
+                 AND inv.whatsapp_error ILIKE '%Aucun numéro%'
+                THEN 0
+                ELSE inv.whatsapp_attempts
+              END
+         FROM whatsapp_valid_contacts AS wvc
+        WHERE inv.numero_contrat = wvc.contract_number
+          AND inv.whatsapp_status = ANY($1)
+          AND inv.imported_at > NOW() - ($2 || ' days')::interval
+          AND (
+            inv.telephone IS NULL
+            OR regexp_replace(inv.telephone, '[^0-9]', '', 'g')
+               <> regexp_replace(wvc.whatsapp_phone, '[^0-9]', '', 'g')
+          )`,
+      [REWRITABLE_STATUSES, String(WINDOW_DAYS)]
+    );
+
+    logger.info(`[PHONE-SYNC] ✅ ${res.rowCount} lignes mises à jour en ${Date.now() - t0}ms`);
+    process.exit(0);
+  } catch (err) {
+    logger.error('[PHONE-SYNC] Erreur:', err.message);
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,82 @@
+// src/routes/v1/admin.routes.js
+const {
+  // WhatsApp routes (controllers déjà créés précédemment)
+  getAllWhatsappNumbers,
+  getWhatsappNumberDetail,
+  pauseQueueHandler,
+  resumeQueueHandler,
+  disableWhatsappNumberHandler,
+  enableWhatsappNumberHandler,
+  assignWhatsappNumberHandler,
+} = require('../../controllers/whatsapp.admin.controller');
+
+const {
+  // Storage routes (nouveau module)
+  getAllStorageSpacesHandler,
+  updateStorageSizeHandler,
+  activateStorageSpaceHandler,
+  renewStorageSpaceHandler,
+  reassignStorageSpaceHandler,
+  blockStorageSpaceHandler,
+  deleteStorageSpaceHandler,
+} = require('../../controllers/storage.controller');
+
+const { authenticateJWT } = require('../../middlewares/auth.middleware');
+const { requireRole, ROLES } = require('../../middlewares/role.middleware');
+
+async function adminRoutes(fastify, opts) {
+  fastify.addHook('preHandler', authenticateJWT);
+  fastify.addHook('preHandler', requireRole(ROLES.ADMIN));
+
+  // ============================================s
+  // ROUTES ADMIN - WHATSAPP NUMBERS
+  // ============================================
+
+  // Liste complète des numéros avec statut + stats
+  fastify.get('/whatsapp/numbers', getAllWhatsappNumbers);
+
+  // Détail d’un seul numéro
+  fastify.get('/whatsapp/:phoneNumber', getWhatsappNumberDetail);
+
+  // Pause queue
+  fastify.post('/whatsapp/:phoneNumber/pause', pauseQueueHandler);
+
+  // Reprendre queue
+  fastify.post('/whatsapp/:phoneNumber/resume', resumeQueueHandler);
+
+  // Désactiver numéro (is_active = false + pause queue)
+  fastify.post('/whatsapp/:phoneNumber/disable', disableWhatsappNumberHandler);
+
+  // Activer numéro (is_active = true + resume queue)
+  fastify.post('/whatsapp/:phoneNumber/enable', enableWhatsappNumberHandler);
+
+  // Réassigner numéro à un autre client
+  fastify.post('/whatsapp/:phoneNumber/assign', assignWhatsappNumberHandler);
+
+  // ============================================
+  // ROUTES ADMIN - ESPACES DE STOCKAGE CLIENTS
+  // ============================================
+
+  // Liste tous les espaces de stockage
+  fastify.get('/storage/spaces', getAllStorageSpacesHandler);
+
+  // Modifier la taille d’un espace
+  fastify.put('/storage/:spaceId/size', updateStorageSizeHandler);
+
+  // Renouveler un espace (prolonger expires_at)
+  fastify.post('/storage/:spaceId/renew', renewStorageSpaceHandler);
+
+  // Réassigner un espace à un autre client
+  fastify.post('/storage/:spaceId/reassign', reassignStorageSpaceHandler);
+
+  // Bloquer un espace (is_active = false)
+  fastify.post('/storage/:spaceId/block', blockStorageSpaceHandler);
+
+  // Supprimer définitivement un espace + contenu
+  fastify.delete('/storage/:spaceId', deleteStorageSpaceHandler);
+
+  // Activer/Approuver un espace (is_active = true)
+  fastify.post('/storage/:spaceId/activate', require('../../controllers/storage.controller').activateStorageSpaceHandler)
+}
+
+module.exports = adminRoutes;

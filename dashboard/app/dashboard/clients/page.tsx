@@ -1,0 +1,367 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { admin as adminAPI } from '@/lib/api';
+import Card, { CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
+import Button from '@/components/ui/Button';
+import Input from '@/components/ui/Input';
+import Tabs from '@/components/ui/Tabs';
+import { formatDate, formatCurrency, copyToClipboard } from '@/lib/utils';
+import { FiUsers, FiSearch, FiEdit, FiCopy, FiRefreshCw } from 'react-icons/fi';
+
+export default function ClientsPage() {
+  const [clients, setClients] = useState<any[]>([]);
+  const [pagination, setPagination] = useState({ total: 0, page: 1, limit: 10, totalPages: 0 });
+  const [searchTerm, setSearchTerm] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showRechargeModal, setShowRechargeModal] = useState(false);
+  const [selectedClient, setSelectedClient] = useState<any>(null);
+  const [pricingData, setPricingData] = useState({ message_cost: '' });
+  const [rechargeData, setRechargeData] = useState({ quantity: '', notes: '' });
+
+  useEffect(() => {
+    loadClients();
+  }, [pagination.page, searchTerm]);
+
+  const loadClients = async () => {
+    setIsLoading(true);
+    try {
+      const response = await adminAPI.getClients({
+        page: pagination.page,
+        limit: pagination.limit,
+        search: searchTerm || undefined,
+      });
+      setClients(response.clients);
+      setPagination(response.pagination);
+    } catch (error) {
+      console.error('Erreur chargement clients:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleUpdatePricing = async () => {
+    if (!selectedClient || !pricingData.message_cost) return;
+    try {
+      await adminAPI.updatePricing(
+        selectedClient.id,
+        parseFloat(pricingData.message_cost)
+      );
+      setShowPricingModal(false);
+      setPricingData({ message_cost: '' });
+      loadClients();
+      alert('Tarif mis à jour avec succès');
+    } catch (error) {
+      alert('Erreur lors de la mise à jour du tarif');
+    }
+  };
+
+  const handleRecharge = async () => {
+    if (!selectedClient || !rechargeData.quantity) return;
+    try {
+      await adminAPI.rechargeQuota(
+        selectedClient.id,
+        parseInt(rechargeData.quantity),
+        rechargeData.notes
+      );
+      setShowRechargeModal(false);
+      setRechargeData({ quantity: '', notes: '' });
+      loadClients();
+      alert('Quota rechargé avec succès');
+    } catch (error) {
+      alert('Erreur lors de la recharge');
+    }
+  };
+
+  const tabs = [
+    {
+      id: 'all',
+      label: 'Tous les clients',
+      content: (
+        <div className="space-y-4">
+          {isLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-200">
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Entreprise</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Email</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Quota</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Tarif/msg</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Statut</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Inscrit le</th>
+                    <th className="text-left py-3 px-4 text-sm font-medium text-gray-500">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {clients.map((client) => (
+                    <tr key={client.id} className="border-b border-gray-100 hover:bg-gray-50">
+                      <td className="py-3 px-4">
+                        <div>
+                          <p className="font-medium">{client.company_name}</p>
+                          <p className="text-xs text-gray-500">{client.phone}</p>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex items-center gap-2">
+                          <span>{client.email}</span>
+                          <button
+                            onClick={() => copyToClipboard(client.email)}
+                            className="text-gray-400 hover:text-primary"
+                          >
+                            <FiCopy size={14} />
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div>
+                          <p className="font-medium">{client.quota_remaining || 0}</p>
+                          <p className="text-xs text-gray-500">/{client.quota_total || 0}</p>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                          client.message_cost === 20
+                            ? 'bg-gray-100 text-gray-700'
+                            : 'bg-secondary/20 text-secondary-dark'
+                        }`}>
+                          {formatCurrency(client.message_cost || 20)}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                          !client.is_active ? 'bg-red-100 text-red-800' :
+                          client.is_blocked ? 'bg-orange-100 text-orange-800' :
+                          'bg-green-100 text-green-800'
+                        }`}>
+                          {!client.is_active ? 'Désactivé' :
+                           client.is_blocked ? 'Bloqué' : 'Actif'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-sm text-gray-500">
+                        {formatDate(client.created_at)}
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex gap-2 flex-wrap">
+                          {/* Boutons existants */}
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              setSelectedClient(client);
+                              setPricingData({ message_cost: client.message_cost?.toString() || '20' });
+                              setShowPricingModal(true);
+                            }}
+                          >
+                            <FiEdit size={14} />
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              setSelectedClient(client);
+                              setRechargeData({ quantity: '100', notes: '' });
+                              setShowRechargeModal(true);
+                            }}
+                          >
+                            <FiRefreshCw size={14} />
+                          </Button>
+
+                          {/* Nouveau : Bloquer / Débloquer */}
+                          <Button
+                            size="sm"
+                            variant={client.is_blocked ? "secondary" : "danger"}
+                            onClick={() => {
+                              if (client.is_blocked) {
+                                if (confirm(`Débloquer ${client.company_name} ?`)) {
+                                  adminAPI.toggleBlock(client.id, false).then(() => loadClients());
+                                }
+                              } else {
+                                const reason = prompt("Raison du blocage ?");
+                                const days = prompt("Durée en jours (vide = permanent) ?");
+                                const duration = days ? parseInt(days) : null;
+                                if (reason && confirm(`Bloquer ${client.company_name} ?`)) {
+                                  adminAPI.toggleBlock(client.id, true, reason, duration).then(() => loadClients());
+                                }
+                              }
+                            }}
+                          >
+                            {client.is_blocked ? 'Débloquer' : 'Bloquer'}
+                          </Button>
+
+                          {/* Nouveau : Activer / Désactiver */}
+                          <Button
+                            size="sm"
+                            variant={client.is_active ? "danger" : "secondary"}
+                            onClick={() => {
+                              if (client.is_active) {
+                                if (confirm(`Désactiver définitivement ${client.company_name} ?`)) {
+                                  adminAPI.toggleActive(client.id, false).then(() => loadClients());
+                                }
+                              } else {
+                                if (confirm(`Réactiver ${client.company_name} ?`)) {
+                                  adminAPI.toggleActive(client.id, true).then(() => loadClients());
+                                }
+                              }
+                            }}
+                          >
+                            {client.is_active ? 'Désactiver' : 'Activer'}
+                          </Button>
+                          <Button
+  size="sm"
+  variant="danger"
+  onClick={() => {
+    if (confirm(`Voulez-vous VRAIMENT supprimer le client ${client.company_name} (${client.email}) ?\n\nCette action est irréversible et supprimera aussi tous ses messages associés.`)) {
+      adminAPI.deleteClient(client.id).then(() => {
+        loadClients(); // recharge la liste
+        alert('Client supprimé avec succès');
+      }).catch(err => {
+        alert('Erreur lors de la suppression : ' + (err.response?.data?.message || 'Erreur inconnue'));
+      });
+    }
+  }}
+>
+  Supprimer
+</Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-dark">Gestion des clients</h1>
+          <p className="text-gray-500 mt-1">Administrez les comptes clients et leurs quotas</p>
+        </div>
+      </div>
+
+      {/* Search bar */}
+      <Card>
+        <CardContent>
+          <div className="flex gap-4">
+            <div className="flex-1">
+              <Input
+                placeholder="Rechercher par nom, email ou téléphone..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                icon={<FiSearch />}
+              />
+            </div>
+            <Button onClick={() => loadClients()}>
+              Rechercher
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Clients list */}
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <div className="flex items-center gap-2">
+              <FiUsers />
+              <span>Liste des clients ({pagination.total})</span>
+            </div>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Tabs tabs={tabs} />
+        </CardContent>
+      </Card>
+
+      {/* Modals */}
+      {showPricingModal && selectedClient && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-md w-full p-6">
+            <h3 className="text-lg font-bold text-dark mb-4">
+              Modifier le tarif pour {selectedClient.company_name}
+            </h3>
+            <Input
+              label="Prix par message (FCFA)"
+              type="number"
+              value={pricingData.message_cost}
+              onChange={(e) => setPricingData({ message_cost: e.target.value })}
+              min="1"
+              step="0.01"
+            />
+            <div className="flex gap-3 mt-6">
+              <Button
+                variant="outline"
+                onClick={() => setShowPricingModal(false)}
+                className="flex-1"
+              >
+                Annuler
+              </Button>
+              <Button
+                onClick={handleUpdatePricing}
+                className="flex-1"
+              >
+                Enregistrer
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRechargeModal && selectedClient && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-md w-full p-6">
+            <h3 className="text-lg font-bold text-dark mb-4">
+              Recharger le quota pour {selectedClient.company_name}
+            </h3>
+            <div className="space-y-4">
+              <Input
+                label="Nombre de messages"
+                type="number"
+                value={rechargeData.quantity}
+                onChange={(e) => setRechargeData({ ...rechargeData, quantity: e.target.value })}
+                min="1"
+                placeholder="100"
+              />
+              <div>
+                <label className="block text-sm font-medium text-dark mb-2">Notes (optionnel)</label>
+                <textarea
+                  value={rechargeData.notes}
+                  onChange={(e) => setRechargeData({ ...rechargeData, notes: e.target.value })}
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+                  rows={3}
+                  placeholder="Raison de la recharge..."
+                />
+              </div>
+            </div>
+            <div className="flex gap-3 mt-6">
+              <Button
+                variant="outline"
+                onClick={() => setShowRechargeModal(false)}
+                className="flex-1"
+              >
+                Annuler
+              </Button>
+              <Button
+                onClick={handleRecharge}
+                className="flex-1"
+              >
+                Confirmer
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,194 @@
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const whatsappService = require('../services/whatsapp.service');
+const logger = require('../utils/logger');
+
+/**
+ * Worker pour traiter les messages WhatsApp – Version optimisée (2026)
+ * Respecte les limites Meta ~4–10 msg/s selon tier
+ * Concurrency basse pour limiter CPU + éviter rate-limits agressifs
+ */
+const messageWorker = new Worker(
+  'whatsapp-messages',
+  async (job) => {
+    const { 
+      messageId, 
+      client_id, 
+      recipient_phone, 
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type = 'image'  // valeur par défaut
+    } = job.data;
+
+    // Logging minimal en début (pas à chaque job si volume élevé)
+    if (job.attemptsMade === 0) {
+      logger.info('Début traitement message', {
+        jobId: job.id,
+        messageId,
+        recipient: recipient_phone,
+        type: message_type,
+      });
+    }
+
+    try {
+      // Vérifier quota (cette requête est rapide → acceptable)
+      const quotaCheck = await query(
+        'SELECT quota_remaining, is_active FROM clients WHERE id = $1',
+        [client_id]
+      );
+
+      if (quotaCheck.rows.length === 0 || !quotaCheck.rows[0].is_active) {
+        throw new Error('Client inactif ou non trouvé');
+      }
+
+      if (quotaCheck.rows[0].quota_remaining <= 0) {
+        throw new Error('Quota insuffisant');
+      }
+
+      let result;
+
+      switch (message_type) {
+        case 'text':
+          result = await whatsappService.sendTextMessage(recipient_phone, message_content);
+          break;
+
+        case 'template':
+          result = await whatsappService.sendTemplateMessage(
+            recipient_phone,
+            template_name,
+            template_language || 'fr',
+            template_params || {}
+          );
+          break;
+
+        case 'media':
+          result = await whatsappService.sendMediaMessage(
+            recipient_phone,
+            media_type,
+            media_url,
+            message_content || ''
+          );
+          break;
+
+        default:
+          throw new Error(`Type de message non supporté: ${message_type}`);
+      }
+
+      if (!result?.success) {
+        // Échec → update DB
+        await query(
+          `UPDATE messages 
+           SET wa_status = $1, 
+               wa_error_code = $2, 
+               wa_error_message = $3,
+               failed_at = CURRENT_TIMESTAMP
+           WHERE id = $4`,
+          ['failed', result?.errorCode || 'UNKNOWN', result?.error || 'Échec inconnu', messageId]
+        );
+
+        throw new Error(result?.error || 'Échec envoi WhatsApp');
+      }
+
+      // Succès
+      await query(
+        `UPDATE messages 
+         SET wa_message_id = $1, 
+             wa_status = $2,
+             sent_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [result.messageId, 'sent', messageId]
+      );
+
+      logger.info('Message envoyé OK', { messageId, waMessageId: result.messageId });
+
+      await job.updateProgress(100);
+
+      return {
+        success: true,
+        waMessageId: result.messageId,
+        status: result.status,
+      };
+
+    } catch (error) {
+      // Logging erreur + update DB si pas déjà failed
+      logger.error('Erreur traitement message', {
+        messageId,
+        attempt: job.attemptsMade + 1,
+        error: error.message,
+        stack: error.stack?.slice(0, 300), // tronqué pour éviter logs trop gros
+      });
+
+      await query(
+        `UPDATE messages 
+         SET wa_status = $1, 
+             wa_error_message = $2,
+             failed_at = CURRENT_TIMESTAMP
+         WHERE id = $3 AND wa_status != 'failed'`,
+        ['failed', error.message.slice(0, 500), messageId] // limite taille
+      );
+
+      throw error; // BullMQ va gérer le retry
+    }
+  },
+  {
+    connection: redisConnection,
+
+    // === CONFIG OPTIMISÉE POUR ÉVITER SATURATION CPU ===
+    concurrency: 2,                     // 1 ou 2 suffisent largement pour WhatsApp
+    stalledInterval: 60000,             // 60s au lieu de 30s → moins de checks inutiles
+
+    limiter: {
+      max: 6,                           // 6 messages max...
+      duration: 1000,                   // ... par seconde (très conservateur)
+      bounceBack: true                  // rejette les jobs au lieu de les accumuler
+    },
+
+    // Retries intelligents → évite les boucles CPU infinies
+    attempts: 6,
+    backoff: {
+      type: 'exponential',
+      delay: 3000,                      // 3s → 6s → 12s → 24s → 48s → 96s
+    },
+
+    // Nettoyage automatique pour éviter accumulation Redis + CPU
+    removeOnComplete: { age: 3600, count: 1000 },    // 1h max, 1000 jobs
+    removeOnFail:    { age: 86400, count: 2000 },    // 24h max pour les fails
+  }
+);
+
+// Événements – logging réduit pour prod
+messageWorker.on('completed', (job) => {
+  // Pas de log systématique → trop verbeux en volume élevé
+  // logger.info('Job complété', { jobId: job.id });
+});
+
+messageWorker.on('failed', (job, err) => {
+  logger.error('Job échoué définitivement', {
+    jobId: job?.id,
+    error: err.message,
+    attempts: job?.attemptsMade,
+  });
+});
+
+messageWorker.on('error', (err) => {
+  logger.error('Erreur grave worker WhatsApp', err);
+});
+
+// Arrêt gracieux
+const gracefulShutdown = async (signal) => {
+  logger.info(`${signal} reçu → arrêt worker WhatsApp`);
+  await messageWorker.close();
+  process.exit(0);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+
+logger.info('✅ Message Worker WhatsApp démarré (concurrency:2, limiter:6/s)');
+
+module.exports = messageWorker;

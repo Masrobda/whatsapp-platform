@@ -1,0 +1,267 @@
+// src/workers/whatsapp.worker.js
+// Lancez avec : node src/workers/whatsapp.worker.js --phone=+237689588347
+const { Worker } = require('bullmq');
+const { redisConnection } = require('../config/redis');
+const { query } = require('../config/database');
+const watiService = require('../services/wati.service');
+const logger = require('../utils/logger');
+
+const phoneArg = process.argv.find(arg => arg.startsWith('--phone='));
+const phoneNumber = phoneArg ? phoneArg.split('=')[1] : null;
+
+if (!phoneNumber) {
+  logger.error('Argument obligatoire : --phone=+237xxxxxxxxx');
+  process.exit(1);
+}
+
+const normalized = phoneNumber.replace(/[^0-9+]/g, '');
+const queueName = `whatsapp-messages-${normalized}`;
+
+// ============================================================
+// DÉBIT CONFIGURABLE VIA .env
+// ============================================================
+// WATI_MAX_PER_MINUTE : débit réel confirmé par le support WATI pour ce compte
+// (à ajuster une fois la réponse de WATI obtenue - voir échange support).
+// WORKER_CONCURRENCY   : nombre de jobs traités en parallèle par CE process.
+//
+// Valeurs par défaut prudentes tant que WATI n'a pas confirmé de plafond plus élevé.
+// Ne pas dépasser le plafond réel WATI sous peine de 429 en rafale.
+const WATI_MAX_PER_MINUTE = parseInt(process.env.WATI_MAX_PER_MINUTE, 10) || 500;
+const WORKER_CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY, 10) || 10;
+
+// BullMQ limiter : max requêtes par fenêtre de 1s, dérivé du débit/minute
+const LIMITER_MAX_PER_SECOND = Math.max(1, Math.floor(WATI_MAX_PER_MINUTE / 60));
+
+logger.info(
+  `Worker WATI démarré pour numéro ${phoneNumber} (queue: ${queueName}) - ` +
+  `concurrency=${WORKER_CONCURRENCY}, limiter=${LIMITER_MAX_PER_SECOND}/s (~${WATI_MAX_PER_MINUTE}/min)`
+);
+
+const worker = new Worker(
+  queueName,
+  async (job) => {
+    const {
+      messageId,
+      client_id,
+      recipient_phone,
+      message_type,
+      template_name,
+      template_language,
+      template_params,
+      message_content,
+      media_url,
+      media_type = 'image',
+      invoice_data
+    } = job.data;
+
+    try {
+      // Vérification quota (par client)
+      const quotaCheck = await query(
+        'SELECT quota_remaining, is_active FROM clients WHERE id = $1',
+        [client_id]
+      );
+
+      if (quotaCheck.rows.length === 0 || !quotaCheck.rows[0].is_active) {
+        throw new Error('Client inactif ou non trouvé');
+      }
+
+      if (quotaCheck.rows[0].quota_remaining <= 0) {
+        throw new Error('Quota insuffisant');
+      }
+
+      // Vérification cooldown (2 semaines)
+      const cooldownCheck = await checkCooldown(recipient_phone, client_id);
+      if (!cooldownCheck.canSend) {
+        throw new Error(cooldownCheck.reason);
+      }
+
+      let result;
+      logger.info(`Envoi via WATI - Type: ${message_type}`, {
+        messageId,
+        recipient: recipient_phone,
+        template: template_name
+      });
+
+      switch (message_type) {
+        case 'text':
+          result = await watiService.sendTextMessage(recipient_phone, message_content);
+          break;
+
+        case 'template':
+          // Cas spécial: facture avec PDF
+          if (invoice_data && invoice_data.pdfUrl) {
+            result = await watiService.sendInvoiceWithPDF(recipient_phone, invoice_data);
+          } else {
+            result = await watiService.sendTemplateMessage(
+              recipient_phone,
+              template_name,
+              template_params || [],
+              template_language || 'en'
+            );
+          }
+          break;
+
+        case 'media':
+          result = await watiService.sendMediaMessage(
+            recipient_phone,
+            media_url,
+            media_type,
+            message_content || ''
+          );
+          break;
+
+        default:
+          throw new Error(`Type non supporté: ${message_type}`);
+      }
+
+      if (!result.success) {
+        // Si WATI renvoie un 429 (rate limit dépassé côté WATI), on le laisse
+        // remonter comme erreur normale : BullMQ va retenter avec le backoff
+        // exponentiel déjà configuré (attempts + backoff ci-dessous), ce qui
+        // absorbe naturellement les pics sans planter le worker.
+        await query(
+          `UPDATE messages
+           SET wa_status = 'failed',
+               wa_error_code = $1,
+               wa_error_message = $2,
+               failed_at = CURRENT_TIMESTAMP
+           WHERE id = $3`,
+          [result.errorCode || 'UNKNOWN', result.error || 'Échec inconnu', messageId]
+        );
+        throw new Error(result.error);
+      }
+
+      // Mettre à jour le message avec succès
+      await query(
+        `UPDATE messages
+         SET wa_message_id = $1,
+             wa_status = $2,
+             sent_at = CURRENT_TIMESTAMP,
+             channel_used = 'wati'
+         WHERE id = $3`,
+        [result.messageId, result.status || 'sent', messageId]
+      );
+
+      // Mettre à jour la table client si elle existe
+      const clientTableName = `messages_client_${client_id.replace(/-/g, '_')}`;
+      await query(
+        `UPDATE ${clientTableName}
+         SET wa_message_id = $1,
+             wa_status = $2,
+             sent_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [result.messageId, result.status || 'sent', messageId]
+      ).catch(err => logger.warn('Table client non trouvée ou erreur:', err.message));
+
+      logger.info('Message envoyé avec succès via WATI', {
+        messageId,
+        waMessageId: result.messageId,
+        recipient: recipient_phone
+      });
+
+      await job.updateProgress(100);
+
+      return { success: true, waMessageId: result.messageId };
+
+    } catch (error) {
+      logger.error('Erreur traitement message WATI', {
+        messageId,
+        recipient: recipient_phone,
+        attempt: job.attemptsMade + 1,
+        error: error.message,
+      });
+
+      await query(
+        `UPDATE messages
+         SET wa_status = 'failed',
+             wa_error_message = $1,
+             failed_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND wa_status != 'failed'`,
+        [error.message.slice(0, 500), messageId]
+      );
+
+      throw error;
+    }
+  },
+  {
+    connection: redisConnection,
+    concurrency: WORKER_CONCURRENCY,
+    stalledInterval: 120000,
+    limiter: { max: LIMITER_MAX_PER_SECOND, duration: 1000, bounceBack: true },
+    attempts: 8,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7200, count: 2000 },
+    removeOnFail: { age: 172800, count: 5000 },
+  }
+);
+
+// Fonction de vérification du cooldown
+async function checkCooldown(recipientPhone, clientId) {
+  try {
+    const result = await query(
+      `SELECT
+         MAX(created_at) as last_message_date,
+         COUNT(*) as message_count
+       FROM messages
+       WHERE recipient_phone = $1
+         AND client_id = $2
+         AND wa_status IN ('sent', 'delivered', 'read')
+       GROUP BY recipient_phone`,
+      [recipientPhone, clientId]
+    );
+
+    if (result.rows.length === 0) {
+      return { canSend: true, messageCount: 0 };
+    }
+
+    const COOLDOWN_DAYS = parseInt(process.env.MESSAGE_COOLDOWN_DAYS) || 14;
+    const lastMessageDate = new Date(result.rows[0].last_message_date);
+    const now = new Date();
+    const daysSinceLastMessage = (now - lastMessageDate) / (1000 * 60 * 60 * 24);
+
+    if (daysSinceLastMessage < COOLDOWN_DAYS) {
+      const remainingDays = Math.ceil(COOLDOWN_DAYS - daysSinceLastMessage);
+      return {
+        canSend: false,
+        remainingDays,
+        lastMessageDate,
+        reason: `Délai minimum de ${COOLDOWN_DAYS} jours requis. Encore ${remainingDays} jour(s) à attendre.`
+      };
+    }
+
+    return {
+      canSend: true,
+      messageCount: result.rows[0].message_count,
+      daysSinceLastMessage
+    };
+  } catch (error) {
+    logger.error('Erreur vérification cooldown:', error);
+    return { canSend: true };
+  }
+}
+
+// Gestion des événements
+worker.on('failed', (job, err) => {
+  logger.error('Job échoué définitivement', { jobId: job?.id, error: err.message });
+});
+
+worker.on('completed', (job) => {
+  logger.info('Job complété avec succès', { jobId: job.id });
+});
+
+worker.on('error', (err) => logger.error('Erreur worker', err));
+
+// Shutdown gracieux
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM → arrêt worker');
+  await worker.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT → arrêt worker');
+  await worker.close();
+  process.exit(0);
+});
+
+module.exports = { worker };
